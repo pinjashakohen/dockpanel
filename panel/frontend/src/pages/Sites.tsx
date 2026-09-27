@@ -18,6 +18,18 @@ interface Site {
   enabled: boolean;
   parent_site_id: string | null;
   created_at: string;
+  // Present only on the admin all-sites view (GET /api/admin/sites). The
+  // owner-scoped list cannot carry them, and would not need to: every row it
+  // returns belongs to the person reading it.
+  user_id?: string;
+  owner_email?: string | null;
+  owner_role?: string | null;
+}
+
+interface PanelUser {
+  id: string;
+  email: string;
+  role: string;
 }
 
 export default function Sites() {
@@ -29,6 +41,19 @@ export default function Sites() {
   const [provisioningSiteId, setProvisioningSiteId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [displayCount, setDisplayCount] = useState(25);
+
+  // Admin all-sites view. Ownership is exclusive, so a site handed to a client
+  // leaves the admin's own list entirely — this is how they find it again, and
+  // the only place from which a transfer can be undone.
+  const isAdmin = user?.role === "admin";
+  /** The one role that may hold sites but never claim a new domain. */
+  const isClient = user?.role === "client";
+  const [allSites, setAllSites] = useState(false);
+  const [users, setUsers] = useState<PanelUser[]>([]);
+  const [transferFor, setTransferFor] = useState<Site | null>(null);
+  const [transferEmail, setTransferEmail] = useState("");
+  const [transferring, setTransferring] = useState(false);
+  const [notice, setNotice] = useState("");
 
   // Form state
   const [domain, setDomain] = useState("");
@@ -54,13 +79,21 @@ export default function Sites() {
 
   const fetchSites = () => {
     api
-      .get<Site[]>("/sites")
+      .get<Site[]>(allSites ? "/admin/sites" : "/sites")
       .then(setSites)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   };
 
-  useEffect(fetchSites, []);
+  useEffect(fetchSites, [allSites]);
+
+  // The transfer recipient is picked, not typed. A free-text email could only
+  // ever fail late — `transfer` answers 404 "No account with that email" — and
+  // an operator does not carry their clients' addresses in their head.
+  useEffect(() => {
+    if (!isAdmin) return;
+    api.get<PanelUser[]>("/users").then(setUsers).catch(() => setUsers([]));
+  }, [isAdmin]);
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
@@ -118,6 +151,17 @@ export default function Sites() {
           <p className="page-header-subtitle">Manage your websites and applications</p>
         </div>
         <div className="flex items-center gap-2">
+          {isAdmin && (
+            <label className="flex items-center gap-2 text-sm text-dark-200 select-none cursor-pointer">
+              <input
+                type="checkbox"
+                checked={allSites}
+                onChange={(e) => { setLoading(true); setAllSites(e.target.checked); }}
+                className="rounded border-dark-500 bg-dark-800 text-rust-500 focus:ring-rust-500"
+              />
+              All sites on this server
+            </label>
+          )}
           {sites.length >= 2 && (
             <input
               type="text"
@@ -127,12 +171,21 @@ export default function Sites() {
               className="px-3 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-sm text-dark-100 placeholder-dark-400 focus:outline-none focus:border-dark-400"
             />
           )}
-          <button
-            onClick={() => setShowForm(!showForm)}
-            className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
-          >
-            {showForm ? "Cancel" : "Create Site"}
-          </button>
+          {/* A `client` holds sites and cannot bring a new domain into service —
+              that single refusal is what the role IS
+              (`services::domain_claim::ensure_claimable`). Offering the control
+              anyway meant the client filled in a domain, a runtime, a PHP version
+              and, for a WordPress choice, an admin username and password, pressed
+              Create, and only then met the refusal. Same predicate as
+              `Dashboard.tsx:680`, which already hides its create tile. */}
+          {!isClient && (
+            <button
+              onClick={() => setShowForm(!showForm)}
+              className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
+            >
+              {showForm ? "Cancel" : "Create Site"}
+            </button>
+          )}
         </div>
       </div>
 
@@ -386,10 +439,26 @@ export default function Sites() {
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9.004 9.004 0 0 0 8.716-6.747M12 21a9.004 9.004 0 0 1-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 0 1 7.843 4.582M12 3a8.997 8.997 0 0 0-7.843 4.582m15.686 0A11.953 11.953 0 0 1 12 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0 1 21 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0 1 12 16.5a17.92 17.92 0 0 1-8.716-2.247m0 0A9 9 0 0 1 3 12c0-1.47.353-2.856.978-4.082" />
           </svg>
           <p className="text-dark-200 font-medium text-lg">No sites yet</p>
-          <p className="text-dark-300 text-sm mt-2 max-w-md mx-auto">Deploy static, PHP, Node.js, or Python sites with automatic SSL certificates, nginx configuration, and one-click CMS installs.</p>
-          <button onClick={() => setShowForm(true)} className="mt-3 px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors">
-            Create your first site
-          </button>
+          {/* The empty state has to say something different to the one role that
+              cannot act on it. Inviting a client to "create your first site" is
+              the same broken promise as the button above, and it is worse here:
+              this is the screen they reach when a site they DO own has not been
+              transferred yet, so the panel answered "you have nothing, make one"
+              to someone whose only route is to ask their administrator. */}
+          {isClient ? (
+            <p className="text-dark-300 text-sm mt-2 max-w-md mx-auto">
+              No sites have been assigned to your account yet. Sites are created and handed
+              over by your administrator — once one is, it appears here and you can manage it
+              fully.
+            </p>
+          ) : (
+            <>
+              <p className="text-dark-300 text-sm mt-2 max-w-md mx-auto">Deploy static, PHP, Node.js, or Python sites with automatic SSL certificates, nginx configuration, and one-click CMS installs.</p>
+              <button onClick={() => setShowForm(true)} className="mt-3 px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors">
+                Create your first site
+              </button>
+            </>
+          )}
         </div>
       ) : sites.length > 0 ? (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto elevation-1">
@@ -401,6 +470,12 @@ export default function Sites() {
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Status</th>
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">SSL</th>
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">Created</th>
+                {allSites && (
+                  <>
+                    <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Owner</th>
+                    <th scope="col" className="text-right text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3"><span className="sr-only">Actions</span></th>
+                  </>
+                )}
               </tr>
             </thead>
             <tbody className="divide-y divide-dark-600">
@@ -413,6 +488,13 @@ export default function Sites() {
                   {displayed.map((site) => (
                 <tr key={site.id} className="hover:bg-dark-700/30 transition-colors">
                   <td className="px-5 py-4">
+                    {/* Every row links to its own page, including a site this
+                        admin does not own. That used to be rendered as inert
+                        text, correctly, because a per-site read answered 404 for
+                        anybody but the owner — so the operator who had handed a
+                        site to a client could see it here and go no further.
+                        An administrator now reaches any site on a machine they
+                        run, so the link goes somewhere. */}
                     <Link
                       to={`/sites/${site.id}`}
                       className="text-sm font-medium text-rust-400 hover:text-rust-300 font-mono"
@@ -425,7 +507,7 @@ export default function Sites() {
                   </td>
                   <td className="px-5 py-4">
                     <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                      site.enabled === false ? "bg-amber-500/10 text-amber-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
+                      site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
                     }`}>
                       {site.enabled === false ? "disabled" : site.status}
                     </span>
@@ -445,6 +527,26 @@ export default function Sites() {
                   <td className="px-5 py-4 text-sm text-dark-200 hidden lg:table-cell">
                     {formatDate(site.created_at)}
                   </td>
+                  {allSites && (
+                    <>
+                      <td className="px-5 py-4 text-sm">
+                        <span className="text-dark-100 font-mono">{site.owner_email ?? "—"}</span>
+                        {site.owner_role && site.owner_role !== "admin" && (
+                          <span className="ml-2 inline-flex px-2 py-0.5 rounded-full text-[10px] font-medium bg-dark-700 text-dark-200 uppercase tracking-wide">
+                            {site.owner_role}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-5 py-4 text-right">
+                        <button
+                          onClick={() => { setTransferFor(site); setTransferEmail(""); setNotice(""); }}
+                          className="px-2.5 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
+                        >
+                          Transfer
+                        </button>
+                      </td>
+                    </>
+                  )}
                 </tr>
               ))}
               </>
@@ -466,6 +568,71 @@ export default function Sites() {
           })()}
         </div>
       ) : null}
+
+      {notice && (
+        <div role="status" className="mt-4 bg-dark-700 text-dark-100 text-sm px-4 py-3 rounded-lg border border-dark-500">
+          {notice}
+        </div>
+      )}
+
+      {/* Transfer, from the all-sites list rather than the site's own page.
+          It has to live here: once a site belongs to somebody else its detail
+          page answers 404 to the admin, so a control rendered only there can
+          hand a site away and never take it back. */}
+      {transferFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-labelledby="transfer-title">
+          <div className="bg-dark-800 border border-dark-500 rounded-lg elevation-2 w-full max-w-md p-5">
+            <h2 id="transfer-title" className="text-base font-medium text-dark-100">Transfer {transferFor.domain}</h2>
+            <p className="text-xs text-dark-300 mt-1">
+              Ownership is exclusive. The account you choose becomes the owner and the current
+              one — {transferFor.owner_email ?? "the current owner"} — stops being it.
+            </p>
+            <label htmlFor="transfer-to" className="block text-sm font-medium text-dark-100 mt-4 mb-1">Transfer to</label>
+            <select
+              id="transfer-to"
+              value={transferEmail}
+              onChange={(e) => setTransferEmail(e.target.value)}
+              className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm bg-dark-800"
+            >
+              <option value="">Choose an account…</option>
+              {users
+                /* `suspended` is refused by the endpoint with a 409 — leaving it
+                   out of the list is the same rule stated earlier. Every other
+                   role is a legitimate destination, including admin, which is
+                   how a transfer is undone. */
+                .filter((u) => u.role !== "suspended" && u.email !== transferFor.owner_email)
+                .map((u) => (
+                  <option key={u.id} value={u.email}>{u.email} ({u.role})</option>
+                ))}
+            </select>
+            <div className="flex items-center gap-2 mt-5">
+              <button
+                disabled={!transferEmail || transferring}
+                onClick={() => {
+                  setTransferring(true);
+                  api.post(`/sites/${transferFor.id}/transfer`, { email: transferEmail })
+                    .then(() => {
+                      setNotice(`${transferFor.domain} transferred to ${transferEmail}.`);
+                      setTransferFor(null);
+                      fetchSites();
+                    })
+                    .catch((e) => setError(e instanceof Error ? e.message : "Transfer failed"))
+                    .finally(() => setTransferring(false));
+                }}
+                className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
+              >
+                {transferring ? "Transferring…" : "Transfer"}
+              </button>
+              <button
+                onClick={() => setTransferFor(null)}
+                className="px-4 py-2 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       </div>
     </div>
   );

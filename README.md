@@ -6,13 +6,17 @@
 
 <p align="center">
   <strong>The most feature-packed free server panel ever built.</strong><br>
-  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~49MB of RAM</strong>. 806 HTTP routes. 153 app templates. 1026 regression assertions. ~45MB binaries. Zero subscriptions.
+  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~49MB of RAM</strong>. 840 HTTP routes. 147 app templates. 4544 regression assertions. ~57MB binaries. Zero subscriptions.
+</p>
+
+<p align="center">
+  <sub>Not the WPF/WinForms <code>DockPanel</code> docking control — this is a self-hosted Linux server panel.</sub>
 </p>
 
 <p align="center">
   <a href="https://github.com/ovexro/dockpanel/releases"><img src="https://img.shields.io/github/v/release/ovexro/dockpanel" alt="Release"></a>
   <a href="https://github.com/ovexro/dockpanel/actions"><img src="https://img.shields.io/github/actions/workflow/status/ovexro/dockpanel/ci.yml?label=CI" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSL_1.1-blue.svg" alt="License: BSL 1.1"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg" alt="License: AGPL v3"></a>
 </p>
 
 <p align="center">
@@ -42,13 +46,13 @@ on any firewalld box by design. See [getting started](docs/getting-started.md#re
 
 ## Why DockPanel?
 
-No other free panel gives you Git push-to-deploy with blue-green zero-downtime updates, 153 one-click Docker app templates, per-image CVE scanning with deploy gating, a WAF, passkey login, GPU passthrough, multi-server management, reseller accounts, a developer CLI, and Infrastructure as Code — all while the panel services themselves use under 20MB of RAM. DockPanel does.
+No other free panel gives you Git push-to-deploy with blue-green zero-downtime updates, 147 one-click Docker app templates, per-image CVE scanning with deploy gating, a WAF, passkey login, GPU passthrough, multi-server management, reseller accounts, a developer CLI, and Infrastructure as Code — all while the panel services themselves use under 20MB of RAM. DockPanel does.
 
 | | DockPanel | HestiaCP | CloudPanel | RunCloud |
 |---|---|---|---|---|
 | **Price** | **Free** | Free | Free | $8/mo+ |
 | **Stack** | **Rust + React** | PHP | PHP | PHP (SaaS) |
-| **Docker native** | **153 templates** | No | No | No |
+| **Docker native** | **147 templates** | No | No | No |
 | **Git deploy** | **Blue-green, zero-downtime** | No | No | Basic |
 | **Multi-server** | **Unlimited** | No | No | Yes |
 | **Reseller + white-label** | **Yes** | Reseller only | No | No |
@@ -87,13 +91,13 @@ found, including what is still broken.
 </details>
 
 <details>
-<summary><strong>Docker Apps</strong> — 153 one-click templates across 14 categories</summary>
+<summary><strong>Docker Apps</strong> — 147 one-click templates across 14 categories</summary>
 
 ![Docker Apps](.github/screenshots/dp-apps.png)
 </details>
 
 <details>
-<summary><strong>Databases</strong> — MySQL/PostgreSQL, SQL browser, schema viewer, point-in-time recovery</summary>
+<summary><strong>Databases</strong> — MySQL/PostgreSQL, SQL browser, schema viewer, scheduled backups</summary>
 
 ![Databases](.github/screenshots/dp-databases.png)
 </details>
@@ -129,7 +133,7 @@ found, including what is still broken.
 </details>
 
 <details>
-<summary><strong>Backups</strong> — Scheduled backups, S3/SFTP destinations, Restic incremental (API only), one-click restore</summary>
+<summary><strong>Backups</strong> — Scheduled backups, S3/SFTP destinations, one-click restore</summary>
 
 ![Backups](.github/screenshots/dp-backups.png)
 </details>
@@ -174,12 +178,12 @@ found, including what is still broken.
 
 ### Hosting
 - **Sites** — Static, PHP (8.1–8.5), Node.js, Python, reverse proxy. Automatic Nginx config, SSL, PHP-FPM pools.
-- **Databases** — MySQL/PostgreSQL in Docker. Built-in SQL browser, visual schema browser, point-in-time recovery (WAL/binlog). Auto-cleanup on site delete.
-- **Docker Apps** — 153 templates across 14 categories (AI, CMS, Database, Media, Monitoring, and more). Compose stacks. Resource limits. GPU passthrough.
+- **Databases** — MySQL/PostgreSQL in Docker. Built-in SQL browser, visual schema browser, scheduled dump/restore. Auto-cleanup on site delete.
+- **Docker Apps** — 147 templates across 14 categories (AI, CMS, Database, Media, Monitoring, and more). Compose stacks. Resource limits. GPU passthrough.
 - **Git Deploy** — Push-to-deploy. Atomic zero-downtime deploys (Capistrano-style). Nixpacks (30+ languages). Preview environments.
 - **WordPress Toolkit** — Multi-site dashboard, vulnerability scanning, security hardening, bulk updates.
 - **CMS Install** — WordPress, Laravel, Drupal, Joomla, Symfony, CodeIgniter — one click.
-- **Backups** — Scheduled, S3/SFTP remote destinations, one-click restore. Restic incremental (encrypted, deduplicated) — API only, no panel UI yet.
+- **Backups** — Scheduled, S3/SFTP remote destinations, one-click restore.
 - **Backup Orchestrator** — DB/volume backups, AES-256 encryption, restore verification, cross-resource policies, S3/SFTP/B2/GCS destinations, health dashboard.
 - **CDN** — BunnyCDN and Cloudflare CDN management. Cache purge, bandwidth stats, pull zone discovery.
 - **Image Optimization** — Server-side WebP/AVIF conversion per site.
@@ -188,8 +192,8 @@ found, including what is still broken.
 
 ### Operations
 - **Multi-Server** — Manage remote servers from one panel. Agent auto-registers.
-- **DNS** — Cloudflare + PowerDNS. Zone templates, propagation checker, DNSSEC. Cloudflare cache purge, security settings, Cloudflare Tunnel.
-- **Container Management** — Auto-sleep (scale to zero), auto-update detection, per-user isolation policies, app migration between servers.
+- **DNS** — Cloudflare + PowerDNS. Zone templates, propagation checker, DNSSEC. Cloudflare cache purge, security settings, `cloudflared` install/uninstall.
+- **Container Management** — Auto-sleep (stop idle containers), auto-update detection, per-user isolation policies.
 - **Mail** — Postfix + Dovecot + OpenDKIM. Webmail (Roundcube), spam filter (Rspamd), SMTP relay.
 - **Monitoring** — HTTP/TCP/ping uptime checks, SLA tracking, PagerDuty integration.
 - **Prometheus + Grafana** — Token-gated `/api/metrics` scrape endpoint (off by default) plus a drop-in [fleet dashboard](dashboards/dockpanel-grafana.json) covering CPU/memory/disk, GPU utilization/VRAM/temp/power, sites, and alerts. See [docs/guides/prometheus.md](docs/guides/prometheus.md).
@@ -205,14 +209,15 @@ found, including what is still broken.
 - **Fail2Ban** — View/ban/unban IPs, panel-specific jail.
 - **SSH Hardening** — Disable password/root login, change port — one click.
 - **Vulnerability Scanning** — File integrity, security headers, full-server audits.
-- **Per-Image CVE Scanning** — Scan every running Docker app's image with Anchore grype. Severity badge per app row on the Apps page. Scheduled background rescans (configurable interval). Soft deploy gate refuses deploys on images exceeding a critical/high/medium threshold. Grype installs self-contained into `/var/lib/dockpanel/scanners/` from the Settings UI. **Defaults to off** — opt in from Settings → Services → Image Vulnerability Scanning.
+- **Per-Image CVE Scanning** — Scan every running Docker app's image with Anchore grype. Severity badge per app row on the Apps page. Scheduled background rescans (configurable interval). Soft deploy gate refuses images exceeding a critical/high/medium threshold — on template deploys, image changes, compose deploys and stacks alike. Grype installs self-contained into `/var/lib/dockpanel/scanners/` from the Settings UI. **Defaults to off** — opt in from Settings → Services → Image Vulnerability Scanning.
 - **Signed Releases + SBOM** — Every release binary and its SPDX SBOM is signed in CI with cosign keyless via Sigstore (no long-lived signing key, recorded in the public Rekor transparency log). Verification snippet in [SECURITY.md](SECURITY.md#verifying-release-signatures).
 - **Per-Image SBOM Generation** — Generate an SPDX 2.3 JSON SBOM for any deployed Docker app's image on demand (syft). Click "Download SBOM" in any app's scan drawer. Self-contained install at `/var/lib/dockpanel/scanners/syft`. **Defaults to off** — opt in from Settings → Services → SBOM Generation. Companion to image CVE scanning: composition vs. risk.
 - **Auto-Healing** — Restart crashed services, clean disk, renew expiring SSL, auto-sleep idle containers.
 
 ### Developer Experience
 - **CLI** — `dockpanel status`, `sites`, `apps`, `diagnose`, `export`, `apply`
-- **Infrastructure as Code** — Export/import server config as YAML. Terraform/Pulumi provider API with scoped IaC tokens.
+- **MCP Server** — Read-only fleet introspection (~40 tools: sites, apps, databases, logs, security, monitors, alerts, and more) for AI agents over the Model Context Protocol. Opt-in, off by default, zero mutating tools. See [docs.dockpanel.dev](https://docs.dockpanel.dev).
+- **Infrastructure as Code** — Export/import server config as YAML. A Terraform/Pulumi-shaped provider API also exists for reading site/database inventory (see [FEATURES.md](FEATURES.md#withdrawn-claims) — its tokens don't yet authenticate).
 - **Smart Diagnostics** — 6 check categories with one-click fixes. Auto-optimization recommendations.
 - **File Manager** — Browse, edit, upload files from the browser.
 - **Command Palette** — Ctrl+K to navigate anywhere.
@@ -227,11 +232,9 @@ found, including what is still broken.
 - **Reseller Accounts** — Admin → Reseller → User hierarchy with quotas.
 - **White-Label** — Custom logo, colors, panel name per reseller.
 - **OAuth/SSO** — Google, GitHub, GitLab login.
-- **Extension API** — Webhook events with HMAC signing and scoped API keys.
+- **Extension API** — Webhook events with HMAC signing.
 - **WHMCS Integration** — Provisioning, suspension, termination hooks. Auto-create users from billing.
-- **Horizontal Auto-Scaling** — Rule-based CPU thresholds with min/max replicas and cooldown.
-- **Migration Wizard** — Import from cPanel, HestiaCP. Plesk (beta). App migration between servers.
-- **Teams** — Multi-user access with role-based permissions.
+- **Migration Wizard** — Import from cPanel, HestiaCP. Plesk (beta).
 
 ## Architecture
 
@@ -244,7 +247,7 @@ Browser → React 19 SPA → Nginx
                            └── /*     → Frontend (static files)
 ```
 
-**3 Rust binaries**: Agent (~21MB), API (~22MB), CLI (~1.7MB). Runtime RAM: ~35MB agent + ~14MB API ≈ 49MB for the panel itself; ~109MB with the bundled PostgreSQL. 15 supervised background services.
+**4 Rust binaries**: Agent (~22MB), API (~25MB), CLI (~3.9MB), MCP server (~6.1MB, opt-in). Runtime RAM: ~35MB agent + ~14MB API ≈ 49MB for the panel itself; ~109MB with the bundled PostgreSQL. 17 supervised background services.
 
 | Component | Tech | Role |
 |-----------|------|------|
@@ -305,4 +308,29 @@ sudo bash /opt/dockpanel/scripts/uninstall.sh   # Remove
 
 ## License
 
-Business Source License 1.1. Free to use on your own servers. See [LICENSE](LICENSE) for details.
+**GNU Affero General Public License v3.0.** DockPanel is free software — run it, read it,
+change it, and redistribute it, on as many servers as you like, commercially included.
+There is no premium tier and nothing is held back.
+
+The one obligation the AGPL adds over the GPL: if you modify DockPanel and offer it to
+other people *as a service over a network*, you have to make your modified source
+available to those users. Running an unmodified copy, or running a modified copy for
+yourself or your own company, obliges you nothing. See [LICENSE](LICENSE) for the full text.
+
+Copyright © 2026 DockPanel.
+
+## Supporting DockPanel
+
+DockPanel is built and maintained by one developer. It has no company behind it, no
+investors to answer to, no telemetry, and nothing gated — which is why the roadmap is
+decided by what actually helps people running servers rather than by what converts.
+
+If it saved you the cost of a control-panel licence, you can put some of that back:
+
+- **[GitHub Sponsors](https://github.com/sponsors/ovexro)** — recurring, and it shows up
+  on the repo
+- **[PayPal](https://www.paypal.com/paypalme/ovexro)** — one-off, no account needed
+
+What that funds, concretely: a wider fleet of test VPSes so releases are verified on more
+distributions before they ship, faster turnaround on security fixes, and time for the
+bigger features on the roadmap. Every version stays free either way.

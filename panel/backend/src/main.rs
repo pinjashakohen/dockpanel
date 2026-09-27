@@ -55,6 +55,13 @@ pub struct AppState {
     pub sessions_revoked_at: Arc<RwLock<Option<i64>>>,
     /// Deploy ownership map: deploy_id -> user_id (for SSE log access control).
     pub deploy_owners: Arc<Mutex<HashMap<uuid::Uuid, uuid::Uuid>>>,
+    /// Shutdown broadcast, mirroring the one `spawn_supervised` already hands
+    /// every background service. Route handlers that hold a connection open
+    /// past a single request/response (the metrics websocket, every SSE
+    /// stream below) subscribe to this so `shutdown_signal`'s graceful drain
+    /// isn't left waiting on a client that never disconnects on its own —
+    /// see `helpers::shutdown_signal_fut`.
+    pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
     /// WebAuthn/Passkey challenge store (in-memory, 5-minute TTL).
     pub passkey_challenges: routes::passkeys::ChallengeStore,
     /// Phase 4 W4: panel self-update orchestrator state. Read by
@@ -199,10 +206,11 @@ async fn main() {
 
     // Create agent client (local) and agent registry (multi-server)
     let agent = AgentClient::new(config.agent_socket.clone(), config.agent_token.clone());
-    let agents = AgentRegistry::new(agent.clone(), db.clone());
+    let agents = AgentRegistry::new(agent.clone(), db.clone(), config.jwt_secret.clone());
 
     // Ensure local server exists in DB and register its ID in the registry
-    let local_server_id = services::agent::ensure_local_server(&db, &config.agent_token).await;
+    let local_server_id =
+        services::agent::ensure_local_server(&db, &config.agent_token, &config.jwt_secret).await;
     if !local_server_id.is_nil() {
         agents.set_local_server_id(local_server_id).await;
         tracing::info!("Local server ID: {local_server_id}");
@@ -255,6 +263,10 @@ async fn main() {
     // Register in the global OnceLock so notify_panel() can broadcast without AppState
     services::notifications::init_notif_broadcast(notif_tx.clone());
 
+    // Shutdown broadcast channel — all background services listen for this signal,
+    // and (via AppState below) so does every long-lived route handler.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // GAP 66: Load persisted token blacklist from DB (survives restart)
     let token_blacklist = {
         let blacklisted: Vec<(String,)> = sqlx::query_as(
@@ -299,6 +311,7 @@ async fn main() {
         notif_tx,
         sessions_revoked_at,
         deploy_owners: Arc::new(Mutex::new(HashMap::new())),
+        shutdown_tx: shutdown_tx.clone(),
         passkey_challenges: routes::passkeys::new_challenge_store(),
         panel_update_state: services::panel_update::new_state_handle(),
     };
@@ -313,9 +326,6 @@ async fn main() {
     // spawned task, so a restart takes them with no chance to write a verdict.
     // On boot nothing is running, so any row still claiming to be is stale.
     routes::migration::finalize_analyzing_on_startup(&state.db).await;
-
-    // Shutdown broadcast channel — all background services listen for this signal
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     // Supervised background task spawner: monitors JoinHandle, auto-restarts on panic
     // with exponential backoff, and respects shutdown signal.
@@ -402,17 +412,23 @@ async fn main() {
     let (s_db, s_agents) = (state.db.clone(), state.agents.clone());
     spawn_supervised("image_scanner", &shutdown_tx, move |rx| services::image_scanner::run(s_db.clone(), s_agents.clone(), rx));
 
+    let (s_db, s_agents) = (state.db.clone(), state.agents.clone());
+    spawn_supervised("wp_vuln_scanner", &shutdown_tx, move |rx| services::wp_vuln_scanner::run(s_db.clone(), s_agents.clone(), rx));
+
     // Its GPU, service-health and container checks each ask ONE machine what it
     // has, so each runs per online server against that server's own agent.
     // See `online_fleet`.
     let (s_db, s_agents) = (state.db.clone(), state.agents.clone());
     spawn_supervised("alert_engine", &shutdown_tx, move |rx| services::alert_engine::run(s_db.clone(), s_agents.clone(), rx));
 
-    // The healer gets the REGISTRY as well as the legacy local client: its disk
-    // heal acts on whichever server's alert is firing, which is not necessarily
-    // this one. See `auto_clean_disk`.
-    let (s_db, s_agent, s_agents) = (state.db.clone(), state.agent.clone(), state.agents.clone());
-    spawn_supervised("auto_healer", &shutdown_tx, move |rx| services::auto_healer::run(s_db.clone(), s_agent.clone(), s_agents.clone(), rx));
+    // The healer gets the REGISTRY and nothing else. Every one of its legs reads
+    // rows that name a host and then writes through an agent, so it has no use
+    // for a handle to this box in particular. It used to be handed the legacy
+    // local client too, and the two legs that took it — SSL renewal and
+    // container auto-sleep — were exactly the two that acted on the wrong
+    // machine. Not passing it is what stops that from coming back.
+    let (s_db, s_agents) = (state.db.clone(), state.agents.clone());
+    spawn_supervised("auto_healer", &shutdown_tx, move |rx| services::auto_healer::run(s_db.clone(), s_agents.clone(), rx));
 
     // Reads every online server through its OWN agent: `metrics_history` is what
     // the trend alerts, the uptime sparkline, the Prometheus scrape and the fleet
@@ -447,6 +463,11 @@ async fn main() {
     // certifies DR for a machine it never tested. See `dispatch_policy_drills`.
     let (s_db, s_agents) = (state.db.clone(), state.agents.clone());
     spawn_supervised("drill_scheduler", &shutdown_tx, move |rx| services::drill_scheduler::run(s_db.clone(), s_agents.clone(), rx));
+
+    // Each site's access log lives on the server that owns it, so this too takes
+    // the registry. See `traffic_accounting_scheduler::collect_one`.
+    let (s_db, s_agents) = (state.db.clone(), state.agents.clone());
+    spawn_supervised("traffic_accounting_scheduler", &shutdown_tx, move |rx| services::traffic_accounting_scheduler::run(s_db.clone(), s_agents.clone(), rx));
 
     // Local BY INTENT, not by omission: it diagnoses the panel host itself. It takes
     // the registry so that intent is stated in the type and calls `agents.local()`.
@@ -502,6 +523,7 @@ async fn main() {
             let now = Instant::now();
             let window_15m = Duration::from_secs(900);
             let window_5m = Duration::from_secs(300);
+            let window_1h = Duration::from_secs(3600);
             if let Ok(mut map) = login.lock() {
                 map.retain(|_, attempts| {
                     attempts.retain(|t| now.duration_since(*t) < window_15m);
@@ -511,8 +533,26 @@ async fn main() {
             if let Ok(mut map) = twofa.lock() {
                 map.retain(|_, (_, start)| now.duration_since(*start) < window_5m);
             }
+            // The webhook limiter's window is an HOUR, not five minutes. Both
+            // webhook handlers roll their own window at 3600s and both say "max 10
+            // attempts per hour" — but this janitor sat on the same line as the 2FA
+            // one and evicted the counter after 300s, so the entry was gone at the
+            // next tick and a caller simply got a fresh 10 every ~15 minutes. The
+            // 2FA sibling above is correct precisely because its handler window is
+            // also 300s; sharing the constant is what made this look right.
+            //
+            // Retaining for an hour costs memory on an UNAUTHENTICATED route — the
+            // pre-check inserts an entry keyed on a caller-supplied UUID before the
+            // row is known to exist — so the longer retention is paired with a cap.
+            // A flood of invented ids parks at count 0, because the counter is only
+            // incremented after a row is found and its secret mismatches, so
+            // dropping the zero-count entries above the cap sheds exactly the flood
+            // and keeps every counter that is actually near its limit.
             if let Ok(mut map) = webhook.lock() {
-                map.retain(|_, (_, start)| now.duration_since(*start) < window_5m);
+                map.retain(|_, (_, start)| now.duration_since(*start) < window_1h);
+                if map.len() > 10_000 {
+                    map.retain(|_, (count, _)| *count >= routes::WEBHOOK_ATTEMPT_LIMIT);
+                }
             }
             if let Ok(mut map) = agent_rl.lock() {
                 map.retain(|_, (_, start)| now.duration_since(*start) < Duration::from_secs(60));
@@ -581,16 +621,20 @@ async fn main() {
     );
 
     if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
         .await
     {
         tracing::error!("API server error: {e}");
     }
 
-    // Signal all background services to stop
-    tracing::info!("Sending shutdown signal to background services...");
-    let _ = shutdown_tx.send(());
-    // Give services a moment to finish their current work
+    // Background services AND every long-lived route handler subscribed via
+    // AppState::shutdown_tx already got the broadcast from inside
+    // shutdown_signal() itself, the instant the OS signal arrived — sending
+    // it here instead would be circular: `axum::serve(...).await` above does
+    // not return until every in-flight connection's task has ended, so a
+    // websocket/SSE handler waiting on THIS line to know when to close would
+    // deadlock the drain against itself. Give whatever's still winding down
+    // a last moment before the DB pool closes underneath it.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Drain the connection pool so active queries finish before process exits
@@ -600,7 +644,14 @@ async fn main() {
     tracing::info!("DockPanel API shut down gracefully");
 }
 
-async fn shutdown_signal() {
+/// Hard bound on the drain phase after a shutdown signal fires: a 78% cut from
+/// systemd's default 90s `TimeoutStopSec` (unset in our unit) — short enough to act
+/// as a real bound, long enough that an ordinary slow request (some agent HTTP calls
+/// carry up to a 60s timeout) isn't routinely cut off mid-response during a normal
+/// deploy.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn shutdown_signal(shutdown_tx: tokio::sync::broadcast::Sender<()>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -622,4 +673,39 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("Received Ctrl+C, shutting down..."),
         _ = terminate => tracing::info!("Received SIGTERM, shutting down..."),
     }
+
+    // Broadcast to every background service AND every long-lived route
+    // handler (the metrics websocket, every SSE stream — AppState::shutdown_tx
+    // / helpers::shutdown_signal_fut) the instant the OS signal arrives, not
+    // after `with_graceful_shutdown` below has already finished waiting for
+    // those same connections to close on their own. This function IS the
+    // `signal` future axum awaits first (before it stops accepting new
+    // connections and starts draining existing ones) — sending from here
+    // means a subscribed handler actually has the ~20s window below to close
+    // itself before the watchdog force-exits, instead of the drain and the
+    // signal waiting on each other.
+    let _ = shutdown_tx.send(());
+
+    // `with_graceful_shutdown` waits for every in-flight connection to close on its
+    // own — an open SSE stream or WebSocket terminal session blocks that
+    // indefinitely, and axum spawns each connection onto its own task that this
+    // signal resolving does not cancel, so a hung connection (or the unbounded
+    // `shutdown_db.close().await` that runs afterward) could stall the whole
+    // process past systemd's default 90s TimeoutStopSec. Arm a hard watchdog now
+    // that the signal has actually fired, so shutdown is bounded no matter what
+    // happens downstream of this point — a plain `tokio::time::timeout` around the
+    // whole serve future would be wrong here: that future runs for the server's
+    // entire lifetime, not just the drain phase, so timing it out would kill the
+    // process ~20s after every boot regardless of whether shutdown was ever
+    // requested.
+    tokio::spawn(async {
+        tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
+        tracing::warn!(
+            "Graceful shutdown did not finish within {}s of the shutdown signal (a \
+             long-lived connection or a stalled cleanup step is likely still open); \
+             forcing exit",
+            GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
+        );
+        std::process::exit(1);
+    });
 }

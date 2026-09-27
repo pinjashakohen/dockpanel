@@ -2,7 +2,7 @@
 
 ## Overview
 
-DockPanel lets you manage unlimited remote servers from a single panel. One server runs the full panel (API + frontend + database), and remote servers run only the lightweight agent binary (~20MB, ~30MB RAM). All communication between the panel and remote agents uses HTTPS with token-based authentication.
+DockPanel lets you manage unlimited remote servers from a single panel. One server runs the full panel (API + frontend + database), and remote servers run only the lightweight agent binary (~22MB, ~35MB RAM). All communication between the panel and remote agents uses HTTPS with token-based authentication.
 
 ## Architecture
 
@@ -152,3 +152,9 @@ yet.
 ### Reseller server allocation
 
 If you use reseller accounts, you can allocate specific servers to specific resellers. Reseller users only see and manage resources on their allocated servers.
+
+Allocate them in **Admin → Resellers**: expand a reseller's row, pick a server and
+allocate it. The same row is where you set that reseller's quotas and white-label
+branding, and where you promote an account to reseller in the first place — the role
+dropdown in **Users** deliberately does not offer it, because a reseller needs a
+profile as well as a role.

@@ -1,13 +1,14 @@
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
 };
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth::AdminUser;
-use crate::error::{internal_error, err, ApiError};
+use crate::error::{internal_error, err, upstream_error, ApiError};
+use crate::services::activity;
 use crate::AppState;
 
 #[derive(serde::Deserialize)]
@@ -46,6 +47,15 @@ pub const OAUTH_PROVIDERS: &[&str] = &["google", "github", "gitlab"];
 /// neither side. Three copies of one `format!` is how they drift apart.
 pub fn redirect_uri(base_url: &str, provider_name: &str) -> String {
     format!("{base_url}/api/auth/oauth/{provider_name}/callback")
+}
+
+/// `Value::to_string()` serializes a JSON string WITH its surrounding quote
+/// characters — it's `Display` for the JSON representation, not the string's
+/// own content. A provider's numeric `id` field survives that unqualified
+/// (GitHub/GitLab), but a string field like Google's `sub` does not: it comes
+/// out as `"1234567890"` (14 chars, quotes included) instead of the real id.
+fn stringify_id(v: &serde_json::Value) -> String {
+    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
 }
 
 fn get_provider(name: &str) -> Option<OAuthProvider> {
@@ -105,6 +115,7 @@ pub async fn redirect_uris(
 pub async fn authorize(
     State(state): State<AppState>,
     Path(provider_name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let provider = get_provider(&provider_name)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "Unknown OAuth provider"))?;
@@ -142,7 +153,29 @@ pub async fn authorize(
         urlencoding::encode(&csrf_state),
     );
 
-    Ok(Redirect::temporary(&auth_url).into_response())
+    // Bind `state` to THIS browser via a short-lived cookie, mirroring the value
+    // already in `state.oauth_states`. Without this, a valid `state` only proves
+    // "some /authorize call happened" — not that the browser presenting it at
+    // /callback is the one that made it. Login-CSRF: an attacker starts their own
+    // OAuth flow, captures the provider's redirect back to this panel (a real
+    // code+state pair for the ATTACKER's account) without letting their own
+    // browser follow it, then hands that exact callback URL to a victim. The old
+    // code validated `state` purely against the server-side map — which the
+    // attacker's `state` legitimately is a member of — and would have logged the
+    // victim's browser into the attacker's account. `callback` below now also
+    // requires this cookie to be present and to match `query.state`.
+    let secure_flag = crate::routes::auth::cookie_secure_flag(&headers);
+    let csrf_cookie = format!(
+        "oauth_csrf={csrf_state}; HttpOnly{secure_flag}; SameSite=Lax; Path=/; Max-Age=600"
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::SET_COOKIE, csrf_cookie)
+        .header(header::LOCATION, auth_url)
+        .body(axum::body::Body::empty())
+        .unwrap()
+        .into_response())
 }
 
 /// GET /api/auth/oauth/{provider}/callback — Handle OAuth callback
@@ -171,7 +204,17 @@ pub async fn callback(
     let provider = get_provider(&provider_name)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "Unknown OAuth provider"))?;
 
-    // Validate CSRF state
+    // Validate CSRF state is a member of the server-side map — proves SOME
+    // /authorize call issued it, nothing about WHO is presenting it now.
+    //
+    // Neither failure branch below (nor the cookie-mismatch one further down)
+    // calls `record_suspicious_event`, and that is deliberate, same reasoning as
+    // `passkeys.rs`'s counter-regression check: that function auto-activates
+    // system-wide lockdown at five events in ten minutes, and this endpoint is
+    // reachable by anyone with no account and no credential at all
+    // (`GET .../callback?state=garbage`) — wiring it in would let any anonymous
+    // visitor lock every non-admin out of the panel with five bad requests.
+    // `err()` below still logs and returns a 400; that is the right ceiling here.
     {
         let mut states = state.oauth_states.lock().unwrap_or_else(|e| e.into_inner());
         let entry = states.remove(&query.state);
@@ -179,6 +222,23 @@ pub async fn callback(
             Some((name, created)) if name == provider_name && created.elapsed().as_secs() < 600 => {}
             _ => return Err(err(StatusCode::BAD_REQUEST, "Invalid or expired OAuth state")),
         }
+    }
+
+    // Validate the browser presenting this callback is the one `authorize` set
+    // the csrf cookie for, and that it names the SAME state — this is what turns
+    // the check above from "a valid flow happened" into "this browser's flow".
+    // Missing/mismatched cookie means either a non-browser replay of a captured
+    // callback URL, or exactly the login-CSRF handoff this cookie exists to stop.
+    let csrf_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|s| s.trim().strip_prefix("oauth_csrf=").map(|v| v.to_string()))
+        });
+    if csrf_cookie.as_deref() != Some(query.state.as_str()) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid or expired OAuth state"));
     }
 
     // Read client credentials
@@ -222,10 +282,10 @@ pub async fn callback(
         ])
         .send()
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Token exchange failed: {e}")))?;
+        .map_err(|e| upstream_error(&format!("{provider_name} OAuth token exchange"), e))?;
 
     let token_data: serde_json::Value = token_resp.json().await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Token parse failed: {e}")))?;
+        .map_err(|e| upstream_error(&format!("{provider_name} OAuth token exchange"), e))?;
 
     let access_token = token_data.get("access_token")
         .and_then(|v| v.as_str())
@@ -237,10 +297,10 @@ pub async fn callback(
         .header("User-Agent", "DockPanel")
         .send()
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Userinfo fetch failed: {e}")))?;
+        .map_err(|e| upstream_error(&format!("{provider_name} OAuth userinfo fetch"), e))?;
 
     let userinfo: serde_json::Value = userinfo_resp.json().await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Userinfo parse failed: {e}")))?;
+        .map_err(|e| upstream_error(&format!("{provider_name} OAuth userinfo fetch"), e))?;
 
     // Extract email based on provider
     let email = match provider_name.as_str() {
@@ -271,7 +331,24 @@ pub async fn callback(
     };
 
     let email = email.ok_or_else(|| err(StatusCode::BAD_GATEWAY, "Could not retrieve email from OAuth provider"))?;
-    let oauth_id = userinfo.get("id").map(|v| v.to_string()).unwrap_or_else(|| userinfo.get("sub").map(|v| v.to_string()).unwrap_or_default());
+
+    // Reject an explicitly-unverified email before it can auto-link to (or
+    // auto-log-into) an existing account by email match alone — the linking
+    // logic below trusts `email` completely once we get this far. Absent means
+    // allow (`unwrap_or(true)`): GitLab's user endpoint and GitHub's profile-email
+    // path don't return this field at all, and treating "field missing" as a
+    // rejection would break both with no evidence either is a problem. Google's
+    // OIDC userinfo endpoint (configured above) does reliably return it.
+    let email_verified = userinfo.get("email_verified").and_then(|v| v.as_bool()).unwrap_or(true);
+    if !email_verified {
+        return Err(err(StatusCode::BAD_GATEWAY, "OAuth provider reports this email address is not verified"));
+    }
+
+    // See `stringify_id` below: `Value::to_string()` keeps a JSON string's
+    // quote characters, which corrupted Google's `sub` (a JSON string) while
+    // leaving GitHub/GitLab's `id` (a JSON number) untouched.
+    let oauth_id = userinfo.get("id").map(stringify_id)
+        .unwrap_or_else(|| userinfo.get("sub").map(stringify_id).unwrap_or_default());
 
     if oauth_id.is_empty() {
         return Err(err(StatusCode::BAD_GATEWAY, "OAuth provider did not return a user ID"));
@@ -288,7 +365,19 @@ pub async fn callback(
 
     let user = match user {
         Some(mut u) => {
-            // Only auto-link if user has no password (OAuth-only) or already same provider
+            // Four-way, not three: auto-link an OAuth-only account with no
+            // provider yet, allow a plain login when already linked to THIS
+            // SAME provider account, reject a provider-account swap under a
+            // matching provider NAME, and reject everything else (a
+            // password-holder with no link yet, OR an account already linked
+            // to a DIFFERENT provider).
+            //
+            // The prior code only tested `oauth_provider.is_none()` on the reject
+            // branch, so once ANY provider was linked, a callback from a SECOND,
+            // different provider reporting the same email fell through both
+            // branches unchecked and logged straight in — contradicting this
+            // comment's own claim of an "already same provider" check, and
+            // bypassing the password-holder protection below it too.
             if u.oauth_provider.is_none() && u.password_hash.is_empty() {
                 sqlx::query("UPDATE users SET oauth_provider = $1, oauth_id = $2 WHERE id = $3")
                     .bind(&provider_name)
@@ -297,11 +386,34 @@ pub async fn callback(
                     .execute(&state.db)
                     .await
                     .ok();
+                let ip = crate::routes::client_ip(&headers);
+                activity::log_activity(
+                    &state.db, u.id, &u.email, "auth.oauth_link",
+                    Some("user"), Some(&provider_name), None, ip.as_deref(), None,
+                ).await;
+                crate::services::security_hardening::audit_log(
+                    &state.db, "auth.oauth_link", Some(&u.email), ip.as_deref(),
+                    Some("user"), Some(&provider_name), None, None, "info", None,
+                ).await;
                 u.oauth_provider = Some(provider_name.clone());
-            } else if u.oauth_provider.is_none() {
-                // User has a password — don't auto-link, require manual linking
+            } else if u.oauth_provider.as_deref() != Some(provider_name.as_str()) {
                 return Err(err(StatusCode::CONFLICT,
-                    "An account with this email exists. Log in with your password and link OAuth in Settings."));
+                    "An account with this email exists, linked to a different sign-in method. \
+                     Log in with your existing method and link this one in Settings."));
+            } else if u.oauth_id.as_deref() != Some(oauth_id.as_str()) {
+                // The provider NAME matches, but the provider's own permanent
+                // account id does not — `oauth_id` is only ever written
+                // together with `oauth_provider` (the UPDATE above and the
+                // auto-create INSERT below), so a genuine returning login can
+                // never land here; matching on email + provider name alone
+                // was the whole check. The realistic way to reach this branch
+                // is the email changing hands AT THE PROVIDER (a departed
+                // employee's mailbox reassigned to a new hire's fresh
+                // account) — without this, that new person would silently
+                // inherit the departed employee's dockpanel account and role.
+                return Err(err(StatusCode::CONFLICT,
+                    "An account with this email exists, linked to a different sign-in method. \
+                     Log in with your existing method and link this one in Settings."));
             }
             u
         }
@@ -348,13 +460,29 @@ pub async fn callback(
                 return Err(err(StatusCode::FORBIDDEN, "OAuth auto-registration is disabled. Contact your administrator."));
             }
 
+            // A THIRD gate, and the same lesson as the two above: `register`
+            // (auth.rs:807) marks a new account unapproved when
+            // `security_approval_required` is on, and this door omitted the column
+            // entirely — so it fell to its `DEFAULT TRUE` and the account was admitted
+            // on the spot. It never surfaced in Security → Approvals either, because
+            // that list selects `WHERE approved = FALSE`. An operator who switched
+            // approval on got it applied to one of the two ways in, with no sign that
+            // the other was open.
+            //
+            // Written into the INSERT rather than a follow-up UPDATE so the row is
+            // never briefly approved, and bound rather than interpolated.
+            let approval_required = crate::services::security_hardening::get_setting_bool(
+                &state.db, "security_approval_required", false,
+            ).await;
+
             let new_user: crate::models::User = sqlx::query_as(
-                "INSERT INTO users (email, password_hash, role, email_verified, oauth_provider, oauth_id) \
-                 VALUES ($1, '', 'user', true, $2, $3) RETURNING *"
+                "INSERT INTO users (email, password_hash, role, email_verified, oauth_provider, oauth_id, approved) \
+                 VALUES ($1, '', 'user', true, $2, $3, $4) RETURNING *"
             )
             .bind(&email)
             .bind(&provider_name)
             .bind(&oauth_id)
+            .bind(!approval_required)
             .fetch_one(&state.db)
             .await
             .map_err(|e| {
@@ -366,6 +494,15 @@ pub async fn callback(
             })?;
 
             tracing::info!("OAuth user created: {} via {}", email, provider_name);
+            let ip = crate::routes::client_ip(&headers);
+            activity::log_activity(
+                &state.db, new_user.id, &new_user.email, "auth.oauth_register",
+                Some("user"), Some(&provider_name), None, ip.as_deref(), None,
+            ).await;
+            crate::services::security_hardening::audit_log(
+                &state.db, "auth.oauth_register", Some(&new_user.email), ip.as_deref(),
+                Some("user"), Some(&provider_name), None, None, "info", None,
+            ).await;
             new_user
         }
     };
@@ -374,6 +511,21 @@ pub async fn callback(
     // passkey login) — otherwise suspension is bypassable by logging in via OAuth.
     if user.role == "suspended" {
         return Err(err(StatusCode::FORBIDDEN, "Account suspended"));
+    }
+
+    // Feature 8, and the missing half of the parity the comment above claims: the
+    // password door refuses an unapproved account at auth.rs:305 and the passkey door
+    // at passkeys.rs:843, but this one did not check at all. Suspension parity was
+    // added here and approval parity was not, so of the three ways in, approval was
+    // enforced at two. COALESCE is copied from the other two deliberately — a row
+    // predating the column reads as approved, so repairing the gap cannot lock out an
+    // account that could sign in yesterday.
+    if let Ok(Some((approved,))) = sqlx::query_as::<_, (bool,)>(
+        "SELECT COALESCE(approved, TRUE) FROM users WHERE id = $1"
+    ).bind(user.id).fetch_optional(&state.db).await {
+        if !approved {
+            return Err(err(StatusCode::FORBIDDEN, "Account pending admin approval"));
+        }
     }
 
     // Lockdown, same rule and same admin escape hatch as the other two doors: an
@@ -404,11 +556,11 @@ pub async fn callback(
             &temp_claims,
             &jsonwebtoken::EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
         )
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("JWT encode failed: {e}")))?;
+        .map_err(|e| internal_error("oauth 2fa token encode", e))?;
 
         crate::services::activity::log_activity(
             &state.db, user.id, &user.email, "auth.oauth_login_2fa_required",
-            Some("user"), Some(&provider_name), None, None,
+            Some("user"), Some(&provider_name), None, None, None,
         ).await;
 
         // Redirect to frontend 2FA page with temp token
@@ -431,6 +583,7 @@ pub async fn callback(
         iat: now,
         exp: now + 7200, // 2 hours
         jti: Some(jti.clone()),
+        key_id: None,
     };
 
     let token = jsonwebtoken::encode(
@@ -438,7 +591,7 @@ pub async fn callback(
         &claims,
         &jsonwebtoken::EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
     )
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("JWT encode failed: {e}")))?;
+    .map_err(|e| internal_error("oauth session token encode", e))?;
 
     // Record the session so it is visible to session management AND — critically —
     // revocable: the DELETE user_sessions RETURNING jti -> blacklist sweeps (logout,
@@ -457,7 +610,11 @@ pub async fn callback(
 
     crate::services::activity::log_activity(
         &state.db, user.id, &user.email, "auth.oauth_login",
-        Some("user"), Some(&provider_name), None, None,
+        Some("user"), Some(&provider_name), None, ip.as_deref(), None,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.oauth_login", Some(&user.email), ip.as_deref(),
+        Some("user"), Some(&provider_name), None, None, "info", None,
     ).await;
 
     // Set cookie and redirect to dashboard.

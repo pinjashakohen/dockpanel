@@ -6,7 +6,8 @@ use axum::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::auth::{AuthUser, ServerScope};
+use crate::auth::AuthUser;
+use crate::auth::Claims;
 use crate::error::{internal_error, err, agent_error, paginate, ApiError};
 use crate::routes::is_safe_shell_command;
 use crate::routes::sites::ProvisionStep;
@@ -70,17 +71,12 @@ pub struct LogsQuery {
     pub offset: Option<i64>,
 }
 
-/// Verify site ownership, return (domain, site_id).
-async fn get_site(state: &AppState, site_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(site_id)
-            .bind(user_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("unknown", e))?;
-    row.map(|(d,)| d)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))
+/// Helper: resolve a site this caller may act on, and return its domain.
+///
+/// One line over [`crate::helpers::site_domain_for_caller`] — the shared resolver
+/// this module used to keep its own copy of.
+async fn get_site(state: &AppState, site_id: Uuid, claims: &Claims) -> Result<String, ApiError> {
+    crate::helpers::site_domain_for_caller(state, site_id, claims).await
 }
 
 /// GET /api/sites/{id}/deploy — Get deploy config.
@@ -89,7 +85,7 @@ pub async fn get_config(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Option<DeployConfig>>, ApiError> {
-    get_site(&state, id, claims.sub).await?;
+    get_site(&state, id, &claims).await?;
 
     let config: Option<DeployConfig> = sqlx::query_as(
         "SELECT * FROM deploy_configs WHERE site_id = $1",
@@ -98,6 +94,16 @@ pub async fn get_config(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("get config", e))?;
+
+    // Deploy.tsx builds the webhook URL to paste into the git host from this
+    // field on every load, so it must decrypt, not stay masked.
+    let config = config.map(|mut c| {
+        c.webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+            &c.webhook_secret,
+            &state.config.jwt_secret,
+        );
+        c
+    });
 
     Ok(Json(config))
 }
@@ -109,7 +115,7 @@ pub async fn set_config(
     Path(id): Path<Uuid>,
     Json(body): Json<SetDeployRequest>,
 ) -> Result<Json<DeployConfig>, ApiError> {
-    let domain = get_site(&state, id, claims.sub).await?;
+    let domain = get_site(&state, id, &claims).await?;
 
     if body.repo_url.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Repository URL is required"));
@@ -125,8 +131,17 @@ pub async fn set_config(
     let atomic_deploy = body.atomic_deploy.unwrap_or(false);
     let keep_releases = body.keep_releases.unwrap_or(5).clamp(2, 20);
     let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+    // Only used on first INSERT — ON CONFLICT's DO UPDATE never touches this
+    // column, so an existing config keeps its original secret (this mirrors
+    // the pre-encryption behavior exactly; see the decrypt-what-came-back
+    // below rather than trusting this local value for the returned struct).
+    let encrypted_webhook_secret = crate::services::secrets_crypto::encrypt_credential(
+        &webhook_secret,
+        &state.config.jwt_secret,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
-    let config: DeployConfig = sqlx::query_as(
+    let mut config: DeployConfig = sqlx::query_as(
         "INSERT INTO deploy_configs (site_id, repo_url, branch, deploy_script, auto_deploy, webhook_secret, atomic_deploy, keep_releases) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (site_id) DO UPDATE SET \
@@ -138,17 +153,25 @@ pub async fn set_config(
     .bind(branch)
     .bind(deploy_script)
     .bind(auto_deploy)
-    .bind(&webhook_secret)
+    .bind(&encrypted_webhook_secret)
     .bind(atomic_deploy)
     .bind(keep_releases)
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("set config", e))?;
 
+    // Decrypt whatever the row actually holds (freshly written on an INSERT,
+    // or the pre-existing secret on an update-conflict) rather than assuming
+    // the freshly-generated value above was ever stored.
+    config.webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &config.webhook_secret,
+        &state.config.jwt_secret,
+    );
+
     tracing::info!("Deploy config set for {domain}: {}", body.repo_url);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "deploy.config",
-        Some("deploy"), Some(&domain), Some(&body.repo_url), None,
+        Some("deploy"), Some(&domain), Some(&body.repo_url), None, claims.key_id,
     ).await;
 
     Ok(Json(config))
@@ -160,7 +183,7 @@ pub async fn remove_config(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    get_site(&state, id, claims.sub).await?;
+    get_site(&state, id, &claims).await?;
 
     sqlx::query("DELETE FROM deploy_configs WHERE site_id = $1")
         .bind(id)
@@ -175,7 +198,6 @@ pub async fn remove_config(
 pub async fn trigger(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Check for active critical/major incidents — block deploy during outage
@@ -190,7 +212,11 @@ pub async fn trigger(
             "Deploy blocked: active critical/major incident in progress. Resolve the incident first."));
     }
 
-    let domain = get_site(&state, id, claims.sub).await?;
+    // The same rule the webhook path below already follows: this clones a repository into
+    // the site's webroot and runs its build script as root on whichever host it is handed.
+    // The webhook was fixed because it has no caller to take a host from; this one had a
+    // caller, took the host from them, and was left as it was. Both need the site's own row.
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let config: DeployConfig = sqlx::query_as(
         "SELECT * FROM deploy_configs WHERE site_id = $1",
@@ -216,6 +242,7 @@ pub async fn trigger(
     let user_id = claims.sub;
     let email = claims.email.clone();
     let domain_clone = domain.clone();
+    let key_id = claims.key_id;
 
     tokio::spawn(async move {
         let emit = |step: &str, label: &str, status: &str, msg: Option<String>| {
@@ -243,7 +270,7 @@ pub async fn trigger(
 
                 activity::log_activity(
                     &db, user_id, &email, "deploy.trigger",
-                    Some("deploy"), Some(&domain_clone), log.commit_hash.as_deref(), Some(&log.status),
+                    Some("deploy"), Some(&domain_clone), log.commit_hash.as_deref(), Some(&log.status), key_id,
                 ).await;
             }
             Err((_status, body)) => {
@@ -268,10 +295,9 @@ pub async fn trigger(
 pub async fn keygen(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let result = agent
         .post("/deploy/keygen", Some(serde_json::json!({ "domain": domain })))
@@ -304,7 +330,7 @@ pub async fn logs(
     Path(id): Path<Uuid>,
     Query(params): Query<LogsQuery>,
 ) -> Result<Json<Vec<DeployLog>>, ApiError> {
-    get_site(&state, id, claims.sub).await?;
+    get_site(&state, id, &claims).await?;
 
     let (limit, offset) = paginate(params.limit, params.offset);
 
@@ -345,7 +371,7 @@ pub async fn webhook(
             // Window expired, reset
             *entry = (0, now);
         }
-        if entry.0 >= 10 {
+        if entry.0 >= crate::routes::WEBHOOK_ATTEMPT_LIMIT {
             return Err(err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded. Try again later."));
         }
     }
@@ -360,9 +386,14 @@ pub async fn webhook(
     .map_err(|e| internal_error("webhook", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid webhook"))?;
 
+    let stored_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &config.webhook_secret,
+        &state.config.jwt_secret,
+    );
+
     // Constant-time secret comparison using subtle crate
     use subtle::ConstantTimeEq;
-    if secret.as_bytes().ct_eq(config.webhook_secret.as_bytes()).unwrap_u8() != 1 {
+    if secret.as_bytes().ct_eq(stored_secret.as_bytes()).unwrap_u8() != 1 {
         // Record failed attempt
         {
             let mut attempts = state.webhook_attempts.lock().unwrap_or_else(|e| e.into_inner());
@@ -569,7 +600,7 @@ async fn execute_deploy(
                         notifications::notify_panel(db, user_id_opt,
                             &format!("Deploy warning: {} returning HTTP {}", domain, status_code),
                             &format!("Deploy succeeded but the site is returning HTTP {}. Check your application logs.", status_code),
-                            "warning", "deploy", None).await;
+                            "warning", "deploy", Some(&format!("/sites/{site_id}"))).await;
                     } else {
                         tracing::info!("Post-deploy health check OK for {domain}: HTTP {status_code}");
                     }
@@ -582,7 +613,7 @@ async fn execute_deploy(
                     notifications::notify_panel(db, user_id_opt,
                         &format!("Deploy warning: {} unreachable", domain),
                         &format!("Deploy succeeded but the site is not responding: {}", e),
-                        "warning", "deploy", None).await;
+                        "warning", "deploy", Some(&format!("/sites/{site_id}"))).await;
                 }
             }
         }
@@ -592,6 +623,26 @@ async fn execute_deploy(
     if success {
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
         if !jwt_secret.is_empty() {
+            // The vault is NOT encrypted under the JWT secret — it is encrypted
+            // under the key derived from it. Every writer goes through the
+            // derivation in `routes::secrets`, and so does the manual "Inject"
+            // button beside it, which runs this same query against the same
+            // rows and PUTs the same body to the same agent route. This path
+            // passed the raw JWT secret instead, so every decrypt returned Err.
+            //
+            // Nothing could report that. AES-GCM authenticates, so a wrong key
+            // cannot yield garbage — it yields an error, which `if let Ok` threw
+            // away; `env_pairs` then stayed empty, and the agent call and the
+            // only log line both sit inside `if !env_pairs.is_empty()`. A
+            // feature on the README, in FEATURES.md, in the guide and behind a
+            // UI checkbox was inert and silent at the same time.
+            // Read path — `decrypt_vault` tries every source the value could have
+            // been written under. Deriving ONE source and handing it to
+            // `secrets_crypto::decrypt` is the shape that made adding
+            // SECRETS_ENCRYPTION_KEY strand every vault secret; this call site
+            // already carries the scar tissue from the last time it read with the
+            // wrong key and could not say so.
+
             let inject_rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT s.key, s.encrypted_value FROM secrets s \
                  JOIN secret_vaults v ON v.id = s.vault_id AND v.site_id = $1 \
@@ -602,15 +653,36 @@ async fn execute_deploy(
 
             if !inject_rows.is_empty() {
                 let mut env_pairs = Vec::new();
+                let mut undecryptable = 0usize;
                 for (key, encrypted_value) in &inject_rows {
-                    if let Ok(value) = crate::services::secrets_crypto::decrypt(encrypted_value, &jwt_secret) {
-                        env_pairs.push(serde_json::json!({ "key": key, "value": value }));
+                    match crate::services::secrets_crypto::decrypt_vault(encrypted_value, &jwt_secret) {
+                        Ok(value) => {
+                            env_pairs.push(serde_json::json!({ "key": key, "value": value }));
+                        }
+                        // The NAME is enough to act on; never the ciphertext and
+                        // never the key. Skipping quietly is what hid the wrong
+                        // key material here for four months.
+                        Err(e) => {
+                            undecryptable += 1;
+                            tracing::warn!("Auto-inject: could not decrypt secret {key} for {domain}: {e}");
+                        }
                     }
                 }
                 if !env_pairs.is_empty() {
                     let body = serde_json::json!({ "vars": env_pairs });
-                    let _ = agent.put(&format!("/nginx/env/{domain}"), body).await;
-                    tracing::info!("Auto-injected {} secrets into {domain} after deploy", env_pairs.len());
+                    match agent.put(&format!("/nginx/env/{domain}"), body).await {
+                        Ok(_) => tracing::info!(
+                            "Auto-injected {} secrets into {domain} after deploy", env_pairs.len()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Auto-inject: the agent refused the env write for {domain}: {e}"
+                        ),
+                    }
+                } else if undecryptable > 0 {
+                    tracing::warn!(
+                        "Auto-inject: all {undecryptable} auto-inject secrets for {domain} \
+                         failed to decrypt — nothing was injected"
+                    );
                 }
             }
         }
@@ -648,9 +720,9 @@ async fn execute_deploy(
         .bind(site_id).fetch_optional(db).await
         .map_err(|e| internal_error("deploy notification user lookup", e))?;
     if success {
-        notifications::notify_panel(db, user_id, &format!("Deploy complete: {}", domain), "Site deployment completed successfully", "info", "deploy", None).await;
+        notifications::notify_panel(db, user_id, &format!("Deploy complete: {}", domain), "Site deployment completed successfully", "info", "deploy", Some(&format!("/sites/{site_id}"))).await;
     } else {
-        notifications::notify_panel(db, user_id, &format!("Deploy failed: {}", domain), output, "critical", "deploy", None).await;
+        notifications::notify_panel(db, user_id, &format!("Deploy failed: {}", domain), output, "critical", "deploy", Some(&format!("/sites/{site_id}"))).await;
     }
 
     Ok(log)
@@ -660,10 +732,9 @@ async fn execute_deploy(
 pub async fn list_releases(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<ReleaseInfo>>, ApiError> {
-    let domain = get_site(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let result = agent
         .get(&format!("/deploy/releases/{domain}"))
@@ -680,10 +751,9 @@ pub async fn list_releases(
 pub async fn rollback_release(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path((id, release_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let result = agent
         .post("/deploy/activate", Some(serde_json::json!({
@@ -707,7 +777,7 @@ pub async fn rollback_release(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "deploy.rollback",
-        Some("deploy"), Some(&domain), Some(&release_id), Some("success"),
+        Some("deploy"), Some(&domain), Some(&release_id), Some("success"), claims.key_id,
     ).await;
 
     // Reload nginx to pick up any config changes

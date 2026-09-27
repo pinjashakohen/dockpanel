@@ -112,6 +112,36 @@ log()    { echo -e "${GREEN}[+]${NC} $1"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $1"; }
 error()  { echo -e "${RED}[x]${NC} $1" >&2; }
 
+# dp_fetch <url> <out> — download, retrying the failures curl's own --retry does
+# not. Same shape as setup.sh's dp_fetch, deliberately: four programs in this
+# repo perform the identical operation against the identical host, and until
+# s354 only the installer retried it at all.
+#
+# `--retry` covers connection refusals, timeouts and some HTTP codes. It does
+# NOT cover a connection dropped MID-TRANSFER, which exits 56 — the error that
+# has aborted real installs against the release CDN. curl grew
+# `--retry-all-errors` for exactly this, but it landed in 7.71 and the installer
+# supports Ubuntu 20.04, which ships 7.68 — so the loop lives in shell, and the
+# four copies stay identical rather than drifting apart.
+#
+# ⚠ `rc=$?` on the line after a bare `if` reads 0, because a false `if` with no
+# `else` is itself a success. Capture with `|| rc=$?` on the command itself.
+# ⚠ Written as explicit `if` blocks, not `[ … ] && …`: under `set -e` a false
+# test at statement level aborts the script.
+dp_fetch() {
+    local url="$1" out="$2" attempt=1 rc=0
+    while [ "$attempt" -le 3 ]; do
+        rc=0
+        curl --retry 3 --retry-delay 2 -sfL "$url" -o "$out" || rc=$?
+        if [ "$rc" -eq 0 ]; then return 0; fi
+        warn "  fetch attempt ${attempt}/3 exited ${rc} — $url"
+        rm -f "$out"
+        attempt=$((attempt + 1))
+        if [ "$attempt" -le 3 ]; then sleep 3; fi
+    done
+    return "$rc"
+}
+
 # ── Checks ────────────────────────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     error "Run as root"
@@ -123,6 +153,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AGENT_SRC="$REPO_DIR/panel/agent"
 API_SRC="$REPO_DIR/panel/backend"
 CLI_SRC="$REPO_DIR/panel/cli"
+MCP_SRC="$REPO_DIR/panel/mcp"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
 # stripped. Derived from the unit that is about to be deployed (or, on a layout
@@ -138,6 +169,7 @@ FRONTEND_DIR="$REPO_DIR/panel/frontend"
 AGENT_BIN="/usr/local/bin/dockpanel-agent"
 API_BIN="/usr/local/bin/dockpanel-api"
 CLI_BIN="/usr/local/bin/dockpanel"
+MCP_BIN="/usr/local/bin/dockpanel-mcp"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="ovexro/dockpanel"
 
@@ -249,12 +281,56 @@ fi
 _dockpanel_stage="db-backup"
 BACKUP_DIR="/var/backups/dockpanel/db"
 mkdir -p "$BACKUP_DIR"
+# `>` creates 0666 & ~umask. This dump carries `servers.agent_token` in
+# cleartext — the Bearer credential for every agent endpoint and the key the
+# agent signs its own root-shell tickets with — so it is root-only. The two
+# chmods repair a tree an older installer already left 0755/0644; the agent
+# does the same at startup, but update.sh runs on panel boxes that may not
+# restart the agent for hours.
+#
+# ⚠ The umask MUST stay inside the subshell. v2.88.0 set it bare at this line,
+# which is top-level scope in a 1100-line script, so it governed every `mkdir`
+# and `>` for the rest of the upgrade — including `mkdir -p "$FE_DIR"` below
+# (nginx serves the SPA from there as www-data: 0700 makes every panel asset
+# 403) and `/var/www/acme/.well-known/acme-challenge` (0700 breaks HTTP-01, so
+# certificates stop renewing). Both are silent: `tar` restores its own archived
+# modes, so the extracted tree looks right and only the parent is wrong.
+# Scope it the way setup.sh already does at its three `$(umask 077; mktemp)`
+# sites — the redirect is the only thing that needs it.
+chmod 700 "$BACKUP_DIR" /var/backups/dockpanel 2>/dev/null || true
 log "Backing up database..."
-if docker exec dockpanel-postgres pg_dump -U dockpanel dockpanel | gzip > "$BACKUP_DIR/pre-upgrade-$(date +%Y%m%d%H%M%S).sql.gz"; then
+if ( umask 077; docker exec dockpanel-postgres pg_dump -U dockpanel dockpanel | gzip > "$BACKUP_DIR/pre-upgrade-$(date +%Y%m%d%H%M%S).sql.gz" ); then
     log "Database backup saved to $BACKUP_DIR/"
 else
     error "Database backup failed, aborting upgrade"
     exit 1
+fi
+
+# ── Harden a legacy inline backup cron ────────────────────────────────────
+# Installs predating v2.88.0 carry the daily dump as an INLINE crontab command
+# whose bare `>` creates the file 0666 & ~umask — so the whole panel database,
+# `servers.agent_token` in cleartext, lands 0644 on a box that also runs other
+# people's PHP as www-data.
+#
+# v2.88.0 hardened the writer setup.sh EMITS, but nothing rewrote an existing
+# install's crontab, and nothing could: setup.sh dedupes on the new script's
+# path, which a legacy inline line never contains, so re-running setup leaves
+# the old line in place and adds a SECOND daily dump. update.sh referenced
+# crontab nowhere at all. The agent's startup sweep is what makes older dumps
+# look correct — it repairs the tree once, at start, so the newest dump stays
+# 0644 from 03:30 until the next agent restart.
+#
+# Prepending the umask is deliberately the whole fix: it needs no new file, it
+# preserves whatever schedule the operator chose, and it is safe to run twice.
+if crontab -l 2>/dev/null | grep -c 'pg_dump -U dockpanel.*/var/backups/dockpanel/db' >/dev/null \
+   && ! crontab -l 2>/dev/null | grep 'pg_dump -U dockpanel' | grep -c 'umask 077' >/dev/null; then
+    if crontab -l 2>/dev/null \
+        | sed '\#/var/backups/dockpanel/db# s#docker exec dockpanel-postgres pg_dump#umask 077; docker exec dockpanel-postgres pg_dump#' \
+        | crontab -; then
+        log "Hardened legacy database-backup cron (umask 077)"
+    else
+        warn "Could not rewrite the legacy backup cron — dumps stay 0644 until it is fixed by hand"
+    fi
 fi
 
 # ── Build or download binaries ────────────────────────────────────────────
@@ -304,7 +380,7 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     # checksums.txt, a missing entry, or a hash mismatch aborts the upgrade —
     # never install unverified bytes (lesson #25/#48).
     CHECKSUMS=/tmp/dockpanel-checksums.txt
-    if ! curl -sfL "${BASE_URL}/checksums.txt" -o "$CHECKSUMS"; then
+    if ! dp_fetch "${BASE_URL}/checksums.txt" "$CHECKSUMS"; then
         error "Could not download ${BASE_URL}/checksums.txt — refusing to install unverified binaries"
         exit 1
     fi
@@ -325,23 +401,28 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     }
 
     log "Downloading agent (${DL_ARCH})..."
-    curl -sfL "${BASE_URL}/dockpanel-agent-linux-${DL_ARCH}" -o /tmp/dockpanel-agent-new
+    dp_fetch "${BASE_URL}/dockpanel-agent-linux-${DL_ARCH}" /tmp/dockpanel-agent-new
     verify_checksum /tmp/dockpanel-agent-new "dockpanel-agent-linux-${DL_ARCH}"
     chmod +x /tmp/dockpanel-agent-new
 
     log "Downloading API (${DL_ARCH})..."
-    curl -sfL "${BASE_URL}/dockpanel-api-linux-${DL_ARCH}" -o /tmp/dockpanel-api-new
+    dp_fetch "${BASE_URL}/dockpanel-api-linux-${DL_ARCH}" /tmp/dockpanel-api-new
     verify_checksum /tmp/dockpanel-api-new "dockpanel-api-linux-${DL_ARCH}"
     chmod +x /tmp/dockpanel-api-new
 
     log "Downloading CLI (${DL_ARCH})..."
-    curl -sfL "${BASE_URL}/dockpanel-cli-linux-${DL_ARCH}" -o /tmp/dockpanel-cli-new
+    dp_fetch "${BASE_URL}/dockpanel-cli-linux-${DL_ARCH}" /tmp/dockpanel-cli-new
     verify_checksum /tmp/dockpanel-cli-new "dockpanel-cli-linux-${DL_ARCH}"
     chmod +x /tmp/dockpanel-cli-new
 
+    log "Downloading MCP server (${DL_ARCH})..."
+    dp_fetch "${BASE_URL}/dockpanel-mcp-linux-${DL_ARCH}" /tmp/dockpanel-mcp-new
+    verify_checksum /tmp/dockpanel-mcp-new "dockpanel-mcp-linux-${DL_ARCH}"
+    chmod +x /tmp/dockpanel-mcp-new
+
     # Download and extract frontend
     log "Downloading frontend..."
-    curl -sfL "${BASE_URL}/dockpanel-frontend.tar.gz" -o /tmp/dockpanel-frontend.tar.gz
+    dp_fetch "${BASE_URL}/dockpanel-frontend.tar.gz" /tmp/dockpanel-frontend.tar.gz
     verify_checksum /tmp/dockpanel-frontend.tar.gz "dockpanel-frontend.tar.gz"
     FE_DIR="/opt/dockpanel/frontend"
     mkdir -p "$FE_DIR"
@@ -372,6 +453,11 @@ else
 
     log "Building CLI..."
     (cd "$CLI_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
+
+    if [ -d "$MCP_SRC" ]; then
+        log "Building MCP server..."
+        (cd "$MCP_SRC" && $CARGO_CMD build --release 2>&1 | tail -1)
+    fi
 
     if [ -d "$FRONTEND_DIR" ]; then
         log "Building frontend..."
@@ -499,7 +585,7 @@ fi
 
 if command -v getenforce &> /dev/null && [ "$(getenforce 2>/dev/null)" = "Enforcing" ] \
    && command -v getsebool &> /dev/null; then
-    if getsebool httpd_can_network_connect 2>/dev/null | grep -q -- "--> off"; then
+    if getsebool httpd_can_network_connect 2>/dev/null | grep -c -- "--> off" >/dev/null; then
         if setsebool -P httpd_can_network_connect on 2>/dev/null; then
             log "SELinux: allowed nginx to reach the API (the panel was answering 502)"
         else
@@ -519,6 +605,16 @@ if [ -f "$AGENT_SRC/dockpanel-agent.service" ]; then
     chmod 644 /etc/systemd/system/dockpanel-agent.service
 else
     warn "Agent unit source not found at $AGENT_SRC/dockpanel-agent.service — keeping existing on-disk unit (no repo tree on this layout)"
+fi
+
+# MCP server unit — deploy from repo (single source of truth:
+# panel/mcp/dockpanel-mcp.service). Installed but never enabled/started here:
+# see the matching comment in setup.sh's create_services(). An install that
+# already has the service enabled (a manual opt-in) keeps running through the
+# upgrade — this only refreshes the unit FILE, it never touches enablement.
+if [ -f "$MCP_SRC/dockpanel-mcp.service" ]; then
+    cp "$MCP_SRC/dockpanel-mcp.service" /etc/systemd/system/dockpanel-mcp.service
+    chmod 644 /etc/systemd/system/dockpanel-mcp.service
 fi
 
 cat > /etc/systemd/system/dockpanel-api.service << 'EOF'
@@ -561,7 +657,34 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
         fi
     done
 else
-    FE_DIST="${REPO_DIR}/panel/frontend/dist"
+    # The build above lands in $REPO_DIR/panel/frontend/dist, but nginx's
+    # `root` may point somewhere else entirely — every box that started life
+    # via the standard curl|bash install.sh serves from
+    # /opt/dockpanel/frontend/dist (the release-tarball layout, written by the
+    # branch above), which this branch's own build output never touches. Left
+    # alone, a source build logs "Frontend rebuilt" and changes nothing an
+    # operator can see: the exact stale-panel-that-looks-healthy failure this
+    # box's own nginx config already warns about (see the /assets/ location
+    # comment in setup.sh's heredoc), reached through a second door — found by
+    # actually loading the panel after a source-build upgrade, not by reading
+    # the script. Detect the ACTUAL served root rather than assume one, and
+    # sync the fresh build there; fall back to the build directory itself only
+    # when no vhost exists yet to read (first-ever setup.sh run).
+    BUILT_DIST="${REPO_DIR}/panel/frontend/dist"
+    FE_DIST="$BUILT_DIST"
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        if [ -f "$conf" ]; then
+            SERVED_ROOT=$(grep -oP '^\s*root\s+\K[^;]+' "$conf" | head -1)
+            if [ -n "$SERVED_ROOT" ] && [ "$SERVED_ROOT" != "$BUILT_DIST" ] && [ -d "$BUILT_DIST" ]; then
+                mkdir -p "$SERVED_ROOT"
+                rsync -a --delete "$BUILT_DIST/" "$SERVED_ROOT/" 2>/dev/null \
+                    || cp -r "$BUILT_DIST/." "$SERVED_ROOT/"
+                log "Synced built frontend to the served root ($SERVED_ROOT)"
+                FE_DIST="$SERVED_ROOT"
+            fi
+            break
+        fi
+    done
 fi
 
 # ── Drop install-agent.sh into FE_ROOT (#56, v2.8.14) ─────────────────────
@@ -648,6 +771,63 @@ if [ -d /etc/nginx/sites-enabled ]; then
             sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl ipv6only=on;|\1listen [::]:443 ssl;|' "$site_conf"
             log "Stripped ipv6only=on from $site_conf for shared-socket compatibility"
             NGINX_NEEDS_RELOAD=1
+        fi
+    done
+fi
+
+# ── v2.68.1: retrofit the static branch's denies onto EXISTING site vhosts ───
+# v2.68.0 fixed the TEMPLATE, and a template only reaches a site when something
+# re-renders its vhost — a runtime switch, an SSL issuance, a settings change.
+# Nothing re-renders on upgrade. So the site that most needs this fix, one already
+# switched from php to static under v2.67.0, keeps serving wp-config.php, .env and
+# .git/config as plain text after the operator has updated and been told it is
+# fixed. Same shape as the v2.47.1 index.html migration below: a fix that reaches
+# only new renders is a fix nobody in the field receives.
+#
+# Scoped by what the vhost IS, not by what we guess it was: a static vhost has the
+# static branch's `index index.html index.htm;` and no fastcgi handler. A php vhost
+# already carries these denies inside its preset branch and is skipped. Additive,
+# idempotent (guarded on the deny already being present), and every edit is
+# validated by `nginx -t` with a per-file rollback — a security retrofit must never
+# be the thing that takes a customer's site down.
+if [ -d /etc/nginx/sites-enabled ]; then
+    for site_conf in /etc/nginx/sites-enabled/*.conf; do
+        [ -f "$site_conf" ] || continue
+        case "$(basename "$site_conf")" in
+            dockpanel-panel.conf) continue ;;
+        esac
+        grep -q 'index index.html index.htm;' "$site_conf" || continue
+        grep -q 'fastcgi_pass' "$site_conf" && continue
+        grep -qF 'location ~ /\.(?!well-known)' "$site_conf" && continue
+
+        cp -p "$site_conf" "$site_conf.pre-2680" 2>/dev/null || true
+        if awk '
+            { print }
+            /^[[:space:]]*index index\.html index\.htm;[[:space:]]*$/ {
+                print "";
+                print "    # v2.68.1: a site switched from php to static keeps its application";
+                print "    # source in the same docroot. Both denies exist in every php preset.";
+                print "    location ~ /\\.(?!well-known) {";
+                print "        deny all;";
+                print "    }";
+                print "";
+                print "    location ~ \\.php$ {";
+                print "        deny all;";
+                print "    }";
+            }
+        ' "$site_conf.pre-2680" > "$site_conf.new" 2>/dev/null && [ -s "$site_conf.new" ]; then
+            mv "$site_conf.new" "$site_conf"
+            if nginx -t > /dev/null 2>&1; then
+                rm -f "$site_conf.pre-2680"
+                log "Retrofitted dotfile/.php denies onto static vhost $site_conf"
+                NGINX_NEEDS_RELOAD=1
+            else
+                mv "$site_conf.pre-2680" "$site_conf"
+                log "WARN: denies rejected by nginx -t for $site_conf — reverted, site untouched"
+            fi
+        else
+            rm -f "$site_conf.new" "$site_conf.pre-2680"
+            log "WARN: could not retrofit denies onto $site_conf — skipped"
         fi
     done
 fi
@@ -794,7 +974,7 @@ for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dock
     ' "$conf" "$conf" > "$conf.new" && [ -s "$conf.new" ] \
         && grep -q 'max-age=31536000, immutable' "$conf.new" \
         && ! awk '/^    location \/assets\/ \{/ {f=1} f {print} f && /^    \}/ {exit}' \
-             "$conf.new" | grep -q 'expires '; then
+             "$conf.new" | grep -c 'expires ' >/dev/null; then
         mv "$conf.new" "$conf"
         log "Repeated the security headers on /assets/ in $conf"
         NGINX_NEEDS_RELOAD=1
@@ -810,7 +990,7 @@ if [ "$NGINX_NEEDS_RELOAD" = "1" ] || [ "$NGINX_NEEDS_RESTART" = "1" ]; then
             systemctl restart nginx > /dev/null 2>&1 && log "Nginx restarted after panel :443 listen migration"
             # Verify the socket actually moved — the whole point of restarting.
             if command -v ss > /dev/null 2>&1 && [ -n "${PANEL_BIND_IP:-}" ] \
-               && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -q "${PANEL_BIND_IP}:443"; then
+               && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -c "${PANEL_BIND_IP}:443" >/dev/null; then
                 log "WARN: panel is still not listening on ${PANEL_BIND_IP}:443 — a site vhost may shadow it"
             fi
         else
@@ -869,21 +1049,40 @@ log "Backing up current binaries..."
 cp "$AGENT_BIN" "${AGENT_BIN}.bak" 2>/dev/null || true
 cp "$API_BIN" "${API_BIN}.bak" 2>/dev/null || true
 cp "$CLI_BIN" "${CLI_BIN}.bak" 2>/dev/null || true
+# dockpanel-mcp is a NEW binary as of this release — on every box upgrading
+# for the first time since it shipped, $MCP_BIN does not exist yet, so there
+# is nothing to back up and nothing to roll back TO. Recorded now so the
+# rollback function below can tell "no backup because first install" apart
+# from "no backup because something is actually wrong".
+MCP_BIN_PRE_EXISTED=0
+[ -f "$MCP_BIN" ] && MCP_BIN_PRE_EXISTED=1
+cp "$MCP_BIN" "${MCP_BIN}.bak" 2>/dev/null || true
+
+# dockpanel-mcp is opt-in (§ setup.sh/update.sh systemd-units comment) — most
+# installs have it deployed but never enabled, so unlike agent/api it is only
+# stopped/restarted here if an operator already turned it on. Captured BEFORE
+# the stop below since `systemctl is-active` after stopping would always say no.
+MCP_WAS_ACTIVE=0
+systemctl is-active --quiet dockpanel-mcp 2>/dev/null && MCP_WAS_ACTIVE=1
 
 log "Stopping services..."
 _dockpanel_services_stopped=1
 systemctl stop dockpanel-agent dockpanel-api 2>/dev/null || true
+[ "$MCP_WAS_ACTIVE" = "1" ] && systemctl stop dockpanel-mcp 2>/dev/null || true
 
 if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     mv /tmp/dockpanel-agent-new "$AGENT_BIN"
     mv /tmp/dockpanel-api-new "$API_BIN"
     mv /tmp/dockpanel-cli-new "$CLI_BIN"
+    mv /tmp/dockpanel-mcp-new "$MCP_BIN"
 else
     cp "$AGENT_SRC/target/release/dockpanel-agent" "$AGENT_BIN"
     cp "$API_SRC/target/release/dockpanel-api" "$API_BIN"
     cp "$CLI_SRC/target/release/dockpanel" "$CLI_BIN"
+    [ -f "$MCP_SRC/target/release/dockpanel-mcp" ] && cp "$MCP_SRC/target/release/dockpanel-mcp" "$MCP_BIN"
 fi
 chmod +x "$AGENT_BIN" "$API_BIN" "$CLI_BIN"
+[ -f "$MCP_BIN" ] && chmod +x "$MCP_BIN"
 
 # SELinux: restore the binaries' security context after the swap.
 #
@@ -903,15 +1102,16 @@ chmod +x "$AGENT_BIN" "$API_BIN" "$CLI_BIN"
 #
 # No-op on Debian/Ubuntu, where restorecon is usually absent.
 if command -v restorecon > /dev/null 2>&1; then
-    restorecon -F "$AGENT_BIN" "$API_BIN" "$CLI_BIN" 2>/dev/null || true
+    restorecon -F "$AGENT_BIN" "$API_BIN" "$CLI_BIN" "$MCP_BIN" 2>/dev/null || true
 fi
 
-log "Binaries updated (agent: $(du -h "$AGENT_BIN" | cut -f1), api: $(du -h "$API_BIN" | cut -f1), cli: $(du -h "$CLI_BIN" | cut -f1))"
+log "Binaries updated (agent: $(du -h "$AGENT_BIN" | cut -f1), api: $(du -h "$API_BIN" | cut -f1), cli: $(du -h "$CLI_BIN" | cut -f1), mcp: $(du -h "$MCP_BIN" 2>/dev/null | cut -f1 || echo '?'))"
 
 systemctl daemon-reload
 systemctl start dockpanel-agent
 sleep 1
 systemctl start dockpanel-api
+[ "$MCP_WAS_ACTIVE" = "1" ] && systemctl start dockpanel-mcp
 _dockpanel_services_stopped=0
 log "Services restarted"
 
@@ -933,10 +1133,11 @@ rollback() {
     # busy inode — it is what the forward swap above already uses.
     _dockpanel_services_stopped=1
     systemctl stop dockpanel-agent dockpanel-api 2>/dev/null || true
+    [ "$MCP_WAS_ACTIVE" = "1" ] && systemctl stop dockpanel-mcp 2>/dev/null || true
 
     local restore_failed=0
     local pair
-    for pair in "$AGENT_BIN" "$API_BIN" "$CLI_BIN"; do
+    for pair in "$AGENT_BIN" "$API_BIN" "$CLI_BIN" "$MCP_BIN"; do
         if [ -f "${pair}.bak" ]; then
             if mv "${pair}.bak" "$pair"; then
                 log "Restored $pair"
@@ -944,6 +1145,13 @@ rollback() {
                 error "FAILED to restore $pair from ${pair}.bak"
                 restore_failed=1
             fi
+        elif [ "$pair" = "$MCP_BIN" ] && [ "$MCP_BIN_PRE_EXISTED" = "0" ]; then
+            # Nothing to roll back to — this box never had dockpanel-mcp before
+            # this update. Remove the newly-placed (unhealthy-update) binary
+            # rather than leaving a stray one an un-rolled-back systemd unit
+            # could later be pointed at.
+            rm -f "$pair"
+            log "No prior $pair to restore (first install of this binary) — removed"
         else
             error "No backup at ${pair}.bak — cannot restore $pair"
             restore_failed=1
@@ -958,6 +1166,9 @@ rollback() {
     systemctl start dockpanel-agent || error "dockpanel-agent did not start after rollback"
     sleep 1
     systemctl start dockpanel-api || error "dockpanel-api did not start after rollback"
+    if [ "$MCP_WAS_ACTIVE" = "1" ]; then
+        systemctl start dockpanel-mcp || error "dockpanel-mcp did not start after rollback"
+    fi
     _dockpanel_services_stopped=0
 
     if [ "$restore_failed" = "1" ]; then
@@ -1026,12 +1237,15 @@ _dockpanel_write_result true "complete" \
     "updated to ${DOCKPANEL_VERSION:-latest} and passed the post-deploy health checks"
 
 # Clean up backups
-rm -f "${AGENT_BIN}.bak" "${API_BIN}.bak" "${CLI_BIN}.bak"
+rm -f "${AGENT_BIN}.bak" "${API_BIN}.bak" "${CLI_BIN}.bak" "${MCP_BIN}.bak"
 
 echo ""
 echo -e "${GREEN}${BOLD}Update complete!${NC}"
 echo ""
 echo -e "  Agent: $(systemctl is-active dockpanel-agent)"
 echo -e "  API:   $(systemctl is-active dockpanel-api)"
+if systemctl list-unit-files dockpanel-mcp.service > /dev/null 2>&1; then
+    echo -e "  MCP:   $(systemctl is-active dockpanel-mcp) $([ "$MCP_WAS_ACTIVE" = "0" ] && echo '(not enabled — see docs.dockpanel.dev)')"
+fi
 echo -e "  Version: $($CLI_BIN --version 2>/dev/null || echo 'unknown')"
 echo ""

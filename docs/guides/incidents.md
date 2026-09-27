@@ -31,7 +31,7 @@ investigating --> identified --> monitoring --> resolved --> postmortem
 
 ### From the Panel
 
-1. Go to **Incidents** in the sidebar
+1. Go to **Monitoring** in the sidebar, then the **Status Page** tab
 2. Click **Create Incident**
 3. Fill in:
    - **Title**: Short description (e.g., "API response times elevated")
@@ -121,7 +121,7 @@ Subscribers receive email notifications for:
 
 Notifications are sent through your configured SMTP settings (see **Settings** > **Email**). If SMTP is not configured, subscriber notifications are silently skipped.
 
-Subscribers can sign up on the public status page (if the subscribe option is enabled) or be managed from **Status Page** > **Subscribers** in the admin panel.
+Subscribers sign up on the public status page (if the subscribe option is enabled) and remove themselves through the public unsubscribe endpoint. There is no subscriber screen in the admin panel; the list is readable over the API at `GET /api/status-page/subscribers`.
 
 ## How Incidents Appear on the Status Page
 

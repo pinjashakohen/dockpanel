@@ -47,7 +47,11 @@ Check history is kept for 24 hours and then purged automatically.
 
 ### Maintenance Windows
 
-When a maintenance window is active for a user, their monitors are skipped. No checks run and no alerts fire during the window. Schedule maintenance from the panel to suppress false alarms during planned downtime.
+When a maintenance window is active for a user, their uptime monitors are skipped and the alert engine stops paging them. CPU, memory, disk, disk forecast, memory leak, server offline, service health, SSL expiry, GPU and container alerts are all held for the duration.
+
+Nothing is lost by holding them. Each describes a standing condition that is re-evaluated every 60 seconds, so anything still true when the window closes fires on the next check. The window is applied before any alert state is recorded, precisely so that a held alert is deferred rather than marked as already sent.
+
+Alerts that report a **one-off event** are deliberately not suppressed, because nothing would raise them again afterwards: backup failure, backup verification failure, cron failure, security findings, image scan findings, WordPress vulnerability scan findings and SSL renewal failures still arrive during a window.
 
 ### Heartbeat Monitors (Dead Man's Switch)
 
@@ -60,7 +64,7 @@ No authentication is required for heartbeat pings.
 
 ## Alert Rules
 
-Alert rules define thresholds for server-level conditions. Configure them under **Alerts** > **Rules**.
+Alert rules define thresholds for server-level conditions. Configure them under **Settings** > **Alert Channels**.
 
 ### Available Alert Types
 
@@ -81,13 +85,22 @@ You can set rules globally (apply to all servers) or per-server to override glob
 
 After an alert fires, it will not fire again for the configured cooldown period (default: 60 minutes). This prevents notification spam during sustained incidents.
 
-### Muted Types
+### Recording and notifying are two different switches
 
-You can mute specific alert types from external notifications (Slack, Discord, etc.) while still recording them in the panel. Set a comma-separated list of types to suppress in the alert rules.
+**Settings** > **Notifications** > **Alert Behaviour** gives every alert type two checkboxes. They do different things, and the difference matters:
+
+| Column | Switched off means |
+|--------|--------------------|
+| **Record** | The alert is never created at all — no alert row, no bell, no status-page incident, and nothing for escalation to page you about. |
+| **Notify** | The alert is still recorded and visible in the panel exactly as usual. Only the external send is suppressed: Slack, Discord, PagerDuty and webhooks. |
+
+Ten of the twenty alert types have a **Record** switch: CPU, memory, disk, offline, service, backup, SSL expiry, and the three GPU types — which share a single switch between them. The other ten are always recorded and show a dash in that column; use **Notify** if you do not want to be paged for one of those.
+
+Switching **Record** off also stops alerts of that type **escalating**. Before v2.158.0 it did not: the switch was read only when an alert was first recorded, so a row that was already firing when you switched its type off carried on re-paging every thirty minutes until it aged out of the seven-day escalation window. Switching the type back on resumes paging on the next sweep, without the delay a fresh alert waits out.
 
 ## Notification Channels
 
-Configure where alerts are sent under **Alerts** > **Rules**.
+Configure where alerts are sent under **Settings** > **Alert Channels**.
 
 | Channel | Configuration |
 |---------|---------------|
@@ -102,6 +115,8 @@ All webhook URLs are validated against SSRF -- internal/private IP addresses are
 ## Alert Escalation
 
 If a firing alert is not acknowledged within 15 minutes, the alert engine re-sends notifications. Escalation repeats every 30 minutes until the alert is acknowledged or resolved.
+
+If you attach an **escalation policy** to an alert rule, that chain drives the escalation instead: its first step fires the moment the alert is created, and each later step fires once the alert has gone unacknowledged past that step's threshold. When the chain runs out, the alert falls back to the same 30-minute cadence above, re-paging the last step's route -- an unacknowledged alert never stops paging on its own.
 
 To stop escalation, go to **Alerts** and click **Acknowledge** on the alert.
 
@@ -142,7 +157,69 @@ Every 2 minutes, the alert engine checks all Docker containers on the server:
 
 ## SSL Certificate Dashboard
 
-The certificate dashboard shows all SSL certificates across your sites with expiry dates. Certificates expiring within the configured warning window (default: 30, 14, 7, 3, 1 days) trigger alerts. DockPanel auto-renews Let's Encrypt certificates. The dashboard helps you spot custom certificates that need manual renewal.
+The certificate dashboard shows the SSL certificates on your sites with their expiry
+dates. Certificates expiring within the configured warning window (default: 30, 14, 7,
+3, 1 days) trigger alerts.
+
+**A status of `Unknown` means the panel does not know when the certificate expires**,
+not that it is healthy. That happens for certificates installed before v2.139.0 through
+**SSL → Upload certificate**, which recorded only that SSL was enabled; re-uploading the
+certificate records its expiry.
+
+**An uploaded certificate must name the site it secures.** Since v2.148.0 the upload is
+refused, before anything is written, if the certificate's subjectAltName entries (or its
+Common Name, when it carries no SAN) do not cover the site's domain — and the refusal
+tells you which names it does cover. A wildcard counts for exactly one level, so
+`*.example.com` covers `app.example.com` and not `app.staging.example.com`. Before that
+check existed, pasting the wrong `fullchain.pem` installed cleanly: nginx does not
+compare a certificate against `server_name`, so the panel showed a padlock and only the
+browser disagreed, with `ERR_CERT_COMMON_NAME_INVALID`. The same check refuses a private
+key pasted into the certificate field — which used to be stored with the certificate's
+permissions rather than the key's, and left the site with no recorded expiry at all.
+
+**DockPanel renews only the Let's Encrypt certificates it issued itself.** Its ACME
+client can produce nothing else, so a certificate from any other issuer — a commercial
+wildcard, a Cloudflare Origin CA certificate, a corporate PKI — is left alone by the
+automatic renewal loops, and the Renew button refuses it with the issuer named. Renew
+those wherever they were issued and upload the replacement. (Before v2.139.0 the weekly
+security scan replaced them instead, which is why this is stated so plainly.)
+
+### Registered certificates (administrators)
+
+A certificate you manage outside the panel — a Cloudflare Origin CA wildcard, a
+commercial certificate, a corporate PKI — can be **registered once, under a name**,
+and then served by any number of Compose stacks whose domain it covers. The pair is
+kept on that server's disk beside the panel's own certificates, never in the
+database; the page lists what each certificate names, who issued it, when it expires,
+and which stacks use it. Register a certificate here, then choose **Registered
+certificate** and its name when a stack claims a domain.
+
+Three things are checked before anything is written. The private key must belong to
+the certificate (the check nginx would otherwise make at the first reload after a
+claim). A key pasted into the certificate field is refused. And at claim time the
+certificate must actually name the domain — the same subjectAltName rule as the
+per-site upload, wildcards counting for one level — or the claim is refused with the
+names it does cover. A certificate cannot be deleted while a stack still names it, and
+a replacement that stops covering a domain a stack serves is refused before the old
+pair is overwritten.
+
+**The panel does not renew a registered certificate** — as with any certificate it
+did not issue. Its expiry shows on this page with the same status ladder as the rest,
+and replacing it in place puts the new pair behind every stack that uses it at once.
+
+### All certificates on this server (administrators)
+
+Administrators get an **All certificates on this server** switch. It lists every site's
+certificate on the current server together with its owner, and — because the agent scans
+the host, not the database — the certificates the machine holds that belong to no site
+at all: DNS-01 wildcards, certificates issued for Docker apps, anything installed by
+hand. Those appear as **Not a site** and offer no Renew or Delete control, because both
+act on a site record and there is none.
+
+This exists because the diagnostics scanner reports findings about the whole host, so an
+administrator could be told a certificate was expiring and then find it on no screen.
+If the server's agent is older than the panel it cannot enumerate certificates, and the
+page says so rather than presenting a partial list as a complete one.
 
 ## API Reference
 

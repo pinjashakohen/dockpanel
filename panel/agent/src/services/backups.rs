@@ -34,8 +34,170 @@ fn staging_root() -> PathBuf { test_root().join("backups/.staging") }
 /// distinct top-level member and can be extracted (and excluded) on its own.
 const PAYLOAD_DIR: &str = ".dockpanel-backup";
 
+/// Make the whole backup tree root-only, repairing what is already on disk.
+///
+/// Everything under `/var/backups/dockpanel` is a restorable copy of something
+/// secret: the panel's own database — which carries `servers.agent_token` in
+/// CLEARTEXT, and that token is both the Bearer credential for every
+/// authenticated agent endpoint and the HMAC key the agent verifies its own
+/// root-PTY tickets with (`routes/terminal.rs`) — plus every tenant's database
+/// dump and every site archive, `wp-config.php` included.
+///
+/// The tree was created `0755` and each writer used a plain shell redirect or
+/// `fs::write`, so files landed `0644`. Both panel services run as root, so
+/// nothing legitimate ever needed the world bits — but on a panel host that
+/// also serves sites, `www-data` is the uid EVERY hosted site's PHP runs as,
+/// and `services/command_filter.rs` already records that every site resolves to
+/// that one uid. Measured on the demo box at v2.87.0: **17 of 17 files readable
+/// as www-data**, the newest being a full `pg_dump` of the panel database.
+///
+/// The directory bit is the load-bearing half: at `0700` nothing under the tree
+/// is reachable by a non-root uid whatever the individual files say. The file
+/// bits are defence in depth for anything that gets moved out.
+///
+/// Repairing on every start rather than only fixing the writers is deliberate.
+/// Three writers produce these files — this agent, the panel's auto-healer, and
+/// a root crontab line `setup.sh` installs — and a fix that only corrects new
+/// writes would leave every install that already holds a backup exposed for
+/// ever. That is the same delivery shape as the s280 install-template lesson.
+/// Idempotent, cheap, and it walks a directory that holds tens of files.
+pub fn secure_backup_tree() {
+    secure_tree_at(&backups_root());
+}
+
+/// The body of [`secure_backup_tree`], parameterized on the root.
+///
+/// Split out for ONE reason: the tests must not share `backups_root()`. Nine
+/// tests in this module use that single fixed path and cargo runs them
+/// concurrently, so an arm written against it races another test's
+/// `remove_dir_all` — which is exactly what happened. The first symlink arm
+/// written here PASSED against a deliberately broken `tighten()`, twice, and
+/// only a mutation revealed it was measuring an empty directory.
+fn secure_tree_at(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tighten(path: &Path, want: u32) {
+        // Compare before writing so a correct tree costs one stat per entry and
+        // the log line below only ever fires on a box that was actually exposed.
+        let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+        // Never follow a symlink here: chmod would apply to its target, which is
+        // an arbitrary path a writer could have aimed anywhere.
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if meta.permissions().mode() & 0o777 != want {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(want));
+        }
+    }
+
+    fn walk(dir: &Path, loosened: &mut u32) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if meta.permissions().mode() & 0o777 != 0o700 {
+                    *loosened += 1;
+                }
+                tighten(&path, 0o700);
+                walk(&path, loosened);
+            } else {
+                if meta.permissions().mode() & 0o007 != 0 {
+                    *loosened += 1;
+                }
+                tighten(&path, 0o600);
+            }
+        }
+    }
+
+    if !root.exists() {
+        return;
+    }
+    let mut loosened = 0u32;
+    tighten(root, 0o700);
+    walk(root, &mut loosened);
+    if loosened > 0 {
+        tracing::warn!(
+            "Tightened {loosened} world-readable entries under {} — a backup there \
+             carries the panel database, which holds agent tokens in cleartext",
+            root.display()
+        );
+    }
+}
+
 /// Bump when the payload layout changes in a way a reader must know about.
 const MANIFEST_SCHEMA: u32 = 1;
+
+#[cfg(all(test, unix))]
+mod backup_perm_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A root of this arm's OWN, never `backups_root()` — see `secure_tree_at`.
+    fn isolated_root() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dp-bkperm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The defect, reproduced: a 0755 tree of 0644 dumps is readable by any uid
+    /// on the box — and on a panel host that also serves sites, that uid is
+    /// `www-data`, which runs every tenant's PHP. Measured on the demo box at
+    /// v2.87.0: 17 of 17 files readable as www-data, the newest a full pg_dump
+    /// carrying `servers.agent_token` in cleartext.
+    #[test]
+    fn a_world_readable_backup_tree_is_repaired() {
+        let root = isolated_root();
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("dockpanel-db-x.sql.gz"), b"dump").unwrap();
+        std::fs::write(root.join("db/nested.sql.gz"), b"dump").unwrap();
+        // Exactly what the three writers leave behind today.
+        for (p, m) in [
+            (root.clone(), 0o755),
+            (root.join("db"), 0o755),
+            (root.join("dockpanel-db-x.sql.gz"), 0o644),
+            (root.join("db/nested.sql.gz"), 0o644),
+        ] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(m)).unwrap();
+        }
+        // The arm can only mean something if the tree really is exposed first.
+        assert_eq!(mode_of(&root.join("dockpanel-db-x.sql.gz")), 0o644, "setup did not land");
+
+        secure_tree_at(&root);
+
+        assert_eq!(mode_of(&root), 0o700, "the backup root is still traversable");
+        assert_eq!(mode_of(&root.join("db")), 0o700, "a nested backup dir is still traversable");
+        assert_eq!(mode_of(&root.join("dockpanel-db-x.sql.gz")), 0o600, "the panel dump is still world-readable");
+        assert_eq!(mode_of(&root.join("db/nested.sql.gz")), 0o600, "a nested dump is still world-readable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// It must never chmod THROUGH a symlink: a writer that dropped one in the
+    /// tree could otherwise aim a root-owned `set_permissions` at any path.
+    #[test]
+    fn it_does_not_follow_a_symlink_out_of_the_tree() {
+        let root = isolated_root();
+        let outside = std::env::temp_dir().join(format!("dp-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"not ours").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        // Non-vacuity: prove the link resolves before asserting it is not followed.
+        assert_eq!(std::fs::read_to_string(root.join("link")).unwrap(), "not ours");
+
+        secure_tree_at(&root);
+
+        assert_eq!(mode_of(&outside), 0o644, "chmod followed a symlink out of the backup tree");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
 
 /// A database the panel wants dumped into (or restored from) a site backup.
 ///
@@ -94,6 +256,16 @@ pub struct BackupInfo {
     /// Databases the panel asked for that are NOT in the archive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub databases_failed: Vec<DbFailure>,
+    /// Why a file sitting in a backup directory cannot be used, and how to fix it.
+    ///
+    /// `None` for every real backup, and omitted from the JSON when absent, so the
+    /// site- and volume-backup responses — which share this struct — are byte-identical
+    /// to what they were before this field existed. Only the database listing sets it,
+    /// and only for a file it would otherwise have dropped on the floor: an operator who
+    /// copies a dump into the directory and gets an empty list back has been told
+    /// nothing, which is the failure this whole release is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported: Option<String>,
 }
 
 /// What a restore actually did. `ok()` is the only thing callers should treat
@@ -273,7 +445,12 @@ pub async fn create_backup(domain: &str, databases: &[DbSpec]) -> Result<BackupI
 
     let tar_result = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("tar").args(&tar_args).output(),
+        // safe_command sets no kill_on_drop, so a timed-out (dropped) future
+        // would otherwise leave `tar` running in the background against the
+        // staged plaintext copy below — see git_build.rs/deploy.rs's fetch
+        // fixes and database.rs:317, migration.rs:91, database_backup.rs:424,
+        // security_scanner.rs:633 for the same fix elsewhere in this crate.
+        safe_command("tar").args(&tar_args).kill_on_drop(true).output(),
     )
     .await;
 
@@ -323,6 +500,7 @@ pub async fn create_backup(domain: &str, databases: &[DbSpec]) -> Result<BackupI
         sha256,
         databases_included,
         databases_failed,
+        ..Default::default()
     })
 }
 
@@ -374,6 +552,7 @@ pub fn list_backups(domain: &str) -> Result<Vec<BackupInfo>, String> {
             sha256: None,
             databases_included: Vec::new(),
             databases_failed: Vec::new(),
+            ..Default::default()
         });
     }
 
@@ -399,13 +578,15 @@ async fn extract_payload(archive: &str, stage: &Path) -> Result<Option<Manifest>
                 "-C", stage_str,
                 PAYLOAD_DIR,
             ])
+            .kill_on_drop(true)
             .output(),
     )
     .await
     .map_err(|_| "Reading backup payload timed out (5 minutes)".to_string())?
     .map_err(|e| format!("Failed to run tar: {e}"))?;
 
-    let manifest_path = stage.join(PAYLOAD_DIR).join("manifest.json");
+    let payload_dir = stage.join(PAYLOAD_DIR);
+    let manifest_path = payload_dir.join("manifest.json");
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -414,6 +595,21 @@ async fn extract_payload(archive: &str, stage: &Path) -> Result<Option<Manifest>
             return Ok(None);
         }
         return Err(format!("Failed to read backup payload: {stderr}"));
+    }
+
+    // The archive's top-level PAYLOAD_DIR member can itself be a symlink — tar
+    // extracts it as asked, with no traversal for tar's own protections to
+    // catch, and plain `std::fs` calls below would follow it transparently.
+    // Refuse rather than read manifest.json through a link this backup does
+    // not own extracting into (same "never follow a symlink here" stance as
+    // `secure_tree_at` above).
+    if std::fs::symlink_metadata(&payload_dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "Backup payload '{PAYLOAD_DIR}' is a symlink, not a directory — refusing to read it"
+        ));
     }
 
     if !manifest_path.exists() {
@@ -511,6 +707,7 @@ async fn restore_inner(
                 "--exclude", &format!("{PAYLOAD_DIR}/*"),
                 "-C", site_root_str,
             ])
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -552,6 +749,23 @@ async fn restore_inner(
             continue;
         };
 
+        // `entry.file` comes from `manifest.json` inside the archive being
+        // restored — not generated by this agent on the restore path. An
+        // absolute or traversal-shaped value makes `PathBuf::join` discard
+        // `db_dir` entirely (`Path::join` on an absolute component replaces
+        // the base), pointing `dump_path` at an arbitrary file this
+        // root-running agent can read. Reject it before joining.
+        if entry.file.is_empty()
+            || entry.file.contains('/')
+            || entry.file.contains("..")
+            || Path::new(&entry.file).is_absolute()
+        {
+            report.databases_failed.push(DbFailure {
+                db_name: entry.db_name.clone(),
+                error: "the manifest names an unsafe dump filename; refusing to restore it".into(),
+            });
+            continue;
+        }
         let dump_path = db_dir.join(&entry.file);
         if !dump_path.exists() {
             report.databases_failed.push(DbFailure {
@@ -625,6 +839,7 @@ pub async fn list_backup_files(domain: &str, filename: &str) -> Result<Vec<Strin
         std::time::Duration::from_secs(30),
         safe_command("tar")
             .args(["tzf", filepath_str])
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -696,6 +911,7 @@ pub async fn restore_single_file(domain: &str, filename: &str, file_path: &str) 
         std::time::Duration::from_secs(60),
         safe_command("tar")
             .args(["xzf", backup_str, "--no-same-owner", "--no-same-permissions", "-C", &target, &extract_path])
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -915,6 +1131,95 @@ mod db_payload_tests {
         restore_single_file(site.domain(), &info.filename, "index.html")
             .await
             .expect("a normal file still restores");
+    }
+
+    /// `manifest.json`'s `file` field is attacker-controlled once an archive
+    /// exists on disk (it's just JSON inside the tar, no symlink needed) — an
+    /// absolute path makes `PathBuf::join` discard `db_dir` entirely and read
+    /// straight from the named path. The guard must refuse it before ever
+    /// touching that path, not merely fail later trying to read it.
+    #[tokio::test]
+    async fn restore_refuses_a_manifest_dump_file_that_escapes_db_dir() {
+        let site = TestSite::new("unsafedumpfile");
+
+        let stage = std::env::temp_dir().join("dp-pin-unsafefile-stage");
+        let _ = std::fs::remove_dir_all(&stage);
+        std::fs::create_dir_all(stage.join(PAYLOAD_DIR).join("db")).expect("stage");
+        let manifest = serde_json::json!({
+            "schema": 1, "domain": site.domain(), "created_at": "2026-07-26T00:00:00Z",
+            "databases": [{
+                "db_name": "pinunsafe", "db_type": "postgres",
+                "file": "/etc/passwd", "size_bytes": 15
+            }]
+        });
+        std::fs::write(
+            stage.join(PAYLOAD_DIR).join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        ).expect("manifest");
+
+        std::fs::create_dir_all(backup_dir(site.domain())).expect("backup dir");
+        let archive = backup_dir(site.domain()).join("handmade-unsafefile.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args([
+                "czf", archive.to_str().unwrap(),
+                "-C", site.root().to_str().unwrap(), ".",
+                "-C", stage.to_str().unwrap(), PAYLOAD_DIR,
+            ])
+            .status()
+            .expect("tar");
+        assert!(status.success());
+        let _ = std::fs::remove_dir_all(&stage);
+
+        let report = restore_backup(site.domain(), "handmade-unsafefile.tar.gz", &[spec("pinunsafe", "postgres")])
+            .await
+            .expect("restore runs");
+
+        assert!(report.files_restored, "files must still be restored");
+        assert_eq!(report.databases_failed.len(), 1, "the unsafe path must be refused");
+        assert!(
+            report.databases_failed[0].error.contains("unsafe"),
+            "refusal must name why, got: {}", report.databases_failed[0].error
+        );
+    }
+
+    /// The archive's top-level PAYLOAD_DIR member can itself be a symlink —
+    /// tar extracts it with no complaint (there is no write-through-an-
+    /// obstruction for tar's own default protections to catch, since the
+    /// requested member IS the symlink). Plain `std::fs` calls that follow
+    /// would then read a manifest through it. `extract_payload` must refuse.
+    #[tokio::test]
+    async fn extract_payload_refuses_when_the_payload_member_is_a_symlink() {
+        let tag = uuid::Uuid::new_v4();
+        let outside = std::env::temp_dir().join(format!("dp-pin-payload-target-{tag}"));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("manifest.json"), b"{}").unwrap();
+
+        let archive_src = std::env::temp_dir().join(format!("dp-pin-payload-src-{tag}"));
+        std::fs::create_dir_all(&archive_src).unwrap();
+        std::os::unix::fs::symlink(&outside, archive_src.join(PAYLOAD_DIR)).unwrap();
+
+        let archive = std::env::temp_dir().join(format!("dp-pin-payload-{tag}.tar.gz"));
+        let status = std::process::Command::new("tar")
+            .args(["czf", archive.to_str().unwrap(), "-C", archive_src.to_str().unwrap(), PAYLOAD_DIR])
+            .status()
+            .expect("tar");
+        assert!(status.success());
+
+        let stage = std::env::temp_dir().join(format!("dp-pin-payload-stage-{tag}"));
+        std::fs::create_dir_all(&stage).unwrap();
+
+        let result = extract_payload(archive.to_str().unwrap(), &stage).await;
+
+        assert!(result.is_err(), "must refuse a symlinked payload member");
+        assert!(
+            result.as_ref().unwrap_err().contains("symlink"),
+            "refusal must name why, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&archive_src);
+        let _ = std::fs::remove_file(&archive);
+        let _ = std::fs::remove_dir_all(&stage);
     }
 
     #[test]

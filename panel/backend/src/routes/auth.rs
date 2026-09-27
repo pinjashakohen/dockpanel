@@ -17,6 +17,16 @@ use totp_rs::{Algorithm, TOTP, Secret};
 
 use crate::auth::{AuthUser, Claims};
 use crate::error::{internal_error, err, ApiError};
+
+/// A real Argon2 PHC string verified against on the paths where there is no
+/// stored hash to verify against, so that "no such account" and "this account
+/// signs in with an identity provider" cost what a real verification costs.
+///
+/// Module-level rather than a local so a test can assert it actually parses —
+/// the branches that use it call `.expect()`, and the whole point of those
+/// branches is that they must not be the ones that fail.
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$ZHVtbXlzYWx0MTIzNA$K1PqGlDJpiBFSguVJXKDBIuXQ5baiAOXSgWAGkuJYxk";
 use crate::models::User;
 use crate::services::{activity, email, notifications, security_hardening};
 use crate::AppState;
@@ -94,10 +104,25 @@ pub async fn setup(
         .map_err(|e| internal_error("initial setup", e))?
         .to_string();
 
-    // Atomic check-and-insert to prevent TOCTOU race
+    // Atomic check-and-insert to prevent TOCTOU race.
+    //
+    // `email_verified` is TRUE here, and that is the whole difference between this
+    // door and `register`. This is the bootstrap door: it runs once, only while the
+    // table is empty, for the person who already has the box. It issues no
+    // `email_token` and sends no mail — so unlike a registration, there is no
+    // ceremony to complete and nobody to complete it against.
+    //
+    // Leaving it FALSE made the first administrator of every install a latent
+    // lockout. `login` (:268) refuses an unverified account whenever `smtp_host` is
+    // merely NON-EMPTY, so the gate armed the moment the operator configured mail —
+    // against their own account — and BOTH exits needed the mail that was being
+    // configured. The token door (:833) matches `WHERE email_token = $1`, and this
+    // user has no token at all, so that door does not exist for them; the only other
+    // writer is `reset_password`, which needs the forgot-password message. Reported
+    // as #100 by an operator who reinstalled to get back in.
     let user: Option<User> = sqlx::query_as(
-        "INSERT INTO users (email, password_hash, role) \
-         SELECT $1, $2, 'admin' \
+        "INSERT INTO users (email, password_hash, role, email_verified) \
+         SELECT $1, $2, 'admin', TRUE \
          WHERE NOT EXISTS (SELECT 1 FROM users) \
          RETURNING *",
     )
@@ -116,6 +141,7 @@ pub async fn setup(
         let local_id = crate::services::agent::ensure_local_server(
             &state.db,
             &state.config.agent_token,
+            &state.config.jwt_secret,
         )
         .await;
         if !local_id.is_nil() {
@@ -174,23 +200,52 @@ pub async fn login(
         .map_err(|e| internal_error("login", e))?;
 
     // Constant-time: always run Argon2 verify, even for non-existent users (prevents timing attack)
-    let dummy_hash = "$argon2id$v=19$m=19456,t=2,p=1$ZHVtbXlzYWx0MTIzNA$K1PqGlDJpiBFSguVJXKDBIuXQ5baiAOXSgWAGkuJYxk";
+    let dummy_hash = DUMMY_PASSWORD_HASH;
     let user = match user_opt {
         Some(u) => {
-            let parsed = PasswordHash::new(&u.password_hash)
-                .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Password hash error"))?;
-            match Argon2::default().verify_password(body.password.as_bytes(), &parsed) {
-                Ok(()) => u,
-                Err(_) => {
-                    record_login_attempt(&state.login_attempts, &ip);
-                    // Log failed login attempt (never log password)
-                    activity::log_activity(
-                        &state.db, u.id, &u.email, "auth.login_failed",
-                        None, None, None, Some(&ip),
-                    ).await;
-                    return Err(err(StatusCode::UNAUTHORIZED, "Invalid credentials"));
-                }
+            // An account created through an identity provider has no password
+            // at all — `oauth.rs` stores the empty string — and an empty string
+            // is not a PHC string, so parsing it fails. Answering that with a
+            // 500 made this door an oracle: a non-existent address and a
+            // password account both answered 401, and the ONE class that
+            // answered anything else was "this address exists and signs in with
+            // SSO". Worse, the `?` returned above the two lines below it, so
+            // the probe was neither counted against the rate limit nor written
+            // to the activity log the login-audit surface reads — an
+            // unauthenticated, unthrottled, unlogged enumeration channel.
+            //
+            // Having no password is failing to present one, so it is answered
+            // exactly like a wrong password, and at the same cost: the dummy
+            // verify runs first, or the branch would return in microseconds
+            // where every other outcome takes an Argon2 hash, and the status
+            // oracle would simply become a timing oracle.
+            let verified = if u.password_hash.is_empty() {
+                let dummy = PasswordHash::new(dummy_hash)
+                    .expect("the compiled-in dummy hash is a valid PHC string");
+                let _ = Argon2::default().verify_password(body.password.as_bytes(), &dummy);
+                false
+            } else {
+                let parsed = PasswordHash::new(&u.password_hash)
+                    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Password hash error"))?;
+                Argon2::default()
+                    .verify_password(body.password.as_bytes(), &parsed)
+                    .is_ok()
+            };
+
+            if !verified {
+                record_login_attempt(&state.login_attempts, &ip);
+                // Log failed login attempt (never log password)
+                activity::log_activity(
+                    &state.db, u.id, &u.email, "auth.login_failed",
+                    None, None, None, Some(&ip), None,
+                ).await;
+                crate::services::security_hardening::audit_log(
+                    &state.db, "auth.login_failed", Some(&u.email), Some(&ip),
+                    None, None, None, None, "warning", None,
+                ).await;
+                return Err(err(StatusCode::UNAUTHORIZED, "Invalid credentials"));
             }
+            u
         }
         None => {
             // Run dummy verify to equalize timing, then fail
@@ -212,6 +267,10 @@ pub async fn login(
             activity::log_activity_system(
                 &state.db, &body.email, "auth.login_failed",
                 None, None, Some("unknown_user"), Some(&ip), None,
+            ).await;
+            crate::services::security_hardening::audit_log(
+                &state.db, "auth.login_failed", Some(&body.email), Some(&ip),
+                None, None, Some("unknown_user"), None, "warning", None,
             ).await;
             return Err(err(StatusCode::UNAUTHORIZED, "Invalid credentials"));
         }
@@ -315,7 +374,7 @@ pub async fn login(
                 // During lockdown, log but don't block admin logins
                 security_hardening::audit_log(
                     &pool, "login.during_lockdown", Some(&email_clone), Some(&ip_clone),
-                    None, None, None, None, "warning",
+                    None, None, None, None, "warning", None,
                 ).await;
             }
 
@@ -324,13 +383,28 @@ pub async fn login(
             // Write immutable audit log
             security_hardening::audit_log(
                 &pool, "login", Some(&email_clone), Some(&ip_clone),
-                Some("user"), None, None, geo.as_ref(), "info",
+                Some("user"), None, None, geo.as_ref(), "info", None,
             ).await;
 
             // Check if this IP is new for this user
             if security_hardening::get_setting_bool(&pool, "security_geo_alert_enabled", true).await {
+                // "Have we seen this address before?" has to be asked of a
+                // record that outlives the answer. It used to count
+                // `user_sessions`, which the retention sweep truncates at 24
+                // hours (`auto_healer.rs`, "expired user sessions (>24h)") — so
+                // every address became new again the day after it was last used
+                // and alerted for ever. On this panel that produced 25 identical
+                // "Login from new IP" notifications from 5 distinct addresses,
+                // 14 of them the loopback of our own deploy script. An alert that
+                // repeats on a condition that has not changed is not an alert.
+                //
+                // `security_audit_log` is the right source: it records every
+                // login with its address and is the one table a DELETE trigger
+                // refuses (`trg_immutable_audit_log`), so it cannot be aged out
+                // from under this check. The `<= 1` still holds because the row
+                // for the login in progress was written a few lines above.
                 let known: Option<(i64,)> = sqlx::query_as(
-                    "SELECT COUNT(*) FROM user_sessions WHERE user_id = (SELECT id FROM users WHERE email = $1) AND ip_address = $2"
+                    "SELECT COUNT(*) FROM security_audit_log WHERE event_type = 'login' AND actor_email = $1 AND actor_ip = $2"
                 )
                 .bind(&email_clone)
                 .bind(&ip_clone)
@@ -339,7 +413,7 @@ pub async fn login(
                 .ok()
                 .flatten();
 
-                let is_new_ip = known.map(|(c,)| c <= 1).unwrap_or(true); // <=1 because we just inserted
+                let is_new_ip = known.map(|(c,)| c <= 1).unwrap_or(true); // <=1 because we just logged it
                 if let Some(ref geo) = geo {
                     if is_new_ip || geo.proxy || geo.hosting {
                         security_hardening::alert_suspicious_ip(
@@ -471,6 +545,7 @@ pub fn issue_session_pub(
         iat: now.timestamp() as usize,
         exp: (now + chrono::Duration::hours(2)).timestamp() as usize,
         jti: Some(jti.clone()),
+        key_id: None,
     };
 
     let token = encode(
@@ -716,7 +791,7 @@ pub async fn register(
 
     activity::log_activity(
         &state.db, user.id, &user.email, "auth.register",
-        None, None, None, Some(&ip),
+        None, None, None, Some(&ip), None,
     ).await;
 
     // Feature 1/7: Geo-IP alert and immutable audit log on registration
@@ -730,7 +805,7 @@ pub async fn register(
             // Immutable audit log
             security_hardening::audit_log(
                 &pool, "register", Some(&email_clone), Some(&ip_clone),
-                Some("user"), None, None, geo.as_ref(), "info",
+                Some("user"), None, None, geo.as_ref(), "info", None,
             ).await;
 
             // Alert admins about new registration (especially from proxy/datacenter IPs)
@@ -854,6 +929,20 @@ pub async fn forgot_password(
         None => return Ok(Json(success_msg)),
     };
 
+    // A suspended account gets no reset token. Every other door already refuses
+    // one — login (:228), the JWT middleware (auth.rs:105), 2FA (:1184),
+    // passkeys and OAuth — and this was the single entry point with no role test
+    // at all, so a reset issued here could never be used for anything anyway.
+    //
+    // ⚠ Return the SAME success body, never an error. The handler above answers
+    // identically for every address on purpose, to defeat account enumeration; a
+    // refusal here would turn it into an oracle that additionally discloses
+    // WHICH addresses are suspended — a worse leak than the one being closed,
+    // handed to an unauthenticated caller.
+    if user.role == "suspended" {
+        return Ok(Json(success_msg));
+    }
+
     let (token, token_hash) = generate_token();
     let expires = chrono::Utc::now() + chrono::Duration::hours(1);
 
@@ -928,6 +1017,14 @@ pub async fn reset_password(
 
     let user = user.ok_or_else(|| err(StatusCode::BAD_REQUEST, "Invalid or expired reset token"))?;
 
+    // The same refusal as `forgot_password`, for a token minted before the
+    // account was suspended. Answers with the sentence an unknown token gets, so
+    // it stays silent about why — the response shape is the disclosure here, and
+    // this endpoint has no enumeration defence of its own to lean on.
+    if user.role == "suspended" {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid or expired reset token"));
+    }
+
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(body.password.as_bytes(), &salt)
@@ -968,11 +1065,15 @@ pub async fn reset_password(
 
     activity::log_activity(
         &state.db, user.id, &user.email, "auth.password_reset",
-        None, None, None, None,
+        None, None, None, None, None,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.password_reset", Some(&user.email), None,
+        None, None, None, None, "warning", None,
     ).await;
 
     // Panel notification
-    notifications::notify_panel(&state.db, Some(user.id), "Password reset", "Your password was reset successfully", "warning", "security", None).await;
+    notifications::notify_panel(&state.db, Some(user.id), "Password reset", "Your password was reset successfully", "warning", "security", Some("/account")).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "message": "Password reset successfully" })))
 }
@@ -987,16 +1088,265 @@ struct TwoFaClaims {
     exp: usize,
 }
 
-/// Generate 10 recovery codes (8 chars each, hex).
+/// Generate 10 recovery codes (16 chars each, hex).
+///
+/// ⚠ These were 4 bytes — **32 bits** — and they are stored as an UNSALTED
+/// SHA-256 (`hash_token`), which is a fast hash. A 32-bit preimage space under a
+/// fast hash is exhaustible on ordinary hardware in seconds, so anyone holding a
+/// copy of the `users` table (a leaked backup, a read on a restored snapshot)
+/// could recover the plaintext codes. That is precisely the situation 2FA exists
+/// to survive: the recovery code is the factor that is supposed to still mean
+/// something after the password hash has leaked.
+///
+/// Widened to 8 bytes / 64 bits, which makes the stored hash a real preimage
+/// problem again. The hash is deliberately NOT changed to Argon2: matching is
+/// by hash, so every code already issued would keep working under one scheme and
+/// not the other, and a migration cannot re-hash values it cannot read. Length is
+/// the lever that works without invalidating anybody's set.
+///
+/// Older 8-character codes keep working — `try_recovery_code` compares hashes and
+/// never looks at length — and the field that accepts them takes both widths.
 fn generate_recovery_codes() -> Vec<String> {
     use rand::Rng;
     let mut rng = rand::rng();
     (0..10)
         .map(|_| {
-            let bytes: [u8; 4] = rng.random();
+            let bytes: [u8; 8] = rng.random();
             hex::encode(bytes)
         })
         .collect()
+}
+
+/// The 2FA challenge limiter — 5 attempts per 5 minutes, keyed on the user.
+///
+/// This lived inline inside `twofa_verify` and nowhere else, so it guarded the
+/// login door and only the login door. `twofa_disable` checks the SAME 6-digit
+/// code against the SAME secret in order to make the change that switches the
+/// factor OFF, and it could be guessed without limit: `check_current` runs with
+/// a skew of 1, so 3 codes out of 10^6 are live at any instant, and nothing sits
+/// above the handler either — the router layers only CORS, timeout and tracing
+/// (`main.rs`), and the `/api/` block `setup.sh` writes for the panel vhost
+/// carries no `limit_req`. The door that mints a session was rate-limited
+/// because a 6-digit code is guessable; the door that removes the requirement
+/// for one was not, and since v2.83.0 it also accepts recovery codes.
+///
+/// Kept as three small functions rather than one guard object because the
+/// success path has to CLEAR the counter, and that only happens once the
+/// handler knows the code was good.
+fn twofa_rate_limit_check(state: &AppState, user_id: uuid::Uuid) -> Result<(), ApiError> {
+    let attempts = state.twofa_attempts.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if let Some((count, window_start)) = attempts.get(&user_id) {
+        if now.duration_since(*window_start).as_secs() < 300 && *count >= 5 {
+            let remaining = 300 - now.duration_since(*window_start).as_secs();
+            let mins = (remaining + 59) / 60;
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                &format!("Too many attempts. Try again in {mins} minutes."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Record one failed 2FA attempt, rolling the window if it has expired.
+fn twofa_rate_limit_record(state: &AppState, user_id: uuid::Uuid) {
+    let mut attempts = state.twofa_attempts.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let entry = attempts.entry(user_id).or_insert((0, now));
+    if now.duration_since(entry.1).as_secs() >= 300 {
+        *entry = (1, now);
+    } else {
+        entry.0 += 1;
+    }
+}
+
+/// Clear the counter after a code has been accepted.
+fn twofa_rate_limit_clear(state: &AppState, user_id: uuid::Uuid) {
+    let mut attempts = state.twofa_attempts.lock().unwrap_or_else(|e| e.into_inner());
+    attempts.remove(&user_id);
+}
+
+/// How stale a session may be before an account that can present *nothing* is
+/// asked to sign in again.
+///
+/// Deliberately far shorter than the session cookie's own `Max-Age` (7200s, in
+/// `issue_session_pub` below). A window at or above the cookie lifetime is
+/// satisfied by every live session by construction: the check would compile,
+/// run, and guard nothing.
+const REAUTH_MAX_SESSION_AGE_SECS: i64 = 300;
+
+/// Proof presented when enrolling a new authenticator. Both fields are optional
+/// because the *first* request carries neither — that request IS the challenge,
+/// and the refusal it earns is what tells the client which fields to collect.
+#[derive(Deserialize, Default)]
+pub struct EnrolmentProof {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub current_password: Option<String>,
+}
+
+/// The refusal that asks a caller to re-present a credential.
+///
+/// `methods` is a LIST, never a single chosen value: an account holding both a
+/// password and an authenticator must be offered both, for the reason spelled
+/// out in [`require_enrolment_proof`].
+fn reauth_required(msg: &str, methods: &[&str], provider: Option<&str>) -> ApiError {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": msg,
+            "code": crate::error::CODE_REAUTH_REQUIRED,
+            "methods": methods,
+            "provider": provider,
+        })),
+    )
+}
+
+/// Require proof of identity before this account may enrol a new authenticator.
+///
+/// **Why enrolment and not removal.** A passkey is the only credential this
+/// panel mints that survives every remediation it offers: resetting the
+/// password, clearing 2FA and revoking every session all leave the row in
+/// `passkeys` intact and immediately usable, and passkey sign-in does not take
+/// the 2FA step. So a session hijacker who enrols one converts a transient
+/// compromise into a permanent, 2FA-free door. The door to guard is the one
+/// that PLANTS the credential.
+///
+/// **Why any one factor, and not the strongest.** The branches below are
+/// non-exclusive on purpose. The security-hardening guide tells a sole
+/// administrator who has lost both authenticator and recovery codes to register
+/// a passkey — that is the documented way back. Demanding a TOTP code here
+/// would refuse exactly those accounts at exactly the door that repairs them,
+/// which is the mistake `twofa_disable` above already had to be corrected for.
+/// Against the threat actually being closed — a hijacker holding a session
+/// cookie and neither the password nor the authenticator — a password is just
+/// as unanswerable as a code.
+///
+/// **Why a freshness fallback rather than a refusal.** An account created
+/// through an identity provider has an empty password hash by construction and
+/// may hold no authenticator, so it can present nothing at all. Refusing it
+/// would bar those accounts from passkeys permanently — a subtraction wearing a
+/// safeguard's clothes. It falls back to session age instead, which is a real
+/// but weaker bound: it stops a cookie replayed from another machine and buys
+/// little against script injection on the panel's own origin. Stated plainly so
+/// the next reader does not mistake it for equivalence.
+pub async fn require_enrolment_proof(
+    state: &AppState,
+    claims: &Claims,
+    user: &User,
+    proof: &EnrolmentProof,
+) -> Result<(), ApiError> {
+    let has_password = !user.password_hash.is_empty();
+    let has_totp = user.totp_enabled;
+
+    // Nothing to present. Fall back to how recently this session authenticated.
+    // `iat` is authentication time here: it is stamped once when the session is
+    // minted and there is no refresh route that would re-stamp it.
+    if !has_password && !has_totp {
+        let age = chrono::Utc::now().timestamp() - claims.iat as i64;
+        if age <= REAUTH_MAX_SESSION_AGE_SECS {
+            return Ok(());
+        }
+        let provider = user.oauth_provider.as_deref();
+        let label = provider.unwrap_or("your identity provider");
+        return Err(reauth_required(
+            &format!("For security, sign in again with {label} before adding a passkey."),
+            &["oauth"],
+            provider,
+        ));
+    }
+
+    // Checked before any verification so a locked-out caller is refused without
+    // spending an Argon2 hash on them.
+    twofa_rate_limit_check(state, user.id)?;
+
+    let mut passed = false;
+
+    if has_password {
+        if let Some(candidate) = proof.current_password.as_deref().filter(|c| !c.is_empty()) {
+            // Unreachable on an empty hash, so unlike `login` this cannot parse
+            // an empty string and fail internally.
+            if let Ok(parsed) = PasswordHash::new(&user.password_hash) {
+                passed = Argon2::default()
+                    .verify_password(candidate.as_bytes(), &parsed)
+                    .is_ok();
+            }
+        }
+    }
+
+    if !passed && has_totp {
+        if let Some(candidate) = proof.code.as_deref().filter(|c| !c.is_empty()) {
+            if let Some(secret_b32_enc) = user.totp_secret.as_ref() {
+                let secret_b32 = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+                    secret_b32_enc,
+                    &state.config.jwt_secret,
+                );
+                if let Ok(secret) = Secret::Encoded(secret_b32).to_bytes() {
+                    if let Ok(totp) = TOTP::new(
+                        Algorithm::SHA1,
+                        6,
+                        1,
+                        30,
+                        secret,
+                        Some("DockPanel".to_string()),
+                        user.email.clone(),
+                    ) {
+                        passed = totp.check_current(candidate).unwrap_or(false);
+                    }
+                }
+            }
+            // The recovery codes are the fallback for a lost authenticator, and
+            // this is one of the doors that repairs the account.
+            if !passed {
+                passed = try_recovery_code(&state.db, user, candidate).await?;
+            }
+        }
+    }
+
+    if passed {
+        twofa_rate_limit_clear(state, user.id);
+        return Ok(());
+    }
+
+    // Only an ATTEMPT counts against the limiter. The bare challenge request
+    // carries no proof, and five visits to the account page must not lock the
+    // user out of `/auth/2fa/disable` and the recovery-code reissue route,
+    // which share this counter keyed on user id alone.
+    let attempted = proof.code.is_some() || proof.current_password.is_some();
+    if attempted {
+        twofa_rate_limit_record(state, user.id);
+    }
+
+    let mut methods: Vec<&str> = Vec::new();
+    if has_password {
+        methods.push("password");
+    }
+    if has_totp {
+        methods.push("totp");
+    }
+
+    let msg = match (has_password, has_totp) {
+        (true, true) => "Confirm your password, or enter a code from your authenticator app or a recovery code, to add a passkey.",
+        (true, false) => "Confirm your password to add a passkey.",
+        _ => "Enter a code from your authenticator app, or one of your recovery codes, to add a passkey.",
+    };
+
+    Err(reauth_required(msg, &methods, None))
+}
+
+/// How many unused recovery codes an account is holding.
+///
+/// Returns 0 for both "never enrolled" and "corrupted JSON", because this feeds
+/// a warning and a warning that fails closed is the safe direction: the account
+/// is told it has none left, which is the state it must act on.
+fn recovery_codes_remaining(stored: &Option<String>) -> usize {
+    stored
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<Vec<String>>(c).ok())
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 /// POST /api/auth/2fa/setup — Generate TOTP secret and return QR code.
@@ -1067,6 +1417,7 @@ pub struct TwoFaVerifyRequest {
 pub async fn twofa_enable(
     AuthUser(claims): AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<TwoFaVerifyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
@@ -1116,9 +1467,14 @@ pub async fn twofa_enable(
     .await
     .map_err(|e| internal_error("2FA enable", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "auth.2fa_enabled",
-        None, None, None, None,
+        None, None, None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.2fa_enabled", Some(&claims.email), ip.as_deref(),
+        None, None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -1158,20 +1514,7 @@ pub async fn twofa_verify(
     let user_id = token_data.claims.sub;
 
     // Rate limit: max 5 failed 2FA attempts per 5 minutes
-    {
-        let attempts = state.twofa_attempts.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        if let Some((count, window_start)) = attempts.get(&user_id) {
-            if now.duration_since(*window_start).as_secs() < 300 && *count >= 5 {
-                let remaining = 300 - now.duration_since(*window_start).as_secs();
-                let mins = (remaining + 59) / 60;
-                return Err(err(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    &format!("Too many attempts. Try again in {mins} minutes."),
-                ));
-            }
-        }
-    }
+    twofa_rate_limit_check(&state, user_id)?;
 
     let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
         .bind(user_id)
@@ -1194,8 +1537,16 @@ pub async fn twofa_verify(
         return Err(err(StatusCode::SERVICE_UNAVAILABLE, "System is in lockdown mode"));
     }
 
+    // No secret here does NOT mean the server is broken: an administrator can now
+    // reset this account's 2FA (`users::reset_2fa`), and the temp token issued by
+    // the first step stays valid for five minutes after it. Somebody holding one
+    // when that happens used to get a 500 telling them nothing. They no longer
+    // need a second factor at all, so the honest answer is "start again".
     let secret_b32_enc = user.totp_secret.as_ref().ok_or_else(|| {
-        err(StatusCode::INTERNAL_SERVER_ERROR, "2FA secret missing")
+        err(
+            StatusCode::UNAUTHORIZED,
+            "Two-factor authentication is no longer set up on this account. Sign in again.",
+        )
     })?;
 
     // Decrypt TOTP secret (with legacy plaintext fallback)
@@ -1215,27 +1566,13 @@ pub async fn twofa_verify(
         // Try recovery codes
         let used_recovery = try_recovery_code(&state.db, &user, &body.code).await?;
         if !used_recovery {
-            // Record failed attempt
-            {
-                let mut attempts = state.twofa_attempts.lock().unwrap_or_else(|e| e.into_inner());
-                let now = Instant::now();
-                let entry = attempts.entry(user_id).or_insert((0, now));
-                if now.duration_since(entry.1).as_secs() >= 300 {
-                    // Window expired, reset
-                    *entry = (1, now);
-                } else {
-                    entry.0 += 1;
-                }
-            }
+            twofa_rate_limit_record(&state, user_id);
             return Err(err(StatusCode::UNAUTHORIZED, "Invalid 2FA code"));
         }
     }
 
     // Successful verification — clear rate limit
-    {
-        let mut attempts = state.twofa_attempts.lock().unwrap_or_else(|e| e.into_inner());
-        attempts.remove(&user_id);
-    }
+    twofa_rate_limit_clear(&state, user_id);
 
     let (_token, cookie, jti) = issue_session(&state, &user, &headers)?;
 
@@ -1318,10 +1655,12 @@ pub struct TwoFaDisableRequest {
     pub code: String,
 }
 
-/// POST /api/auth/2fa/disable — Disable 2FA (requires current TOTP code).
+/// POST /api/auth/2fa/disable — Disable 2FA (requires a current TOTP code OR a
+/// recovery code; the latter is the only route back for a lost authenticator).
 pub async fn twofa_disable(
     AuthUser(claims): AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<TwoFaDisableRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
@@ -1333,6 +1672,12 @@ pub async fn twofa_disable(
     if !user.totp_enabled {
         return Err(err(StatusCode::BAD_REQUEST, "2FA is not enabled"));
     }
+
+    // Same limiter as the login door. This route verifies the same 6-digit code
+    // against the same secret, and what it does on success is REMOVE the factor,
+    // so it is the more attractive of the two to guess at — see
+    // `twofa_rate_limit_check`.
+    twofa_rate_limit_check(&state, claims.sub)?;
 
     let secret_b32_enc = user.totp_secret.as_ref().ok_or_else(|| {
         err(StatusCode::INTERNAL_SERVER_ERROR, "2FA secret missing")
@@ -1348,9 +1693,28 @@ pub async fn twofa_disable(
     let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret, Some("DockPanel".to_string()), user.email.clone())
         .map_err(|e| internal_error("2FA disable", e))?;
 
-    if !totp.check_current(&body.code).map_err(|e| internal_error("2FA disable", e))? {
-        return Err(err(StatusCode::UNAUTHORIZED, "Invalid 2FA code"));
+    // A current TOTP code OR one of the recovery codes, exactly like the login
+    // path at `twofa_verify`.
+    //
+    // Accepting only `check_current` made losing the authenticator app a dead
+    // end: the recovery codes let you IN (`try_recovery_code` below is the same
+    // helper the login flow calls), and then nothing you held could ever turn
+    // 2FA off or re-enrol a new device — while the panel offers no admin-side
+    // 2FA reset either. The codes exist to be the fallback; refusing them at the
+    // one door that repairs the account is a lockout wearing a safeguard's
+    // clothes. This became urgent when enrolment moved to `/account`, where
+    // every role now sees the button that used to refuse them.
+    let code_valid = totp
+        .check_current(&body.code)
+        .map_err(|e| internal_error("2FA disable", e))?;
+    if !code_valid && !try_recovery_code(&state.db, &user, &body.code).await? {
+        twofa_rate_limit_record(&state, claims.sub);
+        return Err(err(
+            StatusCode::UNAUTHORIZED,
+            "Invalid 2FA code. Enter a code from your authenticator app, or one of your recovery codes.",
+        ));
     }
+    twofa_rate_limit_clear(&state, claims.sub);
 
     sqlx::query(
         "UPDATE users SET totp_enabled = FALSE, totp_secret = NULL, recovery_codes = NULL, updated_at = NOW() WHERE id = $1",
@@ -1360,12 +1724,115 @@ pub async fn twofa_disable(
     .await
     .map_err(|e| internal_error("2FA disable", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "auth.2fa_disabled",
-        None, None, None, None,
+        None, None, None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.2fa_disabled", Some(&claims.email), ip.as_deref(),
+        None, None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "message": "2FA has been disabled" })))
+}
+
+#[derive(Deserialize)]
+pub struct TwoFaRegenerateRequest {
+    pub code: String,
+}
+
+/// POST /api/auth/2fa/recovery-codes — Issue a fresh set of recovery codes.
+///
+/// Recovery codes were written exactly once, at enrolment, and consumed one at a
+/// time: after ten recovery logins the fallback was silently gone, and there was
+/// no way to mint more short of disabling 2FA and enrolling again. Worse, every
+/// account that enrolled before v2.83.0 holds ten codes it was NEVER SHOWN — the
+/// block that draws them sat inside the branch the enable handler cleared in the
+/// same breath — so those accounts have a fallback on paper and none in fact.
+/// This is the door that repairs them WITHOUT losing the enrolment, and it is
+/// why the route accepts a live TOTP code: someone who still has their
+/// authenticator can fix themselves, today, with no administrator involved.
+///
+/// A recovery code is accepted too, for the same reason `twofa_disable` accepts
+/// one — it is the same authority, and this is the gentler of the two things it
+/// already permits. Rate-limited on the shared 2FA limiter.
+pub async fn twofa_regenerate_recovery_codes(
+    AuthUser(claims): AuthUser,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TwoFaRegenerateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
+        .bind(claims.sub)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| internal_error("2FA recovery codes", e))?;
+
+    if !user.totp_enabled {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "2FA is not enabled — recovery codes are issued when you enrol",
+        ));
+    }
+
+    twofa_rate_limit_check(&state, claims.sub)?;
+
+    let secret_b32_enc = user.totp_secret.as_ref().ok_or_else(|| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, "2FA secret missing")
+    })?;
+    let secret_b32 = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        secret_b32_enc,
+        &state.config.jwt_secret,
+    );
+    let secret = Secret::Encoded(secret_b32)
+        .to_bytes()
+        .map_err(|e| internal_error("2FA recovery codes", e))?;
+    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret, Some("DockPanel".to_string()), user.email.clone())
+        .map_err(|e| internal_error("2FA recovery codes", e))?;
+
+    let code_valid = totp
+        .check_current(&body.code)
+        .map_err(|e| internal_error("2FA recovery codes", e))?;
+    if !code_valid && !try_recovery_code(&state.db, &user, &body.code).await? {
+        twofa_rate_limit_record(&state, claims.sub);
+        return Err(err(
+            StatusCode::UNAUTHORIZED,
+            "Invalid 2FA code. Enter a code from your authenticator app, or one of your recovery codes.",
+        ));
+    }
+    twofa_rate_limit_clear(&state, claims.sub);
+
+    // Replaces the whole set, so any code still outstanding — including one just
+    // spent getting in here — stops working. That is the point: the old set is
+    // the one the user could not read.
+    let codes = generate_recovery_codes();
+    let hashed_codes: Vec<String> = codes.iter().map(|c| hash_token(c)).collect();
+    let hashed_json = serde_json::to_string(&hashed_codes)
+        .map_err(|e| internal_error("2FA recovery codes", e))?;
+
+    sqlx::query("UPDATE users SET recovery_codes = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&hashed_json)
+        .bind(claims.sub)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("2FA recovery codes", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "auth.2fa_recovery_codes_regenerated",
+        None, None, None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.2fa_recovery_codes_regenerated", Some(&claims.email), ip.as_deref(),
+        None, None, None, None, "warning", claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "recovery_codes": codes,
+        "message": "New recovery codes issued. The previous set no longer works.",
+    })))
 }
 
 /// GET /api/auth/2fa/status — Check if 2FA is enabled for the current user.
@@ -1373,13 +1840,49 @@ pub async fn twofa_status(
     AuthUser(claims): AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: (bool,) = sqlx::query_as("SELECT totp_enabled FROM users WHERE id = $1")
-        .bind(claims.sub)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| internal_error("2FA status", e))?;
+    // `recovery_codes` rides along so the page can say how many are LEFT. They are
+    // consumed one per recovery login and were never counted anywhere the user
+    // could see, so an account could arrive at zero — no fallback at all — while
+    // its 2FA card still read "2FA is enabled" and nothing else.
+    let row: (bool, Option<String>) =
+        sqlx::query_as("SELECT totp_enabled, recovery_codes FROM users WHERE id = $1")
+            .bind(claims.sub)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| internal_error("2FA status", e))?;
 
-    Ok(Json(serde_json::json!({ "enabled": row.0 })))
+    // `enforced` rides along here because this is the only 2FA read a NON-ADMIN can
+    // make. The layout's "Two-factor authentication is required" banner asked
+    // `GET /api/settings` for it — an `AdminUser` route — and swallowed the 403 in
+    // an empty catch, so `twoFaEnforced` stayed at its `useState(false)` for every
+    // non-admin and the banner could only ever render for the one role that does
+    // not need telling. The operator flipped "Require 2FA for all users" and the
+    // people it was aimed at were the only ones never shown it.
+    //
+    // Whether the panel should also REFUSE the login is a separate decision and is
+    // deliberately still not taken here. ⚠ The reason has CHANGED and the old one
+    // is gone: enrolment used to live only on `/settings`, which is `adminOnly` in
+    // the nav registry, so refusing a non-admin would have been a lockout with no
+    // way out. v2.83.0 built `/account`, which every role carries, so that
+    // objection no longer holds. What holds now is the hazard list nobody has
+    // costed: OAuth-provisioned accounts that have no password to fall back on,
+    // the bootstrap admin, and callers that are not browsers. Enforcement is a
+    // product decision, not a missing line — and until it is taken, `enforce_2fa`
+    // does not refuse anything (`login` sets a `twofa_required` flag on the
+    // response body and issues the session cookie regardless).
+    // `settings.value` is `TEXT NOT NULL`, so the row is either present or absent —
+    // an absent key means the operator never turned it on.
+    let enforced: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'enforce_2fa'")
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("2FA status", e))?;
+
+    Ok(Json(serde_json::json!({
+        "enabled": row.0,
+        "enforced": enforced.map(|(v,)| v == "true").unwrap_or(false),
+        "recovery_codes_remaining": recovery_codes_remaining(&row.1),
+    })))
 }
 
 // ─── Password Change & Session Revocation ───────────────────────────────
@@ -1388,6 +1891,7 @@ pub async fn twofa_status(
 pub async fn change_password(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let current = body.get("current_password").and_then(|v| v.as_str())
@@ -1458,9 +1962,14 @@ pub async fn change_password(
         }
     }
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "auth.password_change",
-        None, None, None, None,
+        None, None, None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.password_change", Some(&claims.email), ip.as_deref(),
+        None, None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "message": "Password changed successfully" })))
@@ -1471,6 +1980,7 @@ pub async fn change_password(
 pub async fn revoke_all_sessions(
     State(state): State<AppState>,
     crate::auth::AdminUser(claims): crate::auth::AdminUser,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let now = chrono::Utc::now();
     // Store a timestamp marker — auth middleware checks this to invalidate older tokens
@@ -1489,9 +1999,14 @@ pub async fn revoke_all_sessions(
         *cached = Some(now.timestamp());
     }
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "auth.revoke_all",
-        None, None, None, None,
+        None, None, None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "auth.revoke_all", Some(&claims.email), ip.as_deref(),
+        None, None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "message": "All sessions revoked. Users will need to re-login." })))
@@ -1599,11 +2114,59 @@ pub async fn export_my_data(
         "SELECT ip_address, user_agent, created_at FROM user_sessions WHERE user_id = $1"
     ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
 
+    // Passkeys belong here for the same reason sessions do, and more urgently:
+    // a session can be revoked, a passkey survives every reset the panel
+    // offers. Exporting the revocable credential while omitting the permanent
+    // one would leave this the only self-service surface that cannot show a
+    // user what signs in as them.
+    let passkeys: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT name, created_at FROM passkeys WHERE user_id = $1"
+    ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+
     Ok(Json(serde_json::json!({
         "user": { "email": user.0, "role": user.1, "oauth_provider": user.2, "2fa_enabled": user.3, "created_at": user.4 },
         "sites": sites.iter().map(|(d,r)| serde_json::json!({"domain": d, "runtime": r})).collect::<Vec<_>>(),
         "recent_activity": activity.iter().map(|(a,t,c)| serde_json::json!({"action": a, "target": t, "at": c})).collect::<Vec<_>>(),
         "sessions": sessions.iter().map(|(ip,ua,c)| serde_json::json!({"ip": ip, "user_agent": ua, "at": c})).collect::<Vec<_>>(),
+        "passkeys": passkeys.iter().map(|(n,c)| serde_json::json!({"name": n, "at": c})).collect::<Vec<_>>(),
         "exported_at": chrono::Utc::now(),
     })))
+}
+
+#[cfg(test)]
+mod login_credential_tests {
+    use super::*;
+
+    /// The mechanism behind the OAuth-only 500. `oauth.rs` creates accounts
+    /// with an empty `password_hash`, and an empty string is not a PHC string,
+    /// so the login handler's parse fails — which it used to answer with a 500,
+    /// making the door an enumeration oracle for identity-provider accounts.
+    #[test]
+    fn an_empty_password_hash_cannot_be_parsed() {
+        assert!(
+            PasswordHash::new("").is_err(),
+            "if this ever parses, the empty-hash branch in `login` is dead code \
+             and the reason for it has changed"
+        );
+    }
+
+    /// Control: the assertion above is about the EMPTY string specifically, not
+    /// about `PasswordHash::new` rejecting everything.
+    #[test]
+    fn a_real_hash_still_parses() {
+        assert!(PasswordHash::new(DUMMY_PASSWORD_HASH).is_ok());
+    }
+
+    /// The empty-hash branch calls `.expect()` on this. A dummy hash that did
+    /// not parse would turn an enumeration fix into a panic on the same input.
+    #[test]
+    fn the_dummy_hash_is_verifiable_not_merely_parseable() {
+        let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH)
+            .expect("the compiled-in dummy hash must parse");
+        // Wrong password against the dummy: the call must COMPLETE (spending
+        // the Argon2 time that equalises this branch), and must not match.
+        assert!(Argon2::default()
+            .verify_password(b"whatever-the-caller-typed", &parsed)
+            .is_err());
+    }
 }

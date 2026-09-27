@@ -1,5 +1,5 @@
 import { Navigate, Outlet, NavLink, Link, useNavigate } from "react-router-dom";
-import { useLayoutState } from "../hooks/useLayoutState";
+import { useLayoutState, badgeCount } from "../hooks/useLayoutState";
 import { useServer } from "../context/ServerContext";
 import { useBranding } from "../context/BrandingContext";
 import { Icon } from "../data/icons";
@@ -188,16 +188,32 @@ export default function CommandLayout() {
                 >
                   {({ isActive }) => (
                     <>
-                      <span className={isActive ? "text-rust-400" : "text-dark-500"}><Icon name={item.iconName} className="w-5 h-5" /></span>
+                      <span className={isActive ? "text-rust-400" : "text-dark-400"}><Icon name={item.iconName} className="w-5 h-5" /></span>
                       <span>{item.label}</span>
-                      {item.to === "/monitoring" && state.firingCount > 0 && (
-                        <span className="ml-auto px-1.5 py-0.5 text-xs font-bold bg-danger-500 text-white rounded-full min-w-[20px] text-center">
-                          {state.firingCount}
-                        </span>
-                      )}
-                      {item.to === "/incidents" && state.incidentCount > 0 && (
-                        <span className="ml-auto px-1.5 py-0.5 text-xs font-bold bg-warn-500 text-dark-900 rounded-full min-w-[20px] text-center">
-                          {state.incidentCount}
+                      {/* One wrapper carries the `ml-auto`. Both pills used to
+                          carry it themselves, and two auto margins in one flex
+                          row split the free space between them, so whenever both
+                          counts were live the pair drifted apart into the middle
+                          of the row instead of sitting together at its end. The
+                          flat-nav branch below already had this right. */}
+                      {item.to === "/monitoring" && (state.firingCount > 0 || state.incidentCount > 0) && (
+                        <span className="ml-auto flex items-center gap-1">
+                          {state.firingCount > 0 && (
+                            <span
+                              title={`${state.firingCount} firing alert${state.firingCount === 1 ? "" : "s"}`}
+                              className="px-1.5 py-0.5 text-xs font-bold bg-danger-500 text-white rounded-full min-w-[20px] text-center"
+                            >
+                              {badgeCount(state.firingCount)}
+                            </span>
+                          )}
+                          {state.incidentCount > 0 && (
+                            <span
+                              title={`${state.incidentCount} open incident${state.incidentCount === 1 ? "" : "s"}`}
+                              className="px-1.5 py-0.5 text-xs font-bold bg-warn-500 text-dark-900 rounded-full min-w-[20px] text-center"
+                            >
+                              {badgeCount(state.incidentCount)}
+                            </span>
+                          )}
                         </span>
                       )}
                     </>
@@ -233,13 +249,28 @@ export default function CommandLayout() {
                         <>
                           <Icon name={item.iconName} />
                           <span>{item.label}</span>
-                          {item.to === "/monitoring" && state.firingCount > 0 ? (
-                            <span className="ml-auto px-1.5 py-0.5 text-xs font-bold bg-danger-500 text-white rounded-full min-w-[20px] text-center">
-                              {state.firingCount}
-                            </span>
-                          ) : item.to === "/incidents" && state.incidentCount > 0 ? (
-                            <span className="ml-auto px-1.5 py-0.5 text-xs font-bold bg-warn-500 text-dark-900 rounded-full min-w-[20px] text-center">
-                              {state.incidentCount}
+                          {/* Both counts belong to this one row now, so they are
+                              rendered together rather than as alternatives — a
+                              chain would have shown the alerts and silently
+                              swallowed the incidents whenever both were live. */}
+                          {item.to === "/monitoring" && (state.firingCount > 0 || state.incidentCount > 0) ? (
+                            <span className="ml-auto flex items-center gap-1">
+                              {state.firingCount > 0 && (
+                                <span
+                                  title={`${state.firingCount} firing alert${state.firingCount === 1 ? "" : "s"}`}
+                                  className="px-1.5 py-0.5 text-xs font-bold bg-danger-500 text-white rounded-full min-w-[20px] text-center"
+                                >
+                                  {badgeCount(state.firingCount)}
+                                </span>
+                              )}
+                              {state.incidentCount > 0 && (
+                                <span
+                                  title={`${state.incidentCount} open incident${state.incidentCount === 1 ? "" : "s"}`}
+                                  className="px-1.5 py-0.5 text-xs font-bold bg-warn-500 text-dark-900 rounded-full min-w-[20px] text-center"
+                                >
+                                  {badgeCount(state.incidentCount)}
+                                </span>
+                              )}
                             </span>
                           ) : isActive ? (
                             <span className="ml-auto blinking-cursor text-xs">_</span>
@@ -276,17 +307,21 @@ export default function CommandLayout() {
             </div>
             <div className="flex items-center justify-between px-3 mt-2">
               <div className="flex items-center gap-2">
-                <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${state.apiHealthy === null ? "bg-dark-400" : state.apiHealthy ? "bg-rust-500" : "bg-danger-500 animate-pulse"}`} />
-                <span className="text-[10px] text-dark-400">{state.apiHealthy === null ? "Checking..." : state.apiHealthy ? "Connected" : "Disconnected"}</span>
+                {state.canSeeHealth && (
+                  <>
+                    <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${state.apiHealthy === null ? "bg-dark-400" : state.apiHealthy ? "bg-rust-500" : "bg-danger-500 animate-pulse"}`} />
+                    <span className="text-[10px] text-dark-400">{state.apiHealthy === null ? "Checking..." : state.apiHealthy ? "Connected" : "Disconnected"}</span>
+                  </>
+                )}
               </div>
               <div className="flex items-center gap-1">
-                <Link to="/notifications" className="relative p-1.5 text-dark-400 hover:text-dark-200 transition-colors rounded" title="Notifications" aria-label="Notifications">
+                <Link to="/notifications" className="relative p-1.5 text-dark-400 hover:text-dark-200 transition-colors rounded" title={state.notifCount > 0 ? `${state.notifCount} unread notification${state.notifCount === 1 ? "" : "s"}` : "Notifications"} aria-label="Notifications">
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0" />
                   </svg>
                   {state.notifCount > 0 && (
                     <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-danger-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
-                      {state.notifCount > 9 ? "9+" : state.notifCount}
+                      {badgeCount(state.notifCount)}
                     </span>
                   )}
                 </Link>
@@ -307,7 +342,7 @@ export default function CommandLayout() {
         )}
 
         {/* Minimal sidebar footer when header is shown */}
-        {showHeader && (
+        {showHeader && state.canSeeHealth && (
           <div className="px-4 py-3 border-t border-dark-600/50">
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full shrink-0 ${state.apiHealthy === null ? "bg-dark-400" : state.apiHealthy ? "bg-rust-500" : "bg-danger-500 animate-pulse"}`} />
@@ -339,26 +374,34 @@ export default function CommandLayout() {
               >
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
                 <span className="flex-1 text-left">Search...</span>
-                <kbd className="text-[10px] px-1.5 py-0.5 border rounded border-dark-700 bg-dark-800 text-dark-500">Ctrl K</kbd>
+                <kbd className="text-[10px] px-1.5 py-0.5 border rounded border-dark-700 bg-dark-800 text-dark-400">Ctrl K</kbd>
               </button>
             </div>
 
             {/* Right side */}
             <div className="flex items-center gap-3">
-              <Link to="/notifications" className="relative p-2 rounded-lg transition-colors text-dark-400 hover:text-dark-50 hover:bg-dark-800" title="Notifications" aria-label="Notifications">
+              <Link to="/notifications" className="relative p-2 rounded-lg transition-colors text-dark-400 hover:text-dark-50 hover:bg-dark-800" title={state.notifCount > 0 ? `${state.notifCount} unread notification${state.notifCount === 1 ? "" : "s"}` : "Notifications"} aria-label="Notifications">
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0" />
                 </svg>
                 {state.notifCount > 0 && (
                   <span className="absolute top-0.5 right-0.5 w-4 h-4 bg-danger-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
-                    {state.notifCount > 9 ? "9+" : state.notifCount}
+                    {badgeCount(state.notifCount)}
                   </span>
                 )}
               </Link>
+              {/* This pill sat next to the notification bell drawing the SAME
+                  bell glyph over a different number, so the header showed two
+                  identical icons meaning unrelated things. A firing alert is not
+                  a notification; it gets the alert glyph and says what it is. */}
               {state.firingCount > 0 && (
-                <Link to="/monitoring" className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold bg-danger-500/15 text-danger-400 rounded-lg hover:bg-danger-500/25 transition-colors">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0" /></svg>
-                  {state.firingCount}
+                <Link
+                  to="/monitoring?tab=alerts"
+                  title={`${state.firingCount} firing alert${state.firingCount === 1 ? "" : "s"}`}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold bg-danger-500/15 text-danger-400 rounded-lg hover:bg-danger-500/25 transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" /></svg>
+                  {badgeCount(state.firingCount)} firing
                 </Link>
               )}
               <div className="h-6 w-px hidden sm:block bg-dark-700" />
@@ -374,7 +417,7 @@ export default function CommandLayout() {
                 </div>
                 <div className="text-left">
                   <p className="text-sm font-medium leading-none text-dark-100">{state.user.email.split("@")[0]}</p>
-                  <p className="text-xs mt-0.5 text-dark-500">{state.user.role}</p>
+                  <p className="text-xs mt-0.5 text-dark-400">{state.user.role}</p>
                 </div>
               </div>
               <button onClick={state.logout} className="p-1.5 text-dark-400 hover:text-dark-100 rounded-lg" title="Logout"><Icon name="logout" className="w-4 h-4" /></button>
@@ -401,9 +444,9 @@ export default function CommandLayout() {
               <svg className="w-5 h-5 text-warn-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
               </svg>
-              <span className="text-sm text-warn-400 font-medium">Two-factor authentication is required. Please enable 2FA in Settings &rarr; Security.</span>
+              <span className="text-sm text-warn-400 font-medium">Two-factor authentication is required. Enable it from My Account.</span>
             </div>
-            <a href="/settings" className="px-3 py-1.5 bg-warn-500 text-dark-900 rounded text-xs font-bold hover:bg-warn-400 transition-colors">Set Up 2FA</a>
+            <Link to="/account" className="px-3 py-1.5 bg-warn-500 text-dark-900 rounded text-xs font-bold hover:bg-warn-400 transition-colors">Set Up 2FA</Link>
           </div>
         )}
 

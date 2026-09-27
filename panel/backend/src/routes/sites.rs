@@ -13,18 +13,33 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
+use crate::auth::AdminUser;
 use crate::auth::AuthUser;
+use crate::auth::Claims;
 use crate::auth::ServerScope;
 use crate::error::{internal_error, err, agent_error, paginate, ApiError};
 use crate::models::Site;
+
+/// `SELECT s.*` over [`crate::helpers::SITE_CALLER_PREDICATE`] — the full-row read
+/// used by every per-site handler in this module. Built once; the predicate itself
+/// is shared with the five other modules that resolve a site by caller.
+static SITE_FOR_CALLER_ALL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("SELECT s.* FROM sites s WHERE {}", crate::helpers::SITE_CALLER_PREDICATE)
+});
 use crate::routes::is_valid_domain;
 use crate::routes::reseller_dashboard::check_reseller_quota;
 use crate::services::domain_claim;
 
-/// Effective per-user site-creation ceiling per hour, shared by `create` and
-/// `clone` so the two cannot drift apart. `security_site_rate_limit` holds the
-/// count; 0 means no limit. Absent row falls back to the seeded default of 3.
-async fn site_rate_limit(pool: &sqlx::PgPool) -> i64 {
+/// Effective per-user site-creation ceiling per hour, shared by every handler
+/// that writes a `sites` row so they cannot drift apart. `security_site_rate_limit`
+/// holds the count; 0 means no limit. Absent row falls back to the seeded default of 3.
+///
+/// Visible to the crate since v2.110.0, when the staging module became the third
+/// caller. It was private while two of the four site-creating handlers lived in
+/// this file, which is precisely why the third one — in another module, and
+/// therefore unable to call this even had its author looked — was written with a
+/// ceiling of its own: none.
+pub(crate) async fn site_rate_limit(pool: &sqlx::PgPool) -> i64 {
     match crate::services::security_hardening::get_setting_i64(pool, "security_site_rate_limit", 3)
         .await
     {
@@ -83,6 +98,11 @@ use crate::services::extensions::fire_event;
 use crate::services::notifications;
 use crate::services::security_hardening;
 use crate::AppState;
+
+/// The agent release in which a domain rename began carrying the site's backup
+/// trees with it. Before it, the archives stayed on disk under the old name
+/// while the panel kept listing rows that no longer resolved to a file.
+const BACKUP_CARRY_MIN_AGENT: &str = "2.142.0";
 
 /// A single provisioning step event.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -193,6 +213,11 @@ pub struct CreateSiteRequest {
 }
 
 /// GET /api/sites — List all sites for the current user.
+///
+/// Scoped to the caller, with no role branch, and every per-site read below is
+/// the same. That is the single ownership axis the `client` role rests on — an
+/// account that OWNS the row passes all of it natively. See `list_for_admin`
+/// for the one read that is allowed to look past it, and why it had to exist.
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
@@ -211,6 +236,76 @@ pub async fn list(
     .fetch_all(&state.db)
     .await
     .map_err(|e| internal_error("list sites", e))?;
+
+    Ok(Json(sites))
+}
+
+/// One site as an admin sees it on the all-sites view, with its owner resolved.
+///
+/// Deliberately NOT [`Site`]. `Site` is `#[derive(FromRow)]` over `SELECT *` and
+/// is bound at three dozen call sites in this crate; a field with no matching
+/// column breaks every one of them at runtime, and a struct that carried an
+/// owner would sooner or later be handed to a per-site handler that must keep
+/// asking "is this yours?". This projection holds only what the list renders,
+/// so it cannot be mistaken for a site the caller may act on.
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct AdminSiteRow {
+    pub id: Uuid,
+    pub domain: String,
+    pub runtime: String,
+    pub status: String,
+    pub enabled: bool,
+    pub ssl_enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub parent_site_id: Option<Uuid>,
+    pub user_id: Uuid,
+    pub owner_email: Option<String>,
+    pub owner_role: Option<String>,
+}
+
+/// GET /api/admin/sites — every site on this server, with its owner. Admin only.
+///
+/// **This route exists because `transfer` was a one-way door.** Ownership is one
+/// axis and `list` above is scoped to the caller with no role branch — so the
+/// moment an admin handed a site to a client, the row left their list, `get_one`
+/// answered 404, and the Transfer control, which is rendered only on the site's
+/// own page, became unreachable. There was no way back through the panel at all,
+/// while `docs/guides/roles-and-ownership.md` promised the opposite in print.
+/// Reported from the field on #51 by the operator who had just used the feature.
+///
+/// It is a READ, and only a read — this route lists, and nothing more. What it is
+/// no longer doing is standing in for the capability: when it shipped, seeing a
+/// site and handing it back was the whole of what an administrator could do with
+/// one they did not own, and the operator it was built for said that was not
+/// enough on a server he is responsible for. Acting on those sites is now decided
+/// by [`crate::helpers::SITE_CALLER_PREDICATE`], one predicate shared by every
+/// per-site handler, which admits the owner or an administrator of the machine
+/// the site runs on.
+///
+/// This read stays a narrow projection anyway. A caller that may act on a site
+/// asks for it by id through the ordinary handlers; nothing needs a list row it
+/// can mistake for an actionable site.
+pub async fn list_for_admin(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    ServerScope(server_id, _agent): ServerScope,
+    Query(params): Query<ListQuery>,
+) -> Result<Json<Vec<AdminSiteRow>>, ApiError> {
+    let (limit, offset) = paginate(params.limit, params.offset);
+
+    let sites: Vec<AdminSiteRow> = sqlx::query_as(
+        "SELECT s.id, s.domain, s.runtime, s.status, s.enabled, s.ssl_enabled, \
+                s.created_at, s.parent_site_id, s.user_id, \
+                u.email AS owner_email, u.role AS owner_role \
+         FROM sites s LEFT JOIN users u ON u.id = s.user_id \
+         WHERE s.server_id = $1 ORDER BY s.created_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind(server_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("list sites for admin", e))?;
 
     Ok(Json(sites))
 }
@@ -249,7 +344,9 @@ pub async fn create(
                 Some(&format!("User tried to create site #{} in 1 hour", recent.0 + 1)),
             ).await;
             return Err(err(StatusCode::TOO_MANY_REQUESTS,
-                &format!("Site creation rate limit: max {max_sites} sites per hour")));
+                &format!("Site creation rate limit: max {max_sites} sites per hour. \
+                          An administrator can change this in Settings > Account > Security Hardening \
+                          (\"Site Creation Rate Limit\"); set it to 0 to remove the limit.")));
         }
     }
 
@@ -258,11 +355,11 @@ pub async fn create(
     // normalised form is what gets stored and sent to the agent.
     let domain = domain_claim::ensure_claimable(
         &state.db,
-        &agent,
-        server_id,
+        &state.agents,
         &body.domain,
         &headers,
         domain_claim::Holder::New,
+        &claims.role,
     )
     .await?;
 
@@ -386,7 +483,11 @@ pub async fn create(
 
     // Auto-allocate port for node/python runtimes
     let effective_proxy_port = if (runtime == "node" || runtime == "python") && body.proxy_port.is_none() {
-        // Find first available port in 4000-4999 range
+        // Find the first free port in the 5000-5999 range, on THIS server. The
+        // uniqueness index behind it is `idx_sites_proxy_port_server`, scoped the
+        // same way; while it was global, this first-fit picked 5000 on every
+        // server whose own set was empty and the INSERT below rejected it as a
+        // duplicate domain.
         let row: Option<(i32,)> = sqlx::query_as(
             "SELECT s.port FROM generate_series(5000, 5999) AS s(port) \
              WHERE s.port NOT IN (SELECT proxy_port FROM sites WHERE proxy_port IS NOT NULL AND server_id = $1) \
@@ -417,7 +518,15 @@ pub async fn create(
     .await
     .map_err(|e| {
         let msg = e.to_string();
-        if msg.contains("duplicate key") || msg.contains("unique") {
+        // Two unique indexes can reject this INSERT and they mean opposite things
+        // to the operator. Collapsing both into "Domain already exists" sent
+        // whoever hit the port one to go and look at DNS.
+        if msg.contains("idx_sites_proxy_port_server") {
+            err(
+                StatusCode::CONFLICT,
+                "That proxy port is already in use on this server",
+            )
+        } else if msg.contains("duplicate key") || msg.contains("unique") {
             err(StatusCode::CONFLICT, "Domain already exists")
         } else {
             err(StatusCode::INTERNAL_SERVER_ERROR, &msg)
@@ -451,6 +560,10 @@ pub async fn create(
         agent_body["app_command"] = serde_json::json!(cmd);
     }
     if let Some(ref php) = body.php_version {
+        // Backend can't know the target server's distro; this Debian-shaped string is
+        // a VERSION CARRIER, not a literal path — the agent resolves the real socket
+        // (Debian or RHEL's unversioned one) via services::pkg::resolve_php_fpm_socket
+        // before ever touching a filesystem path.
         agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
     }
     if let Some(ref preset) = body.php_preset {
@@ -515,10 +628,11 @@ pub async fn create(
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "site.create",
                 Some("site"), Some(&body.domain), Some(runtime), ip.as_deref(),
+                claims.key_id,
             ).await;
 
             // Panel notification
-            notifications::notify_panel(&state.db, Some(claims.sub), &format!("Site created: {}", body.domain), &format!("New {} site is now active", runtime), "info", "site", None).await;
+            notifications::notify_panel(&state.db, Some(claims.sub), &format!("Site created: {}", body.domain), &format!("New {} site is now active", runtime), "info", "site", Some(&format!("/sites/{}", site.id))).await;
 
             fire_event(&state.db, "site.created", serde_json::json!({
                 "site_id": site.id, "domain": site.domain, "runtime": site.runtime,
@@ -623,6 +737,13 @@ pub async fn create(
                 let dns_db = state.db.clone();
                 let dns_logs = logs.clone();
                 let dns_user_id = claims.sub;
+                // The host this site is being created ON. Auto-DNS must publish
+                // THIS machine's address, not the panel's — see
+                // `helpers::public_ip_for_server`. Here the two agree only on a
+                // single-box install; on a fleet the record used to point every
+                // member's site at the panel, which made the site unreachable at
+                // the very name the form had just claimed for it.
+                let dns_server_id = server_id;
                 tokio::spawn(async move {
                     // Extract parent domain
                     let parts: Vec<&str> = dns_domain.splitn(3, '.').collect();
@@ -643,7 +764,15 @@ pub async fn create(
                     };
 
                     if let Some((provider, cf_zone_id, cf_api_token, cf_api_email)) = zone {
-                        let server_ip = crate::helpers::detect_public_ip().await;
+                        let Some(server_ip) =
+                            crate::helpers::public_ip_for_server(&dns_db, Some(dns_server_id)).await
+                        else {
+                            // Refusing is the whole point: an A record naming the
+                            // wrong machine is worse than no record, because it
+                            // resolves and answers.
+                            emit_step(&dns_logs, site_id, "dns", "Creating DNS record", "failed", Some("could not determine this server's public address".to_string()));
+                            return;
+                        };
 
                         if provider == "cloudflare" {
                             if let (Some(zid), Some(tok)) = (cf_zone_id, cf_api_token) {
@@ -706,6 +835,7 @@ pub async fn create(
                 }
             };
             let ssl_runtime = runtime.to_string();
+            // Version carrier, not a literal path — see the comment on the create-site call site.
             let ssl_php_socket = body.php_version.as_ref().map(|v| format!("unix:/run/php/php{v}-fpm.sock"));
             let ssl_proxy_port = body.proxy_port;
             let ssl_php_preset = body.php_preset.clone();
@@ -747,6 +877,16 @@ pub async fn create(
                             tracing::info!("Auto-SSL provisioned for {ssl_domain} (attempt {})", i + 1);
                             emit_step(&ssl_logs, site_id, "ssl", "Provisioning SSL certificate", "done", None);
 
+                            // The body above carries the runtime, the root and the
+                            // PHP socket, but NOT the per-site limits or the
+                            // hardening fields — and the agent re-renders the whole
+                            // vhost from it. This task retries with delays, so a
+                            // limit the operator sets between creation and a later
+                            // attempt is published and then silently dropped.
+                            // Cheaper to put the row back than to keep this body in
+                            // step with every column `build_nginx_body` renders.
+                            crate::routes::ssl::rebuild_vhost_for_site(&ssl_db, &ssl_agent, site_id).await;
+
                             // Parse cert details from agent response
                             let ssl_expiry = result
                                 .get("expiry")
@@ -755,15 +895,31 @@ pub async fn create(
                             let cert_path = result.get("cert_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
                             let key_path = result.get("key_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                            // Update site DB record with SSL status
+                            // Update site DB record with SSL status.
+                            //
+                            // ⚠ This statement recorded FOUR columns while the two
+                            // deliberate issuance doors record their provenance too, so a
+                            // site whose certificate arrived automatically at creation
+                            // carried a NULL profile that the cooldown and margin helpers
+                            // then read. The set-comparison pin (ssl-controls C1/C3) exists
+                            // to keep this path and the upload path in step, and it could
+                            // not see the gap because it compares this statement against
+                            // the upload, not against the doors in `routes/ssl.rs`.
+                            //
+                            // This door is always HTTP-01 (`/ssl/provision/{domain}`,
+                            // one identifier), so the subject is the site's own domain and
+                            // it is never a wildcard.
                             let _ = sqlx::query(
                                 "UPDATE sites SET ssl_enabled = true, ssl_cert_path = $1, ssl_key_path = $2, \
-                                 ssl_expiry = $3, updated_at = NOW() WHERE id = $4"
+                                 ssl_expiry = $3, ssl_profile = NULL, \
+                                 ssl_challenge = 'http-01', ssl_cert_subject = $5, ssl_wildcard = FALSE, \
+                                 ssl_dns_zone_id = NULL, updated_at = NOW() WHERE id = $4"
                             )
                             .bind(&cert_path)
                             .bind(&key_path)
                             .bind(ssl_expiry)
                             .bind(site_id)
+                            .bind(&ssl_domain)
                             .execute(&ssl_db)
                             .await;
 
@@ -878,12 +1034,21 @@ pub async fn create(
 
                         let encrypted_db_password = crate::services::secrets_crypto::encrypt_credential(&db_password, &cms_jwt_secret)
                             .unwrap_or_else(|_| db_password.clone());
+                        // The site id is already in hand — this used to resolve it
+                        // again from the domain, and `sites.domain` is unique only
+                        // per server (`idx_sites_domain_server`). On a fleet holding
+                        // the same domain twice the subquery could attach this
+                        // database — credentials included — to the OTHER host's site
+                        // row, i.e. to a different owner's account. If it matched no
+                        // row at all the NOT NULL insert simply failed into the
+                        // `let _`, leaving a running container with no row: an
+                        // orphan the retention sweep can never see.
                         let _ = sqlx::query(
                             "INSERT INTO databases (site_id, engine, name, db_user, db_password_enc, container_id, port) \
-                             VALUES ((SELECT id FROM sites WHERE domain = $1), 'mysql', $2, $3, $4, $5, $6) \
+                             VALUES ($1, 'mysql', $2, $3, $4, $5, $6) \
                              ON CONFLICT DO NOTHING",
                         )
-                        .bind(&cms_domain)
+                        .bind(site_id)
                         .bind(&db_name)
                         .bind(&db_user_name)
                         .bind(&encrypted_db_password)
@@ -1216,7 +1381,7 @@ pub async fn provision_log(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, axum::BoxError>>>, ApiError> {
     // Verify ownership
     let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM sites WHERE id = $1 AND user_id = $2"
+        &format!("SELECT s.id FROM sites s WHERE {}", crate::helpers::SITE_CALLER_PREDICATE)
     )
     .bind(id).bind(claims.sub)
     .fetch_optional(&state.db).await
@@ -1256,7 +1421,13 @@ pub async fn provision_log(
             }
         });
 
-    let stream = snapshot_stream.chain(live_stream);
+    // The underlying channel closes (and this stream ends) once the job
+    // finishes and its map entry is dropped — but a job in progress at
+    // shutdown time can still run well past the graceful-drain window, so
+    // race it against the panel's own shutdown signal too.
+    let stream = snapshot_stream
+        .chain(live_stream)
+        .take_until(crate::helpers::shutdown_signal_fut(&state));
 
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -1271,12 +1442,16 @@ pub async fn get_one(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Site>, ApiError> {
-    let site: Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
-    )
-    .bind(id)
-    .bind(claims.sub)
-    .fetch_optional(&state.db)
+    // The two arms of [`crate::helpers::site_domain_for_caller`], for the whole
+    // row rather than the domain. This is the read the site's own page makes, so
+    // it is what decides whether an administrator can open a site at all — and
+    // until now it could not, which left the operator who had just handed a site
+    // to a client with a page that answered 404 and a control that lived only on
+    // it (#51).
+    let site: Site = sqlx::query_as(&SITE_FOR_CALLER_ALL)
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("get_one sites", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
@@ -1304,7 +1479,6 @@ pub struct SwitchPhpRequest {
 pub async fn switch_php(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<SwitchPhpRequest>,
 ) -> Result<Json<Site>, ApiError> {
@@ -1318,7 +1492,7 @@ pub async fn switch_php(
     }
 
     let site: Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -1326,6 +1500,7 @@ pub async fn switch_php(
     .await
     .map_err(|e| internal_error("switch php", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if site.runtime != "php" {
         return Err(err(
@@ -1360,7 +1535,162 @@ pub async fn switch_php(
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "site.php_switch",
         Some("site"), Some(&site.domain), Some(version), None,
+        claims.key_id,
     ).await;
+
+    Ok(Json(updated))
+}
+
+/// The runtimes this switch will move a site BETWEEN — deliberately only two.
+///
+/// `proxy`, `node` and `python` are excluded, and not for caution's sake: they
+/// are a different shape of change. Each needs a `proxy_port`, node/python
+/// additionally need an `app_command` that `create_site` puts through a
+/// per-runtime prefix whitelist, and — the part that actually bites — the agent's
+/// `document_root_for` (`agent/src/services/nginx.rs:52`) maps those three to the
+/// site directory itself while `static` and `php` BOTH map to `{site_dir}/public`.
+/// So static⇄php is purely a vhost rebuild, whereas anything involving a proxying
+/// runtime is a vhost rebuild PLUS moving the document root out from under files
+/// the operator already put there. Issue #99 asked for html→PHP and was answered
+/// with exactly this half; the other half is a separate feature, not a longer
+/// version of this list.
+const SWITCHABLE_RUNTIMES: &[&str] = &["static", "php"];
+
+/// PUT /api/sites/{id}/runtime — Switch a site between the static and PHP runtimes.
+#[derive(serde::Deserialize)]
+pub struct SwitchRuntimeRequest {
+    pub runtime: String,
+    /// Required when switching TO php. Ignored when switching to static.
+    pub php_version: Option<String>,
+}
+
+pub async fn switch_runtime(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SwitchRuntimeRequest>,
+) -> Result<Json<Site>, ApiError> {
+    let target = body.runtime.trim();
+
+    if !SWITCHABLE_RUNTIMES.contains(&target) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "Runtime can only be switched between {}. Changing to or from a proxying \
+                 runtime moves the document root and is not supported here.",
+                SWITCHABLE_RUNTIMES.join(" and ")
+            ),
+        ));
+    }
+
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("switch runtime", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+
+    if !SWITCHABLE_RUNTIMES.contains(&site.runtime.as_str()) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "This site runs the '{}' runtime. Only {} sites can be switched.",
+                site.runtime,
+                SWITCHABLE_RUNTIMES.join(" and ")
+            ),
+        ));
+    }
+
+    if site.runtime == target {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            &format!("Site is already running the '{target}' runtime"),
+        ));
+    }
+
+    // A PHP target needs a version, and it must be stated rather than guessed: a
+    // site that was PHP once still carries its old `php_version`, and silently
+    // reusing it would switch the operator onto a version they never chose on
+    // this trip through the control.
+    let php_version = if target == "php" {
+        let version = body
+            .php_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                err(
+                    StatusCode::BAD_REQUEST,
+                    "php_version is required when switching to the PHP runtime",
+                )
+            })?;
+        if !PHP_VERSIONS.contains(&version) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid PHP version. Allowed: {}", PHP_VERSIONS.join(", ")),
+            ));
+        }
+        Some(version.to_string())
+    } else {
+        None
+    };
+
+    // Rebuild the FULL vhost with only the runtime (and its PHP version) changed,
+    // for the same reason `switch_php` does: a hand-rolled partial body drops the
+    // site's WAF / CSP / Permissions-Policy / bot-protection.
+    //
+    // The agent side needs no new code. `put_site` already refuses a PHP version
+    // the server does not have (with the message that offers to install it),
+    // writes the per-site FPM pool, reloads PHP-FPM, and only re-points nginx once
+    // the pool socket actually exists — the fail-safe that stops a switch from
+    // 502-ing the site, which is the failure the reporter had already hit by hand.
+    let mut updated_site = site.clone();
+    updated_site.runtime = target.to_string();
+    updated_site.php_version = php_version.clone();
+    let agent_body = build_nginx_body(&updated_site);
+
+    let agent_path = format!("/nginx/sites/{}", site.domain);
+    agent
+        .put(&agent_path, agent_body)
+        .await
+        .map_err(|e| agent_error("Nginx update", e))?;
+
+    // Only after the vhost is actually live. A failed agent write above leaves the
+    // row describing what is really being served.
+    let updated: Site = sqlx::query_as(
+        "UPDATE sites SET runtime = $1, php_version = $2, updated_at = NOW() \
+         WHERE id = $3 RETURNING *",
+    )
+    .bind(target)
+    .bind(php_version.as_deref())
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| internal_error("switch runtime", e))?;
+
+    tracing::info!(
+        "Runtime switched {} -> {} for {}",
+        site.runtime,
+        target,
+        site.domain
+    );
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.runtime_switch",
+        Some("site"),
+        Some(&site.domain),
+        Some(&match php_version.as_deref() {
+            Some(v) => format!("{} -> {} {}", site.runtime, target, v),
+            None => format!("{} -> {}", site.runtime, target),
+        }),
+        None,
+        claims.key_id,
+    )
+    .await;
 
     Ok(Json(updated))
 }
@@ -1470,17 +1800,21 @@ pub struct UpdateLimitsRequest {
     pub php_memory_mb: Option<i32>,
     pub php_max_workers: Option<i32>,
     pub custom_nginx: Option<String>,
+    /// NULL = unlimited. Mirrors `rate_limit`'s convention: the settings form
+    /// always echoes this back on save, so its absence means "unlimited" the
+    /// same way an unset `rate_limit` means "no rate limit" — never "leave
+    /// whatever was there".
+    pub bandwidth_quota_mb: Option<i32>,
 }
 
 pub async fn update_limits(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateLimitsRequest>,
 ) -> Result<Json<Site>, ApiError> {
     let site: Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -1488,6 +1822,7 @@ pub async fn update_limits(
     .await
     .map_err(|e| internal_error("update limits", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if let Some(rl) = body.rate_limit {
         if rl < 1 || rl > 10000 {
@@ -1514,16 +1849,55 @@ pub async fn update_limits(
         }
     }
 
+    if let Some(q) = body.bandwidth_quota_mb
+        && q < 1
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "Bandwidth quota must be at least 1 MB"));
+    }
+
+    // A quota edit that lifts a site out of over-quota territory (raised the
+    // cap, or removed it) shouldn't leave the site disabled until the
+    // traffic_accounting_scheduler's next tick (up to 5 minutes) notices —
+    // recover it here, in the same request, when that's now the case.
+    let recovering = if site.bandwidth_suspended_at.is_some() {
+        match body.bandwidth_quota_mb {
+            None => true,
+            Some(q) => {
+                let year_month = chrono::Utc::now().format("%Y-%m").to_string();
+                let used: i64 = sqlx::query_scalar(
+                    "SELECT bytes_used FROM site_traffic_usage WHERE site_id = $1 AND year_month = $2",
+                )
+                .bind(id)
+                .bind(&year_month)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+                used <= (q as i64) * 1024 * 1024
+            }
+        }
+    } else {
+        false
+    };
+    let new_enabled = if recovering { true } else { site.enabled };
+    let new_suspended_at: Option<chrono::DateTime<chrono::Utc>> =
+        if recovering { None } else { site.bandwidth_suspended_at };
+
     let custom_nginx = body.custom_nginx.as_deref();
     let updated: Site = sqlx::query_as(
         "UPDATE sites SET rate_limit = $1, max_upload_mb = $2, php_memory_mb = $3, php_max_workers = $4, \
-         custom_nginx = $5, updated_at = NOW() WHERE id = $6 RETURNING *",
+         custom_nginx = $5, bandwidth_quota_mb = $6, enabled = $7, bandwidth_suspended_at = $8, \
+         updated_at = NOW() WHERE id = $9 RETURNING *",
     )
     .bind(body.rate_limit)
     .bind(max_upload)
     .bind(php_memory)
     .bind(php_workers)
     .bind(custom_nginx)
+    .bind(body.bandwidth_quota_mb)
+    .bind(new_enabled)
+    .bind(new_suspended_at)
     .bind(id)
     .fetch_one(&state.db)
     .await
@@ -1540,25 +1914,86 @@ pub async fn update_limits(
         .await
         .map_err(|e| agent_error("Resource limits", e))?;
 
+    if recovering {
+        if let Err(e) = agent.post(&format!("/nginx/sites/{}/enable", site.domain), None).await {
+            tracing::warn!(
+                "Bandwidth quota update: failed to re-enable {} at the agent after lifting suspension: {e}",
+                site.domain
+            );
+        } else {
+            activity::log_activity(
+                &state.db, claims.sub, &claims.email, "site.bandwidth_suspension_lifted",
+                Some("site"), Some(&site.domain), Some("quota raised or removed"), None,
+                claims.key_id,
+            ).await;
+        }
+    }
+
     tracing::info!("Resource limits updated for {}", site.domain);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "site.limits",
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     Ok(Json(updated))
+}
+
+/// GET /api/sites/{id}/bandwidth-usage — current-month bytes used against
+/// quota, suspension state, and up to 12 months of history for the usage chart.
+pub async fn bandwidth_usage(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("bandwidth usage", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    let year_month = chrono::Utc::now().format("%Y-%m").to_string();
+    let used_this_month: i64 = sqlx::query_scalar(
+        "SELECT bytes_used FROM site_traffic_usage WHERE site_id = $1 AND year_month = $2",
+    )
+    .bind(id)
+    .bind(&year_month)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("bandwidth usage", e))?
+    .unwrap_or(0i64);
+
+    let history: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT year_month, bytes_used FROM site_traffic_usage WHERE site_id = $1 \
+         ORDER BY year_month DESC LIMIT 12",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("bandwidth usage", e))?;
+
+    Ok(Json(serde_json::json!({
+        "quota_mb": site.bandwidth_quota_mb,
+        "used_bytes_this_month": used_this_month,
+        "suspended_at": site.bandwidth_suspended_at,
+        "year_month": year_month,
+        "history": history.into_iter()
+            .map(|(ym, b)| serde_json::json!({ "year_month": ym, "bytes_used": b }))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 /// DELETE /api/sites/{id} — Delete a site and all associated resources.
 pub async fn remove(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -1567,16 +2002,68 @@ pub async fn remove(
     .map_err(|e| internal_error("remove sites", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
 
-    // Remove database containers before CASCADE deletes the records
-    let databases: Vec<(String,)> = sqlx::query_as(
-        "SELECT container_id FROM databases WHERE site_id = $1 AND container_id IS NOT NULL AND container_id != ''",
+    // Every destructive step below names this site by DOMAIN and runs on whichever host
+    // this handle points at. Taking the handle from the caller's selection meant a site on
+    // a fleet member had its databases, its firewall rule, its Redis index and its webroot
+    // aimed at the panel host instead — and the firewall arm is the one step that is not
+    // domain-namespaced, so it could match an unrelated rule there. The row names the host.
+    let agent =
+        crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+
+    // Pre-delete backup: snapshot the site BEFORE anything destructive runs.
+    //
+    // This used to sit forty lines further down, AFTER `DELETE /nginx/sites/{domain}`
+    // — whose agent handler does `remove_dir_all("/var/www/{domain}")` — and after the
+    // database containers were destroyed. `create_backup` opens with
+    // `if !site_root.exists() { return Err(...) }`, so by the time it ran the site root
+    // was always gone: the call returned an error 100% of the time, and `let _ =`
+    // discarded it. The "backup before permanent deletion" had never written a byte on
+    // this path, and the comment above it said it had.
+    //
+    // It is still best-effort — a failed snapshot must not strand a site the operator
+    // asked to delete — but a failure is now LOGGED rather than swallowed, and the
+    // databases are included, since they are still alive at this point.
+    let predelete_dbs = crate::routes::backups::site_databases(&state, id).await;
+    match agent
+        .post(
+            &format!("/backups/{}/create", site.domain),
+            Some(serde_json::json!({
+                "reason": "pre-delete",
+                "databases": predelete_dbs.specs,
+            })),
+        )
+        .await
+    {
+        Ok(info) => tracing::info!(
+            "Pre-delete backup for {} created: {}",
+            site.domain,
+            info.get("filename").and_then(|v| v.as_str()).unwrap_or("(unnamed)")
+        ),
+        Err(e) => tracing::warn!(
+            "Pre-delete backup for {} FAILED — continuing with deletion: {e}",
+            site.domain
+        ),
+    }
+
+    // Remove database containers before CASCADE deletes the records.
+    //
+    // The NAME is selected alongside the container id, and rows without a
+    // container are carried too: a dump directory is keyed by the database name
+    // and exists whether or not anything is still running. Selecting only the
+    // container id meant this handler did not even hold the value the dump purge
+    // needs, which is why site deletion left every dump on disk.
+    let databases: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT name, container_id FROM databases WHERE site_id = $1",
     )
     .bind(id)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
 
-    for (container_id,) in &databases {
+    for (_, container_id) in &databases {
+        let Some(container_id) = container_id.as_deref().filter(|c| !c.is_empty()) else {
+            continue;
+        };
         if let Err(e) = agent.delete(&format!("/databases/{container_id}")).await {
             tracing::warn!("Failed to remove database container {container_id}: {e}");
         }
@@ -1607,6 +2094,31 @@ pub async fn remove(
             &format!("/nginx/sites/{}/redis/purge", site.domain),
             Some(serde_json::json!({ "redis_db": site.redis_db })),
         ).await.map_err(|e| tracing::warn!("Best-effort Redis purge failed for {}: {e}", site.domain)).ok();
+    }
+
+    // Tear down the SFTP account (if any) BEFORE the site directory itself is
+    // removed below — detaching the bind mount and reverting ownership on a
+    // directory that is about to be deleted anyway is redundant work, but it
+    // keeps `deprovision`'s contract simple (it always leaves the box in a
+    // fully-reverted state) rather than growing a delete-vs-disable branch.
+    if site.sftp_enabled
+        && let (Some(uid), Some(gid)) = (site.sftp_uid, site.sftp_gid)
+    {
+        let last_sftp_site: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sites WHERE sftp_enabled = true AND id != $1",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((1,)); // fail toward NOT removing the shared sshd drop-in
+        if let Err(e) = agent.post(
+            &format!("/sftp/sites/{}/disable", site.domain),
+            Some(serde_json::json!({
+                "uid": uid, "gid": gid, "last_sftp_site": last_sftp_site.0 == 0,
+            })),
+        ).await {
+            tracing::warn!("SFTP teardown failed for {} during site deletion — continuing: {e}", site.domain);
+        }
     }
 
     // Remove nginx config + SSL + PHP pool + site files + logs
@@ -1651,11 +2163,8 @@ pub async fn remove(
         .await
         .ok();
 
-    // Pre-delete backup: snapshot site files before permanent deletion (best-effort)
-    let _ = agent.post(
-        &format!("/backups/{}/create", site.domain),
-        Some(serde_json::json!({"reason": "pre-delete"})),
-    ).await;
+    // (The pre-delete backup used to be here — see the note above the version that
+    // now runs before the destructive steps.)
 
     // Delete from DB (CASCADE removes databases, backups, crons, etc.)
     sqlx::query("DELETE FROM sites WHERE id = $1")
@@ -1663,6 +2172,21 @@ pub async fn remove(
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("remove sites", e))?;
+
+    // Take each database's dumps with it, now that the cascade has removed the
+    // rows that would otherwise answer the "is this name still in use" question
+    // about themselves.
+    //
+    // ⛔ THE ORDER IS THE GUARD. Above this line every one of these names is
+    // still claimed — by the very row being deleted — so the probe answers
+    // "shared", nothing is purged, and the log reads like a correct decision.
+    // There is no error, no failing request and no symptom; the only evidence
+    // would be the dumps still on disk. This is pinned.
+    for (name, _) in &databases {
+        crate::routes::databases::purge_dumps_if_unclaimed(
+            &state, &agent, name, site.server_id,
+        ).await;
+    }
 
     // Decrement reseller site counter
     let _ = sqlx::query(
@@ -1675,9 +2199,20 @@ pub async fn remove(
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "site.delete",
         Some("site"), Some(&site.domain), None, ip.as_deref(),
+        claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "site.delete", Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&site.domain), None, None, "critical",
+        claims.key_id,
     ).await;
 
     // Panel notification
+    // Deliberately unlinked: every other site notification carries
+    // `/sites/{id}`, but this one's subject no longer exists. `main.tsx`'s
+    // catch-all route sends an unresolvable path to the Dashboard without
+    // saying why, so a link here would be a control that silently lies about
+    // where it is taking you. A notification with no link renders as plain text.
     notifications::notify_panel(&state.db, Some(claims.sub), &format!("Site deleted: {}", site.domain), "Site and all associated resources have been removed", "info", "site", None).await;
 
     fire_event(&state.db, "site.deleted", serde_json::json!({
@@ -1689,6 +2224,13 @@ pub async fn remove(
         let dns_domain = site.domain.clone();
         let dns_db = state.db.clone();
         let dns_user = claims.sub;
+        // The host this site actually ran on. The cleanup below deletes a record
+        // only when its content matches this address, so reading the PANEL's
+        // address here meant a fleet member's record never matched and outlived
+        // the site — a dangling A record still resolving to a machine that no
+        // longer serves the name, which is a subdomain-takeover surface and not
+        // merely untidy.
+        let dns_server_id = site.server_id;
         tokio::spawn(async move {
             // Extract parent domain
             let parts: Vec<&str> = dns_domain.splitn(3, '.').collect();
@@ -1709,7 +2251,12 @@ pub async fn remove(
             };
 
             if let Some((provider, cf_zone_id, cf_api_token, cf_api_email)) = zone {
-                let server_ip = crate::helpers::detect_public_ip().await;
+                let Some(server_ip) =
+                    crate::helpers::public_ip_for_server(&dns_db, dns_server_id).await
+                else {
+                    tracing::warn!("Auto-DNS cleanup: could not resolve the public address of the server {dns_domain} lived on — leaving the record in place rather than deleting one that may belong to another host");
+                    return;
+                };
 
                 if provider == "cloudflare" {
                     if let (Some(zid), Some(tok)) = (cf_zone_id, cf_api_token) {
@@ -1761,28 +2308,22 @@ pub async fn remove(
 // Redirect Rules (proxy to agent)
 // ──────────────────────────────────────────────────────────────
 
-/// Helper: get site domain from site ID + user ID.
-async fn site_domain(state: &AppState, site_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(site_id)
-            .bind(user_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("remove sites", e))?;
-
-    row.map(|(d,)| d)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))
+/// Helper: resolve a site this caller may act on, and return its domain.
+///
+/// Now one line over [`crate::helpers::site_domain_for_caller`], which is shared
+/// with the five modules that each carried their own copy of this query. Read the
+/// rules there — in particular why only the admin arm is scoped by server.
+async fn site_domain(state: &AppState, site_id: Uuid, claims: &Claims) -> Result<String, ApiError> {
+    crate::helpers::site_domain_for_caller(state, site_id, claims).await
 }
 
 /// GET /api/sites/{id}/redirects — List redirects.
 pub async fn list_redirects(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .get(&format!("/nginx/redirects/{domain}"))
         .await
@@ -1806,7 +2347,6 @@ fn default_301() -> String {
 pub async fn add_redirect(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<AddRedirectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1822,7 +2362,7 @@ pub async fn add_redirect(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid redirect target: contains shell metacharacters"));
     }
 
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .post(
             "/nginx/redirects/add",
@@ -1842,11 +2382,10 @@ pub async fn add_redirect(
 pub async fn remove_redirect(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .post(
             &format!("/nginx/redirects/{domain}/remove"),
@@ -1865,10 +2404,9 @@ pub async fn remove_redirect(
 pub async fn list_protected(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .get(&format!("/nginx/password-protect/{domain}"))
         .await
@@ -1887,7 +2425,6 @@ pub struct PasswordProtectBody {
 pub async fn add_password_protect(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<PasswordProtectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1900,7 +2437,7 @@ pub async fn add_password_protect(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid username: must be alphanumeric (underscores and hyphens allowed)"));
     }
 
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .post(
             "/nginx/password-protect",
@@ -1920,11 +2457,10 @@ pub async fn add_password_protect(
 pub async fn remove_password_protect(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .post(
             &format!("/nginx/password-protect/{domain}/remove"),
@@ -1943,10 +2479,9 @@ pub async fn remove_password_protect(
 pub async fn list_aliases(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .get(&format!("/nginx/aliases/{domain}"))
         .await
@@ -1963,7 +2498,6 @@ pub struct AddAliasBody {
 pub async fn add_alias(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<AddAliasBody>,
@@ -1972,14 +2506,28 @@ pub async fn add_alias(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid alias: must be a valid domain name"));
     }
 
-    let domain = site_domain(&state, id, claims.sub).await?;
+    // This handler needs the host as a VALUE, not just as a handle, so it reads both
+    // from the row rather than going through the domain-only resolver. Taking the id
+    // from the caller's selection meant the collision check below ran against one
+    // machine while the alias was written on another.
+    let (domain, site_server_id): (String, Option<Uuid>) = sqlx::query_as(&format!(
+        "SELECT s.domain, s.server_id FROM sites s WHERE {}",
+        crate::helpers::SITE_CALLER_PREDICATE
+    ))
+    .bind(id)
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("add alias", e))?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
 
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &domain).await?;
     // An alias becomes an nginx `server_name` on the caller's own vhost. Without
     // this guard any tenant could attach ANOTHER tenant's (or the panel's own)
     // live domain as an alias and hijack its traffic / intercept its ACME
     // HTTP-01 challenge. Reject reserved domains and any domain already served
     // by a site or git deployment on this server.
-    let alias = ensure_domain_available(&state, &agent, &body.alias, server_id, &headers).await?;
+    let alias = ensure_domain_available(&state, &body.alias, &headers, &claims.role).await?;
 
     let result = agent
         .post(
@@ -1998,11 +2546,10 @@ pub async fn add_alias(
 pub async fn remove_alias(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .post(
             &format!("/nginx/aliases/{domain}/remove"),
@@ -2021,11 +2568,10 @@ pub async fn remove_alias(
 pub async fn access_logs(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let lines = params.get("lines").unwrap_or(&"200".to_string()).clone();
     let log_type = params.get("type").unwrap_or(&"access".to_string()).clone();
     let path = format!(
@@ -2043,10 +2589,9 @@ pub async fn access_logs(
 pub async fn site_stats(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .get(&format!("/nginx/site-stats/{domain}"))
         .await
@@ -2058,10 +2603,9 @@ pub async fn site_stats(
 pub async fn php_errors(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent
         .get(&format!("/nginx/php-errors/{domain}"))
         .await
@@ -2075,7 +2619,7 @@ pub async fn health_check(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let domain = site_domain(&state, id, &claims).await?;
 
     // Check if site has SSL
     let ssl: Option<(bool,)> = sqlx::query_as("SELECT ssl_enabled FROM sites WHERE id = $1")
@@ -2138,7 +2682,7 @@ pub async fn health_summary(
 
     // Verify ownership
     let site: Option<(String, bool, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT domain, ssl_enabled, ssl_expiry FROM sites WHERE id = $1 AND user_id = $2"
+        &format!("SELECT s.domain, s.ssl_enabled, s.ssl_expiry FROM sites s WHERE {}", crate::helpers::SITE_CALLER_PREDICATE)
     ).bind(id).bind(claims.sub).fetch_optional(db).await
         .map_err(|e| internal_error("health summary", e))?;
 
@@ -2158,7 +2702,7 @@ pub async fn health_summary(
 
     // Uptime: latest monitor status + response time
     let monitor: Option<(String, Option<i32>, bool)> = sqlx::query_as(
-        "SELECT status, last_response_ms, enabled FROM monitors WHERE site_id = $1 ORDER BY created_at DESC LIMIT 1"
+        "SELECT status, last_response_time, enabled FROM monitors WHERE site_id = $1 ORDER BY created_at DESC LIMIT 1"
     ).bind(id).fetch_optional(db).await
         .map_err(|e| internal_error("health summary monitor check", e))?;
     let (monitor_status, response_time, monitor_enabled) = monitor
@@ -2253,10 +2797,31 @@ pub async fn clone_site(
     }
 
     // Get source site
-    let source: Option<Site> = sqlx::query_as("SELECT * FROM sites WHERE id = $1 AND user_id = $2")
+    let source: Option<Site> = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
         .bind(id).bind(claims.sub).fetch_optional(&state.db).await
         .map_err(|e| internal_error("clone site", e))?;
     let source = source.ok_or_else(|| err(StatusCode::NOT_FOUND, "Source site not found"))?;
+
+    // A clone is ONE agent operation: `/nginx/clone-site` reads the source
+    // docroot and writes the target docroot on the same box. So unlike the other
+    // handlers in this family the fix is not "dispatch from the row" — the target
+    // is genuinely a new site on the selected server, and the source is genuinely
+    // wherever it already lives. When those differ there is no host that can do
+    // the job, and the old code asked the SELECTED one, which has no such
+    // docroot. Everything expensive is already committed by the time the agent
+    // says so: the reseller quota slot is reserved and the `sites` row inserted
+    // before the call, so the caller was left owning a registered,
+    // quota-consuming site whose files never arrived.
+    //
+    // Refuse up front instead. Copying a docroot between machines is a feature
+    // (it needs a transfer), not something to fake by pointing at the wrong disk.
+    if source.server_id != Some(server_id) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "This site lives on a different server. Select that server to clone it — \
+             cloning across servers is not supported yet.",
+        ));
+    }
 
     // clone_site creates a brand-new site and must enforce the SAME admission
     // controls create() does — otherwise it is a create() with none of the
@@ -2278,10 +2843,12 @@ pub async fn clone_site(
         .unwrap_or((0,));
         if recent.0 >= max_sites {
             return Err(err(StatusCode::TOO_MANY_REQUESTS,
-                &format!("Site creation rate limit: max {max_sites} sites per hour")));
+                &format!("Site creation rate limit: max {max_sites} sites per hour. \
+                          An administrator can change this in Settings > Account > Security Hardening \
+                          (\"Site Creation Rate Limit\"); set it to 0 to remove the limit.")));
         }
     }
-    let target_domain = &ensure_domain_available(&state, &agent, target_domain, server_id, &headers).await?;
+    let target_domain = &ensure_domain_available(&state, target_domain, &headers, &claims.role).await?;
     // Atomically reserve the reseller site-quota slot AFTER the (fallible) domain checks
     // so a rejected clone cannot leak a quota slot; this mirrors create(), where the
     // reserve is the last pre-check before the mutation. Release it if the INSERT fails;
@@ -2336,6 +2903,7 @@ pub async fn clone_site(
         nginx_body["proxy_port"] = serde_json::json!(port);
     }
     if let Some(ref php) = source.php_version {
+        // Version carrier, not a literal path — see the comment on the create-site call site.
         nginx_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
     }
     if let Some(ref preset) = source.php_preset {
@@ -2351,7 +2919,7 @@ pub async fn clone_site(
         .map_err(|e| agent_error("Nginx config", e))?;
 
     activity::log_activity(&state.db, claims.sub, &claims.email, "site.clone",
-        Some("site"), Some(target_domain), Some(&source.domain), None).await;
+        Some("site"), Some(target_domain), Some(&source.domain), None, claims.key_id).await;
 
     // Reseller site counter already incremented atomically by the reserve above.
 
@@ -2432,26 +3000,117 @@ pub async fn clone_site(
 pub async fn upload_ssl(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let mut agent_body = body.clone();
     agent_body["domain"] = serde_json::json!(domain);
 
-    agent.post("/ssl/upload", Some(agent_body)).await
+    let uploaded = agent.post("/ssl/upload", Some(agent_body)).await
         .map_err(|e| agent_error("SSL upload", e))?;
 
-    // Update DB
-    if let Err(e) = sqlx::query("UPDATE sites SET ssl_enabled = true, updated_at = NOW() WHERE id = $1")
-        .bind(id).execute(&state.db).await {
-        tracing::warn!("Failed to update ssl_enabled for site {id}: {e}");
+    // Record WHAT was installed, not merely THAT something was.
+    //
+    // This wrote `ssl_enabled = true` and nothing else, while the ACME path
+    // (`provision`, above) writes `ssl_cert_path`, `ssl_key_path` and
+    // `ssl_expiry` in one statement. The three columns it skipped are the only
+    // ones anything downstream reads, and every one of those readers filters on
+    // `ssl_expiry IS NOT NULL`: the Dashboard SSL tile, `alert_engine`'s
+    // `check_ssl_expiry` ladder, and `auto_healer::auto_renew_ssl`. So an
+    // operator-supplied certificate was invisible to the countdown, to the
+    // pager and to the healer alike — and the certificate list, which reads
+    // the same NULL, called it OK. An uploaded certificate is precisely the
+    // kind nobody renews for you; it was the one class the panel watched least.
+    //
+    // The agent hands back the paths it wrote. The expiry needs one more
+    // question, asked of the route every agent has carried since the beginning
+    // rather than of a new field only a fresh agent would return — this fix has
+    // to reach installs whose agent nobody has updated.
+    let cert_path = uploaded.get("cert_path").and_then(|v| v.as_str()).map(str::to_string);
+    let key_path = uploaded.get("key_path").and_then(|v| v.as_str()).map(str::to_string);
+    // Prefer the expiry the upload itself reported: it describes the certificate
+    // that was just written, needs no second round trip, and cannot fail
+    // separately from the write it belongs to. The `/ssl/status` call behind it is
+    // the compatibility path for an agent older than this release — every agent
+    // has carried that route since the beginning, so the fix reaches installs
+    // nobody has updated.
+    let expiry = uploaded
+        .get("expiry")
+        .and_then(|v| v.as_str())
+        .and_then(crate::helpers::parse_agent_cert_expiry);
+    let expiry = match expiry {
+        Some(e) => Some(e),
+        None => match agent.get(&format!("/ssl/status/{domain}")).await {
+            Ok(status) => status
+                .get("not_after")
+                .and_then(|v| v.as_str())
+                .and_then(crate::helpers::parse_agent_cert_expiry),
+            Err(e) => {
+                tracing::warn!("Uploaded certificate for {domain} is installed, but its expiry could not be read back: {e}");
+                None
+            }
+        },
+    };
+    if expiry.is_none() {
+        tracing::warn!("Uploaded certificate for {domain} stored with no new expiry — the previous value is kept rather than cleared, so the site stays visible to the expiry ladder and the auto-healer");
     }
 
+    // The profile column describes how the PANEL ordered the certificate that used
+    // to be here, and this upload replaced it. Both renewal doors feed that value
+    // back to the agent, and the auto-healer reads it for the renewal margin and
+    // the ARI cooldown, so leaving it in place applies a retired certificate's
+    // terms to whatever the operator just installed. Cleared, not preserved:
+    // absent means the next order resolves its own profile, which is what an
+    // uploaded certificate honestly implies. Unlike its three siblings this one
+    // is NOT wrapped in COALESCE — for those, keeping a known value beats erasing
+    // it, and here the stored value is precisely what has stopped being true.
+    if let Err(e) = sqlx::query(
+        "UPDATE sites SET ssl_enabled = true, ssl_cert_path = COALESCE($1, ssl_cert_path), \
+         ssl_key_path = COALESCE($2, ssl_key_path), ssl_expiry = COALESCE($3, ssl_expiry), \
+         ssl_profile = NULL, \
+         ssl_challenge = NULL, ssl_cert_subject = NULL, ssl_wildcard = NULL, \
+         ssl_dns_zone_id = NULL, \
+         ssl_renewal_at = NULL, ssl_renewal_checked_at = NULL, updated_at = NOW() WHERE id = $4",
+    )
+        .bind(cert_path.as_deref())
+        .bind(key_path.as_deref())
+        .bind(expiry)
+        .bind(id)
+        .execute(&state.db)
+        .await
+    {
+        tracing::warn!("Failed to record uploaded certificate for site {id}: {e}");
+    }
+
+    // Re-render the FULL vhost from the site's DB config — the same compensation
+    // every other SSL path already performs.
+    //
+    // The agent's `/ssl/upload` handler receives only {domain, certificate,
+    // private_key} and has to invent the other nineteen fields of the SiteConfig it
+    // renders, so it writes a vhost with WAF off, bot-protection off, no CSP, no
+    // Permissions-Policy, no custom_nginx, default rate limits — and, because it
+    // cannot know the site's PHP version, an unversioned `php-fpm.sock` that exists
+    // on no modern Debian or Ubuntu. So uploading a certificate did not merely strip
+    // a hardened site's security directives (with the panel's own toggles still
+    // reading ON, since the DB row is untouched): on a PHP site it took the site
+    // OFF THE AIR with a 502.
+    //
+    // v2.18.0 introduced this compensation for exactly this reason and applied it to
+    // provision, renew and force-renew. Upload is the fourth sibling and was missed —
+    // a fix to one instance of a pattern owes a grep for the pattern.
+    crate::routes::ssl::rebuild_vhost_after_ssl(&state, &agent, id).await;
+
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(&state.db, claims.sub, &claims.email, "ssl.upload",
-        Some("site"), Some(&domain), None, None).await;
+        Some("site"), Some(&domain), None, ip.as_deref(), claims.key_id).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "ssl.upload", Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&domain), None, None, "warning",
+        claims.key_id,
+    ).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2497,10 +3156,9 @@ pub async fn install_php_extension(
 pub async fn get_env_vars(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let result = agent.get(&format!("/nginx/env/{domain}")).await
         .map_err(|e| agent_error("Env vars", e))?;
     Ok(Json(result))
@@ -2510,11 +3168,10 @@ pub async fn get_env_vars(
 pub async fn set_env_vars(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     agent.put(&format!("/nginx/env/{domain}"), body).await
         .map_err(|e| agent_error("Env vars", e))?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -2524,14 +3181,13 @@ pub async fn set_env_vars(
 pub async fn rename_domain(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Get current site
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2540,6 +3196,12 @@ pub async fn rename_domain(
     .map_err(|e| internal_error("rename domain", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
 
+    // ⚠ The scope binding this replaces was spelled `_server_id` and was NOT unused —
+    // the underscore silenced the warning while the value was still being passed to
+    // the claim check below. Renaming a domain rewrites this site's vhost, so both
+    // the check and the write have to name the host the row does.
+    let agent =
+        crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
     let requested = body.get("new_domain")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -2552,11 +3214,11 @@ pub async fn rename_domain(
     // that the DESTINATION is free).
     let new_domain = domain_claim::ensure_claimable(
         &state.db,
-        &agent,
-        _server_id,
+        &state.agents,
         &requested,
         &headers,
         domain_claim::Holder::Site(id),
+        &claims.role,
     )
     .await?;
 
@@ -2566,18 +3228,131 @@ pub async fn rename_domain(
 
     // Call agent to rename nginx config, site dir, logs
     let old_domain = site.domain.clone();
+
+    // An agent older than the carry release renames the vhost, the webroot, the
+    // certificates, the logs, the pools and the jail — and silently leaves every
+    // backup tree behind under the old name. It answers success either way, so
+    // there is nothing in the response to notice. Refuse instead, and only for a
+    // site that actually has archives to lose: a site with none renames on any
+    // agent, which is what keeps a mid-upgrade fleet usable.
+    let backup_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backups WHERE site_id = $1")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+    let agent_carries_backups = if backup_rows > 0 {
+        let reported = agent
+            .get("/health")
+            .await
+            .ok()
+            .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(str::to_string));
+        let carries = crate::services::panel_update::semver_key(reported.as_deref())
+            >= crate::services::panel_update::semver_key(Some(BACKUP_CARRY_MIN_AGENT));
+        if !carries {
+            return Err(err(
+                StatusCode::PRECONDITION_FAILED,
+                &format!(
+                    "This site has {backup_rows} backup(s) and the agent on its server reports \
+                     {}, which does not move a site's archives when the domain changes — they \
+                     would be left on disk under {old_domain} where nothing can restore them. \
+                     Update that server's agent to {BACKUP_CARRY_MIN_AGENT} or later, then \
+                     rename.",
+                    reported.as_deref().unwrap_or("an unknown version"),
+                ),
+            ));
+        }
+        true
+    } else {
+        false
+    };
+
     agent.post(
         &format!("/nginx/sites/{}/rename", old_domain),
         Some(serde_json::json!({ "new_domain": new_domain })),
     ).await.map_err(|e| agent_error("Domain rename", e))?;
 
-    // Update site record
-    sqlx::query("UPDATE sites SET domain = $1, updated_at = NOW() WHERE id = $2")
+    // Update site record.
+    //
+    // ⛔ `ssl_cert_path`/`ssl_key_path` MUST move with the domain. The agent has
+    // just renamed `/etc/dockpanel/ssl/{old}` to `{new}` (or copied it, when the
+    // directory is shared), and this statement used to write the domain alone —
+    // so a renamed site kept a path naming a directory it no longer uses, for
+    // ever, since no renewal door rewrites the column either. That is not
+    // cosmetic: `build_nginx_body` sends `ssl_cert_path` verbatim to the agent on
+    // the next full vhost rebuild, so an unrelated later edit re-pointed nginx at
+    // a directory that is gone.
+    //
+    // ⚠ Scoped to the site's OWN directory on purpose. A site whose certificate
+    // is a DNS-01 wildcard has `ssl_cert_path` naming the ZONE, which the agent
+    // does not touch on rename and which must not be rewritten to the new name —
+    // that path is correct exactly as it stands. The `LIKE` therefore matches
+    // only a path under the OLD domain's own directory.
+    sqlx::query(
+        "UPDATE sites SET domain = $1, \
+         ssl_cert_path = CASE WHEN ssl_cert_path LIKE $3 \
+             THEN '/etc/dockpanel/ssl/' || $1 || '/fullchain.pem' ELSE ssl_cert_path END, \
+         ssl_key_path = CASE WHEN ssl_key_path LIKE $4 \
+             THEN '/etc/dockpanel/ssl/' || $1 || '/privkey.pem' ELSE ssl_key_path END, \
+         updated_at = NOW() WHERE id = $2",
+    )
         .bind(&new_domain)
         .bind(id)
+        .bind(format!("/etc/dockpanel/ssl/{old_domain}/%"))
+        .bind(format!("/etc/dockpanel/ssl/{old_domain}/%"))
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("rename domain", e))?;
+
+    // The agent renamed each archive's `{old}-` prefix to `{new}-` as part of the
+    // carry, so the rows have to follow or every filename in them names a file
+    // that is no longer there. Both sides derive the same prefix from the same
+    // two domains, so this is a mirror of the move rather than a guess about it.
+    if agent_carries_backups {
+        let renamed_rows = sqlx::query(
+            "UPDATE backups SET filename = $1 || substring(filename from $3) \
+             WHERE site_id = $2 AND filename LIKE $4",
+        )
+        .bind(format!("{new_domain}-"))
+        .bind(id)
+        .bind(old_domain.len() as i32 + 2)
+        .bind(format!("{old_domain}-%"))
+        .execute(&state.db)
+        .await;
+        match renamed_rows {
+            Ok(r) => tracing::info!(
+                "Rename {old_domain} to {new_domain}: re-prefixed {} backup row(s)",
+                r.rows_affected()
+            ),
+            Err(e) => tracing::error!(
+                "Rename {old_domain} to {new_domain}: the archives moved but their rows could \
+                 not be re-prefixed ({e}). Every backup row for this site now names a file that \
+                 is not there."
+            ),
+        }
+
+        // The carry is the one step of the rename whose success the panel can
+        // check from the outside, and the check is version-independent: if
+        // anything is still listed under the old name, something was left behind.
+        match agent.get(&format!("/backups/{old_domain}/list")).await {
+            Ok(v) => {
+                // The agent answers this one with a bare array, not an object
+                // wrapping a `backups` key. Reading a key that is not there
+                // would make this check report "nothing left behind" for every
+                // input it will ever see.
+                let left = v.as_array().map(|a| a.len()).unwrap_or(0);
+                if left > 0 {
+                    tracing::error!(
+                        "Rename {old_domain} to {new_domain} completed, but the agent still \
+                         lists {left} backup(s) under {old_domain} — the carry did not take \
+                         everything and those archives are unreachable from the panel."
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                "Could not confirm the backup carry for {old_domain}: {e}"
+            ),
+        }
+    }
 
     // Update monitors linked to this site.
     //
@@ -2613,11 +3388,12 @@ pub async fn rename_domain(
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "site.rename_domain",
         Some("site"), Some(&new_domain), Some(&old_domain), None,
+        claims.key_id,
     ).await;
 
     notifications::notify_panel(&state.db, Some(claims.sub),
         &format!("Domain renamed: {old_domain} → {new_domain}"),
-        "Site domain has been updated", "info", "site", None,
+        "Site domain has been updated", "info", "site", Some(&format!("/sites/{id}")),
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2631,12 +3407,11 @@ pub async fn rename_domain(
 pub async fn toggle_enabled(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2644,6 +3419,7 @@ pub async fn toggle_enabled(
     .await
     .map_err(|e| internal_error("toggle site", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     let enabled = body.get("enabled")
         .and_then(|v| v.as_bool())
@@ -2664,8 +3440,15 @@ pub async fn toggle_enabled(
         None,
     ).await.map_err(|e| agent_error("Toggle site", e))?;
 
-    // Update DB
-    sqlx::query("UPDATE sites SET enabled = $1, updated_at = NOW() WHERE id = $2")
+    // Update DB. A manual re-enable also clears bandwidth_suspended_at: without
+    // this, `traffic_accounting_scheduler` would see a lingering suspended_at
+    // and treat the site as still under active bandwidth suspension (never
+    // re-checking its quota), even though a human just turned it back on. A
+    // manual disable leaves the flag untouched — that path never sets it.
+    sqlx::query(
+        "UPDATE sites SET enabled = $1, bandwidth_suspended_at = CASE WHEN $1 THEN NULL ELSE bandwidth_suspended_at END, \
+         updated_at = NOW() WHERE id = $2",
+    )
         .bind(enabled)
         .bind(id)
         .execute(&state.db)
@@ -2678,11 +3461,12 @@ pub async fn toggle_enabled(
         &state.db, claims.sub, &claims.email,
         &format!("site.{action_label}"),
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     notifications::notify_panel(&state.db, Some(claims.sub),
         &format!("Site {action_label}: {}", site.domain),
-        &format!("Site has been {action_label}"), "info", "site", None,
+        &format!("Site has been {action_label}"), "info", "site", Some(&format!("/sites/{id}")),
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2695,12 +3479,11 @@ pub async fn toggle_enabled(
 pub async fn toggle_fastcgi_cache(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2708,6 +3491,7 @@ pub async fn toggle_fastcgi_cache(
     .await
     .map_err(|e| internal_error("toggle fastcgi cache", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if site.runtime != "php" {
         return Err(err(StatusCode::BAD_REQUEST, "FastCGI cache is only available for PHP sites"));
@@ -2748,11 +3532,12 @@ pub async fn toggle_fastcgi_cache(
         &state.db, claims.sub, &claims.email,
         &format!("site.fastcgi_cache.{action}"),
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     notifications::notify_panel(&state.db, Some(claims.sub),
         &format!("FastCGI cache {action}: {}", site.domain),
-        &format!("FastCGI cache has been {action}"), "info", "site", None,
+        &format!("FastCGI cache has been {action}"), "info", "site", Some(&format!("/sites/{id}")),
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2765,11 +3550,10 @@ pub async fn toggle_fastcgi_cache(
 pub async fn purge_fastcgi_cache(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2777,6 +3561,7 @@ pub async fn purge_fastcgi_cache(
     .await
     .map_err(|e| internal_error("purge fastcgi cache", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if !site.fastcgi_cache {
         return Err(err(StatusCode::BAD_REQUEST, "FastCGI cache is not enabled for this site"));
@@ -2792,6 +3577,7 @@ pub async fn purge_fastcgi_cache(
         &state.db, claims.sub, &claims.email,
         "site.fastcgi_cache.purge",
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2804,12 +3590,11 @@ pub async fn purge_fastcgi_cache(
 pub async fn toggle_redis_cache(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2817,6 +3602,7 @@ pub async fn toggle_redis_cache(
     .await
     .map_err(|e| internal_error("toggle redis cache", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if site.runtime != "php" {
         return Err(err(StatusCode::BAD_REQUEST, "Redis object cache is only available for PHP sites"));
@@ -2892,11 +3678,12 @@ pub async fn toggle_redis_cache(
         &state.db, claims.sub, &claims.email,
         &format!("site.redis_cache.{action}"),
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     notifications::notify_panel(&state.db, Some(claims.sub),
         &format!("Redis cache {action}: {}", site.domain),
-        &format!("Redis object cache has been {action} (DB {redis_db})"), "info", "site", None,
+        &format!("Redis object cache has been {action} (DB {redis_db})"), "info", "site", Some(&format!("/sites/{id}")),
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2910,11 +3697,10 @@ pub async fn toggle_redis_cache(
 pub async fn purge_redis_cache(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2922,6 +3708,7 @@ pub async fn purge_redis_cache(
     .await
     .map_err(|e| internal_error("purge redis cache", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if !site.redis_cache {
         return Err(err(StatusCode::BAD_REQUEST, "Redis cache is not enabled for this site"));
@@ -2937,6 +3724,7 @@ pub async fn purge_redis_cache(
         &state.db, claims.sub, &claims.email,
         "site.redis_cache.purge",
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2945,16 +3733,232 @@ pub async fn purge_redis_cache(
     })))
 }
 
+/// POST /api/sites/{id}/sftp/enable — Provision a per-site SFTP account.
+///
+/// The one explicit, operator-triggered step that re-owns an existing site's
+/// content directory (see `panel/agent/src/services/sftp_accounts.rs`) — no
+/// site is ever migrated without this being clicked. `sftp_uid`/`sftp_gid`
+/// come from `sftp_id_seq`, an atomic Postgres sequence rather than a
+/// `MAX(sftp_uid)+1` read (which races under concurrent enables).
+pub async fn enable_sftp(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if crate::services::security_hardening::is_locked_down(&state.db).await {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "System is in lockdown mode"));
+    }
+
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("enable sftp", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    if site.sftp_enabled {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "sftp_enabled": true,
+            "message": "SFTP is already enabled for this site",
+        })));
+    }
+
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+
+    let (allocated,): (i32,) = sqlx::query_as("SELECT nextval('sftp_id_seq')::int")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| internal_error("allocate sftp uid", e))?;
+    let (uid, gid) = (allocated, allocated);
+
+    agent.post(
+        &format!("/sftp/sites/{}/enable", site.domain),
+        Some(serde_json::json!({ "uid": uid, "gid": gid })),
+    ).await.map_err(|e| agent_error("SFTP enable", e))?;
+
+    sqlx::query("UPDATE sites SET sftp_enabled = true, sftp_uid = $1, sftp_gid = $2, updated_at = NOW() WHERE id = $3")
+        .bind(uid)
+        .bind(gid)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("enable sftp", e))?;
+
+    // Rebuild the vhost so the PHP-FPM pool picks up the new owner — mirrors
+    // the redis toggle's own "rebuild the FULL vhost" step, for the same
+    // reason (a hand-rolled partial body would drop WAF/CSP/bot-protection).
+    let mut updated_site = site.clone();
+    updated_site.sftp_enabled = true;
+    updated_site.sftp_uid = Some(uid);
+    updated_site.sftp_gid = Some(gid);
+    agent.put(
+        &format!("/nginx/sites/{}", site.domain),
+        build_nginx_body(&updated_site),
+    ).await.map_err(|e| agent_error("SFTP nginx/pool rebuild", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    tracing::info!("SFTP enabled for {} (uid={uid})", site.domain);
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "site.sftp.enabled",
+        Some("site"), Some(&site.domain), None, ip.as_deref(),
+        claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "site.sftp.enabled", Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&site.domain), None, None, "warning",
+        claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({ "ok": true, "sftp_enabled": true })))
+}
+
+/// POST /api/sites/{id}/sftp/disable — Tear down a site's SFTP account and
+/// revert its content directory back to the shared `www-data` identity.
+pub async fn disable_sftp(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("disable sftp", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    if !site.sftp_enabled {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "sftp_enabled": false,
+            "message": "SFTP is already disabled for this site",
+        })));
+    }
+    let (uid, gid) = (
+        site.sftp_uid.ok_or_else(|| internal_error("disable sftp", sqlx::Error::RowNotFound))?,
+        site.sftp_gid.ok_or_else(|| internal_error("disable sftp", sqlx::Error::RowNotFound))?,
+    );
+
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+
+    let last_sftp_site: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sites WHERE sftp_enabled = true AND id != $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or((1,)); // fail toward NOT removing the shared sshd drop-in
+
+    // Revert the PHP-FPM pool (and reload it) BEFORE tearing down the SFTP
+    // account — live-verified this ordering matters: `userdel` refuses to
+    // remove a uid with a running process, and the OLD pool's workers are
+    // still alive under the SFTP uid at this point. `php-fpm reload` starts
+    // fresh www-data-owned workers and gracefully stops the old ones, so by
+    // the time the agent's disable endpoint runs, nothing is running as the
+    // uid it is about to delete. The other order (userdel first) silently
+    // failed the account/group removal every time, with no error surfaced
+    // anywhere — `deprovision()`'s userdel/groupdel calls are themselves
+    // best-effort (matching every other cleanup step in that function), so
+    // the failure produced a clean "disabled" response over a half-torn-down
+    // box.
+    let mut updated_site = site.clone();
+    updated_site.sftp_enabled = false;
+    agent.put(
+        &format!("/nginx/sites/{}", site.domain),
+        build_nginx_body(&updated_site),
+    ).await.map_err(|e| agent_error("SFTP nginx/pool revert", e))?;
+
+    agent.post(
+        &format!("/sftp/sites/{}/disable", site.domain),
+        Some(serde_json::json!({ "uid": uid, "gid": gid, "last_sftp_site": last_sftp_site.0 == 0 })),
+    ).await.map_err(|e| agent_error("SFTP disable", e))?;
+
+    sqlx::query("UPDATE sites SET sftp_enabled = false, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("disable sftp", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    tracing::info!("SFTP disabled for {}", site.domain);
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "site.sftp.disabled",
+        Some("site"), Some(&site.domain), None, ip.as_deref(),
+        claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "site.sftp.disabled", Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&site.domain), None, None, "warning",
+        claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({ "ok": true, "sftp_enabled": false })))
+}
+
+/// POST /api/sites/{id}/sftp/reset-password — Generate a fresh SFTP password.
+///
+/// Always generates, never accepts an operator-supplied value — matching
+/// `databases.rs::reset_password`'s pattern. No column stores it: a Linux
+/// account's password can be set again with no prior knowledge, so once this
+/// response leaves the panel, the plaintext is gone from every system that
+/// isn't the operator's own clipboard.
+pub async fn reset_sftp_password(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("reset sftp password", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    if !site.sftp_enabled {
+        return Err(err(StatusCode::BAD_REQUEST, "SFTP is not enabled for this site"));
+    }
+    let uid = site.sftp_uid.ok_or_else(|| internal_error("reset sftp password", sqlx::Error::RowNotFound))?;
+
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+    let password = uuid::Uuid::new_v4().to_string();
+
+    agent.post(
+        &format!("/sftp/sites/{}/password", site.domain),
+        Some(serde_json::json!({ "uid": uid, "password": password })),
+    ).await.map_err(|e| agent_error("SFTP password reset", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    tracing::info!("SFTP password reset for {}", site.domain);
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "site.sftp.password_reset",
+        Some("site"), Some(&site.domain), None, ip.as_deref(),
+        claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "site.sftp.password_reset", Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&site.domain), None, None, "warning",
+        claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({ "ok": true, "password": password })))
+}
+
 /// PUT /api/sites/{id}/waf — Toggle WAF and set mode for a site.
 pub async fn toggle_waf(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -2962,6 +3966,7 @@ pub async fn toggle_waf(
     .await
     .map_err(|e| internal_error("toggle waf", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     let enabled = body.get("enabled").and_then(|v| v.as_bool())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "Missing 'enabled' boolean"))?;
@@ -3000,15 +4005,24 @@ pub async fn toggle_waf(
 
     let action = if enabled { format!("enabled ({mode})") } else { "disabled".to_string() };
     tracing::info!("WAF {action} for {}", site.domain);
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email,
         &format!("site.waf.{}", if enabled { "enabled" } else { "disabled" }),
-        Some("site"), Some(&site.domain), None, None,
+        Some("site"), Some(&site.domain), None, ip.as_deref(),
+        claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        &format!("site.waf.{}", if enabled { "enabled" } else { "disabled" }),
+        Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&site.domain), None, None, "warning",
+        claims.key_id,
     ).await;
 
     notifications::notify_panel(&state.db, Some(claims.sub),
         &format!("WAF {action}: {}", site.domain),
-        &format!("Web Application Firewall has been {action}"), "info", "site", None,
+        &format!("Web Application Firewall has been {action}"), "info", "site", Some(&format!("/sites/{id}")),
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -3022,11 +4036,10 @@ pub async fn toggle_waf(
 pub async fn waf_logs(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -3034,6 +4047,7 @@ pub async fn waf_logs(
     .await
     .map_err(|e| internal_error("waf logs", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     let result = agent
         .get(&format!("/nginx/sites/{}/waf/logs?limit=50", site.domain))
@@ -3047,12 +4061,11 @@ pub async fn waf_logs(
 pub async fn optimize_images(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -3060,6 +4073,7 @@ pub async fn optimize_images(
     .await
     .map_err(|e| internal_error("optimize images", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     let format = body.get("format").and_then(|v| v.as_str()).unwrap_or("webp");
     let quality = body.get("quality").and_then(|v| v.as_u64()).unwrap_or(80);
@@ -3071,7 +4085,14 @@ pub async fn optimize_images(
     let result = agent
         .post_long(
             &format!("/nginx/sites/{}/optimize-images", site.domain),
-            Some(serde_json::json!({ "format": format, "quality": quality })),
+            // The agent cannot know where this site's files are without the
+            // runtime: node/python/proxy serve from the site root, static and php
+            // from `public/`. Without it the scan hardcoded `public/`.
+            Some(serde_json::json!({
+                "format": format,
+                "quality": quality,
+                "runtime": site.runtime,
+            })),
             300,
         )
         .await
@@ -3081,6 +4102,7 @@ pub async fn optimize_images(
         &state.db, claims.sub, &claims.email,
         "site.optimize_images",
         Some("site"), Some(&site.domain), Some(format), None,
+        claims.key_id,
     ).await;
 
     Ok(Json(result))
@@ -3107,18 +4129,17 @@ fn is_safe_proxy_port(port: i32) -> bool {
 /// and this is the thin adapter for the two callers that pass a `&AppState`.
 async fn ensure_domain_available(
     state: &AppState,
-    agent: &crate::services::agent::AgentHandle,
     domain: &str,
-    server_id: Uuid,
     headers: &HeaderMap,
+    claimant_role: &str,
 ) -> Result<String, ApiError> {
     domain_claim::ensure_claimable(
         &state.db,
-        agent,
-        server_id,
+        &state.agents,
         domain,
         headers,
         domain_claim::Holder::New,
+        claimant_role,
     )
     .await
 }
@@ -3147,6 +4168,7 @@ pub(crate) fn build_nginx_body(site: &crate::models::Site) -> serde_json::Value 
         body["custom_nginx"] = serde_json::json!(custom);
     }
     if let Some(ref php) = site.php_version {
+        // Version carrier, not a literal path — see the comment on the create-site call site.
         body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
     }
     if site.ssl_enabled {
@@ -3161,6 +4183,19 @@ pub(crate) fn build_nginx_body(site: &crate::models::Site) -> serde_json::Value 
     if site.runtime == "proxy" || site.runtime == "node" || site.runtime == "python" {
         body["proxy_port"] = serde_json::json!(site.proxy_port);
     }
+    if site.sftp_enabled
+        && let (Some(uid), Some(gid)) = (site.sftp_uid, site.sftp_gid)
+    {
+        // Backend and agent are separate binaries — this naming convention is
+        // duplicated (not shared code) on the agent side in
+        // `services::sftp_accounts::{sftp_username, sftp_groupname}`, which is
+        // the one place that actually creates these Linux accounts. Keep the
+        // two definitions byte-for-byte identical; a drift here means the
+        // panel tells the wrong pool owner to a `write_php_pool_config` call
+        // that already succeeded under a different name.
+        body["pool_user"] = serde_json::json!(format!("sftp{uid}"));
+        body["pool_group"] = serde_json::json!(format!("sftpg{gid}"));
+    }
     body
 }
 
@@ -3168,12 +4203,11 @@ pub(crate) fn build_nginx_body(site: &crate::models::Site) -> serde_json::Value 
 pub async fn update_security_headers(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -3181,6 +4215,7 @@ pub async fn update_security_headers(
     .await
     .map_err(|e| internal_error("security headers", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     let csp = body.get("csp_policy").and_then(|v| v.as_str()).map(|s| s.to_string());
     let perms = body.get("permissions_policy").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -3231,6 +4266,7 @@ pub async fn update_security_headers(
         &state.db, claims.sub, &claims.email,
         "site.security_headers",
         Some("site"), Some(&site.domain), None, None,
+        claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -3244,12 +4280,12 @@ pub async fn update_security_headers(
 pub async fn toggle_bot_protection(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let site: crate::models::Site = sqlx::query_as(
-        "SELECT * FROM sites WHERE id = $1 AND user_id = $2",
+        SITE_FOR_CALLER_ALL.as_str(),
     )
     .bind(id)
     .bind(claims.sub)
@@ -3257,6 +4293,7 @@ pub async fn toggle_bot_protection(
     .await
     .map_err(|e| internal_error("bot protection", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("off");
     if !["off", "rate-limit", "challenge", "block"].contains(&mode) {
@@ -3281,15 +4318,207 @@ pub async fn toggle_bot_protection(
         agent_body,
     ).await.map_err(|e| agent_error("Bot protection nginx config", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email,
         &format!("site.bot_protection.{mode}"),
-        Some("site"), Some(&site.domain), None, None,
+        Some("site"), Some(&site.domain), None, ip.as_deref(),
+        claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        &format!("site.bot_protection.{mode}"),
+        Some(&claims.email), ip.as_deref(),
+        Some("site"), Some(&site.domain), None, None, "warning",
+        claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "bot_protection": mode,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct TransferSiteRequest {
+    /// The new owner, by email. Email rather than id because the operator doing
+    /// this is reading a list of people, not a list of UUIDs.
+    pub email: String,
+}
+
+/// The tables that keep their own copy of `user_id` beside a `site_id`.
+///
+/// Derived, not remembered: these are every table in the schema carrying BOTH
+/// columns. Everything else a site owns — `databases`, `crons`, `backups`,
+/// `ssl_certificates` — reaches its owner THROUGH `site_id`, so it follows the
+/// transfer with no statement of its own. Getting this list wrong is the failure
+/// mode that matters: a row left behind keeps the previous owner able to see and
+/// act on part of a site they no longer hold, and nothing would report it.
+const OWNERSHIP_DENORMALIZED_TABLES: [&str; 4] =
+    ["alerts", "monitors", "secret_vaults", "whmcs_service_map"];
+
+/// POST /api/sites/{id}/transfer — hand a site to another account. Admin only.
+///
+/// The point of the whole `client` design (GitHub #51). DockPanel has exactly one
+/// ownership axis, `sites.user_id`, and 108 ownership-scoped reads that all say
+/// `WHERE user_id = $1`. Moving the row therefore moves the site completely, and
+/// every one of those reads keeps working without being touched — which is why
+/// this is a transfer rather than an access-control list. An ACL would have had
+/// to widen all 108, keep 57 `claims.sub` INSERTs in step, and get two name-keyed
+/// cleanups right whose own comments record that they already shipped a
+/// cross-account delete once.
+///
+/// ⚠ Transfer is EXCLUSIVE: the previous owner loses the site, **including when
+/// the previous owner is an admin**. This comment used to claim the role itself
+/// kept an administrator's view of a transferred site, and that was never true:
+/// `list` and every per-site read in this file are `WHERE user_id = $1` with no
+/// role branch, so a transferring admin lost the row from their list and got 404
+/// from `get_one`. Because the Transfer control was rendered only on the site's
+/// own page, the handover had no way back through the panel at all.
+/// `list_for_admin` is that way back; this handler needed no change, because its
+/// own lookup below is by id and is deliberately not ownership-filtered.
+///
+/// One transaction, because a half-transferred site is worse than a failed one:
+/// the row would answer to the new owner while its alerts and secret vaults still
+/// answered to the old one.
+pub async fn transfer(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<TransferSiteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if claims.role != "admin" {
+        return Err(err(StatusCode::FORBIDDEN, "Admin only"));
+    }
+
+    let site: Option<(Uuid, String, Uuid)> =
+        sqlx::query_as("SELECT id, domain, user_id FROM sites WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("load site", e))?;
+    let (site_id, domain, previous_owner) =
+        site.ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    let email = body.email.trim().to_ascii_lowercase();
+    let recipient: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id, role FROM users WHERE lower(email) = $1")
+            .bind(&email)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("load recipient", e))?;
+    let (new_owner, new_owner_role) =
+        recipient.ok_or_else(|| err(StatusCode::NOT_FOUND, "No account with that email"))?;
+
+    if new_owner == previous_owner {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "That account already owns this site",
+        ));
+    }
+    // A suspended account must not be handed a live site: `auth.rs` rejects its
+    // every request, so the site would land somewhere nobody can reach.
+    if new_owner_role == "suspended" {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "That account is suspended. Restore it before transferring a site to it.",
+        ));
+    }
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| internal_error("begin transfer", e))?;
+
+    // ⚠ A STAGING ENVIRONMENT IS A SECOND `sites` ROW, AND IT USED TO STAY BEHIND.
+    //
+    // `staging::create` inserts one (`routes/staging.rs:168`) carrying
+    // `parent_site_id` (20260312700000_staging_sites.sql:2) and the CREATOR's
+    // `user_id`. This statement was `WHERE id = $2`, so the clone did not move with
+    // its parent — and the previous owner kept, on a site they no longer hold: the
+    // staging domain in their Sites list, a `www-data` shell inside a full copy of
+    // the new owner's document root (`wp-config.php` and its database credentials
+    // included), and the push-to-production control, which writes that copy OVER
+    // the new owner's live site. A departed owner with a WRITE into the new owner's
+    // production is the worst version of the failure this handler's own comment
+    // names: "a row left behind keeps the previous owner able to see and act on
+    // part of a site they no longer hold, and nothing would report it."
+    //
+    // Staging cannot nest — `staging::create` refuses a parent that is itself
+    // staging (`staging.rs:106`) — so one `OR parent_site_id` is the whole tree,
+    // not the first level of one.
+    let moved_ids: Vec<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+        "UPDATE sites SET user_id = $1 WHERE id = $2 OR parent_site_id = $2 RETURNING id",
+    )
+    .bind(new_owner)
+    .bind(site_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| internal_error("transfer site", e))?
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+
+    let mut moved = serde_json::Map::new();
+    for table in OWNERSHIP_DENORMALIZED_TABLES {
+        // The table name comes from a const array in this file and never from a
+        // request, so the format! cannot carry anything an caller supplied.
+        //
+        // Keyed on the ids the UPDATE above actually moved, not on `site_id = $2`:
+        // the staging row's alerts, monitors and vaults belong to the staging site,
+        // and scoping this to the parent alone would move the parent's dependents
+        // while leaving the child's with the departed owner — the same split this
+        // fix exists to close, one level down.
+        let n = sqlx::query(&format!(
+            "UPDATE {table} SET user_id = $1 WHERE site_id = ANY($2)"
+        ))
+        .bind(new_owner)
+        .bind(&moved_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal_error("transfer dependent rows", e))?
+        .rows_affected();
+        moved.insert(table.to_string(), serde_json::json!(n));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| internal_error("commit transfer", e))?;
+
+    crate::services::activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.transfer",
+        Some("site"),
+        Some(&domain),
+        Some(&format!("{previous_owner} -> {new_owner} ({email})")),
+        crate::routes::client_ip(&headers).as_deref(),
+        claims.key_id,
+    )
+    .await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "site.transfer",
+        Some(&claims.email),
+        crate::routes::client_ip(&headers).as_deref(),
+        Some("site"),
+        Some(&domain),
+        Some(&format!("{previous_owner} -> {new_owner} ({email})")),
+        None,
+        "critical",
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "domain": domain,
+        "previous_owner": previous_owner,
+        "new_owner": new_owner,
+        "dependent_rows_moved": moved,
     })))
 }
 

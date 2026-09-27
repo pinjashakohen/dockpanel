@@ -41,17 +41,57 @@ pub struct Server {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// GET /api/servers — List current user's servers.
+/// GET /api/servers — the machines this caller may see.
+///
+/// **An administrator sees every machine; anybody else sees the ones they hold.**
+/// This used to be `WHERE user_id = $1` for everyone, and `servers.user_id` names
+/// whoever happened to register the row — the FIRST admin by `created_at` for the
+/// local one (`services::agent`), and the registering admin for a fleet member. So
+/// a panel's SECOND administrator opened Servers to "No servers found. The local
+/// server should appear automatically." — which reads as a broken install, on a box
+/// whose sites that same account can fully administer. It could not appear: nothing
+/// re-points `user_id`, and the only INSERT is this module's own.
+///
+/// Widening this is safe in the one direction that matters: `agent_token` carries
+/// `#[serde(skip_serializing)]` above, so the row this returns has never contained
+/// the credential that is root on the agent. A non-admin is unchanged and still
+/// sees only rows it owns — which for a `client` is none, because no non-admin can
+/// own one.
+///
+/// ⚠ SCOPE LIMIT (CLOSED s432), stated here rather than discovered later: this
+/// fixes the LIST. It named seven sibling reads that still resolved a machine
+/// through `servers.user_id` and so still under-reported for a second admin —
+/// `routes/drift.rs`'s `servers()` and `report()`, `services/drift.rs`'s five
+/// report fetchers (one logical site), and four `routes/dashboard.rs`
+/// aggregations (`fleet_overview`, `metrics_history`, `gpu_metrics_history`,
+/// `timeline`). `routes/billing.rs:63` was never one of them: counting the
+/// servers a given account holds is what billing means. `fleet_overview` was
+/// closed first, at s430 (`AdminUser`-only, so the filter was dropped
+/// outright — see its own comment). The remaining six were closed at s432 by
+/// the same rule, applied per caller shape: the `AdminUser`-only routes
+/// (`drift.rs`, `services/drift.rs`) drop the filter exactly as this route
+/// does below; the routes that also serve non-admins (`metrics_history`,
+/// `gpu_metrics_history`, `timeline`) widen conditionally with a bound
+/// `$N::uuid IS NULL OR` predicate, mirroring `dashboard::intelligence`'s own
+/// established idiom for the same distinction. No shared predicate was
+/// introduced for servers (unlike `helpers::SITE_CALLER_PREDICATE` for
+/// sites): the two shapes above are what the codebase's own prior fixes
+/// (`intelligence`, `fleet_overview`) had already established, and a new
+/// abstraction used by none of the existing call sites would be inconsistent
+/// with both rather than an improvement on either.
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Vec<Server>>, ApiError> {
-    let servers: Vec<Server> =
-        sqlx::query_as("SELECT * FROM servers WHERE user_id = $1 ORDER BY is_local DESC, created_at DESC LIMIT 500")
-            .bind(claims.sub)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| internal_error("list servers", e))?;
+    let servers: Vec<Server> = sqlx::query_as(
+        "SELECT * FROM servers WHERE ($2 OR user_id = $1) \
+         ORDER BY is_local DESC, created_at DESC LIMIT 500",
+    )
+    .bind(claims.sub)
+    .bind(claims.role == "admin")
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("list servers", e))?;
 
     Ok(Json(servers))
 }
@@ -60,6 +100,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let name = body.name.trim();
@@ -84,6 +125,19 @@ pub async fn create(
 
     let agent_token_hash = crate::helpers::hash_agent_token(&agent_token);
 
+    // The plaintext column is kept because the panel DIALS remote agents with
+    // it (the hash only authenticates them inbound), so it is an outbound
+    // credential like any other and belongs under the at-rest promise. It is
+    // decrypted at the single site that consumes it,
+    // `services::agent::AgentPool::for_server`. `auto_healer` names the
+    // exposure this closes: a panel DB dump carried it in cleartext.
+    // The response below still returns the PLAINTEXT local variable — the
+    // operator needs it for the install one-liner, and that is the only time
+    // it is ever shown.
+    let agent_token_enc =
+        crate::services::secrets_crypto::encrypt_credential(&agent_token, &state.config.jwt_secret)
+            .map_err(|e| internal_error("encrypt agent token", e))?;
+
     let server: Server = sqlx::query_as(
         "INSERT INTO servers (user_id, name, ip_address, agent_token, agent_token_hash, agent_url, status, is_local) \
          VALUES ($1, $2, $3, $4, $5, $6, 'pending', false) RETURNING *",
@@ -91,7 +145,7 @@ pub async fn create(
     .bind(claims.sub)
     .bind(name)
     .bind(if ip.is_empty() { None } else { Some(&ip) })
-    .bind(&agent_token)
+    .bind(&agent_token_enc)
     .bind(&agent_token_hash)
     .bind(if agent_url.is_empty() { None } else { Some(&agent_url) })
     .fetch_one(&state.db)
@@ -129,6 +183,8 @@ pub async fn create(
         ),
     };
 
+    let caller_ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -137,7 +193,22 @@ pub async fn create(
         Some("server"),
         Some(name),
         None,
+        caller_ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "server.create",
+        Some(&claims.email),
+        caller_ip.as_deref(),
+        Some("server"),
+        Some(name),
         None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
 
@@ -175,6 +246,7 @@ pub async fn get_one(
 pub async fn remove(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let server: Server =
@@ -200,6 +272,8 @@ pub async fn remove(
     // Invalidate remote agent cache
     state.agents.invalidate(id).await;
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -208,7 +282,22 @@ pub async fn remove(
         Some("server"),
         Some(&server.name),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "server.delete",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("server"),
+        Some(&server.name),
         None,
+        None,
+        "critical",
+        claims.key_id,
     )
     .await;
 
@@ -222,6 +311,7 @@ pub async fn remove(
 pub async fn rotate_cert_pin(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let server: Server =
@@ -243,6 +333,8 @@ pub async fn rotate_cert_pin(
     // the next time a route needs the agent handle.
     state.agents.invalidate(id).await;
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -251,7 +343,22 @@ pub async fn rotate_cert_pin(
         Some("server"),
         Some(&server.name),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "server.rotate_cert_pin",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("server"),
+        Some(&server.name),
         None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
 
@@ -323,6 +430,7 @@ pub async fn test_connection(
 pub async fn update(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<Server>, ApiError> {
@@ -362,6 +470,8 @@ pub async fn update(
     // Invalidate remote agent cache so it picks up new URL/token
     state.agents.invalidate(id).await;
 
+    let caller_ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -370,7 +480,22 @@ pub async fn update(
         Some("server"),
         Some(name),
         None,
+        caller_ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "server.update",
+        Some(&claims.email),
+        caller_ip.as_deref(),
+        Some("server"),
+        Some(name),
         None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
 
@@ -382,6 +507,7 @@ pub async fn update(
 pub async fn rotate_token(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify server belongs to this admin
@@ -411,12 +537,18 @@ pub async fn rotate_token(
         .and_then(|v| v.as_str())
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "Agent did not return new token"))?;
 
-    // Update database with new hash (and plaintext for remote agent communication)
+    // Update database with the new hash, and the new dial-out token encrypted
+    // at rest (see `create_server`; `AgentPool::for_server` decrypts).
     let new_hash = crate::helpers::hash_agent_token(new_token);
+    let new_token_enc = crate::services::secrets_crypto::encrypt_credential(
+        new_token,
+        &state.config.jwt_secret,
+    )
+    .map_err(|e| internal_error("encrypt rotated agent token", e))?;
     sqlx::query(
         "UPDATE servers SET agent_token = $1, agent_token_hash = $2 WHERE id = $3",
     )
-    .bind(new_token)
+    .bind(&new_token_enc)
     .bind(&new_hash)
     .bind(id)
     .execute(&state.db)
@@ -455,6 +587,8 @@ pub async fn rotate_token(
         }
     }
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -463,7 +597,22 @@ pub async fn rotate_token(
         Some("server"),
         None,
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "server.rotate_token",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("server"),
         None,
+        None,
+        None,
+        "critical",
+        claims.key_id,
     )
     .await;
 

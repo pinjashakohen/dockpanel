@@ -89,13 +89,13 @@ INSTALL_TMP=$(mktemp)
 # the check itself. Comparing bytes means handling bytes.
 if "${CURL[@]}" -o "$INSTALL_TMP" "$INSTALL_URL" 2>/dev/null; then
   ok "$INSTALL_URL answers"
-  if head -1 "$INSTALL_TMP" | grep -q '^#!'; then
+  if head -1 "$INSTALL_TMP" | grep -c '^#!' >/dev/null; then
     ok "it begins with a shebang"
   else
     bad "$INSTALL_URL returned 200 but the body does not start with a shebang — the SPA fallback is answering, and the advertised one-liner pipes a web page into bash"
     note "first line: $(head -1 "$INSTALL_TMP" | cut -c1-80)"
   fi
-  if head -c 2000 "$INSTALL_TMP" | grep -qiE '<!doctype html|<html'; then
+  if head -c 2000 "$INSTALL_TMP" | grep -ciE '<!doctype html|<html' >/dev/null; then
     bad "$INSTALL_URL is serving HTML"
   else
     ok "it is not HTML"
@@ -160,14 +160,14 @@ else
   if "${CURL[@]}" -o "$PANEL_TMP" "$PANEL/install-agent.sh" 2>/dev/null; then
     ok "the panel's /install-agent.sh answers"
 
-    if head -1 "$PANEL_TMP" | grep -q '^#!'; then
+    if head -1 "$PANEL_TMP" | grep -c '^#!' >/dev/null; then
       ok "it begins with a shebang"
     else
       bad "the panel's /install-agent.sh returned 200 but does not start with a shebang — the SPA fallback is answering, and the Add-Server command pipes a web page into sudo bash"
       note "first line: $(head -1 "$PANEL_TMP" | cut -c1-80)"
     fi
 
-    if head -c 2000 "$PANEL_TMP" | grep -qiE '<!doctype html|<html'; then
+    if head -c 2000 "$PANEL_TMP" | grep -ciE '<!doctype html|<html' >/dev/null; then
       bad "the panel's /install-agent.sh is serving HTML — this is issue #56's shape and s274 reproduced it"
     else
       ok "it is not HTML"
@@ -289,31 +289,39 @@ else
 fi
 
 echo
-echo "── 4. Class B — the react-router waiver's own re-check condition ──"
+echo "── 4. Class B — we are still on the version that fixed GHSA-qwww-vcr4-c8h2 ──"
 
-# scripts/npm-audit-gate.mjs waives GHSA-qwww-vcr4-c8h2 with a written reason:
-# the advisory needs RSC mode with server actions, both frontends import only
-# BrowserRouter and ship as static assets, and npm's only offered "fix" is a
-# DOWNGRADE out of the 7.x line. The waiver ends with "re-check when react-router
-# ships a fix inside ^7" — and for five ships nothing checked that, which is
-# textbook class B: the waiver was correct when written and no commit here will
-# ever tell us it stopped being.
+# This section used to ask upstream "has a fix landed inside ^7 yet?", because
+# scripts/npm-audit-gate.mjs waived the advisory on the stated grounds that no
+# in-range fix existed. On 2026-08-07 it fired: 7.18.2 carries the fix, both
+# frontends were bumped, and the waiver was retired.
+#
+# ⚠ The section is REPOINTED, not deleted. A check written to police a waiver
+# outlives the waiver, and if it is simply removed the day the waiver goes, the
+# surface it watched goes dark exactly when it starts mattering — we are now
+# relying on a VERSION rather than on an argument, and a version can be
+# downgraded by a lockfile churn nobody reads. So it now asks the question that
+# is live today: is what we ship still at or above the fix?
 ADVISORY=GHSA-qwww-vcr4-c8h2
 if adv=$("${GH_API[@]}" "https://api.github.com/advisories/$ADVISORY" 2>/dev/null); then
   patched=$(grep -o '"first_patched_version":[^,}]*' <<<"$adv" | head -1 | grep -oE '"[0-9][^"]*"' | tr -d '"')
   if [ -z "$patched" ]; then
-    ok "$ADVISORY still has no patched version — the waiver's condition has not been met"
-  elif [[ "$patched" == 7.* ]]; then
-    bad "$ADVISORY now has a fix inside ^7 ($patched) — the waiver in scripts/npm-audit-gate.mjs said to re-check when this happened. Bump and drop the waiver."
+    bad "$ADVISORY reports no patched version, but we retired its waiver on the grounds that 7.18.2 fixed it — re-read the advisory"
   else
-    ok "$ADVISORY's first patched version is $patched, outside ^7 — the waiver still stands"
-    note "the waiver is conditioned on a fix INSIDE ^7; a major-version fix is a migration, not a bump"
+    ok "$ADVISORY's first patched version is $patched"
+    for lock in panel/frontend/package-lock.json website/client/package-lock.json; do
+      have=$(node -e "try{process.stdout.write(require('./$lock').packages['node_modules/react-router'].version)}catch(e){}" 2>/dev/null)
+      if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$have" "$patched" | sort -V | head -1)" = "$patched" ]; then
+        ok "$lock locks react-router $have (>= $patched)"
+      else
+        bad "$lock locks react-router ${have:-nothing}, below the fix $patched — and the waiver that used to cover this is gone"
+      fi
+    done
   fi
 else
-  bad "could not reach the GitHub advisory API for $ADVISORY — the waiver went unchecked this run"
+  bad "could not reach the GitHub advisory API for $ADVISORY — the version floor went unchecked this run"
 fi
 
-echo
 echo "── 5. Class B — the published release still matches the register ──"
 
 # Binary sizes are the one register row that is neither derivable from source
@@ -371,6 +379,77 @@ elif rel=$("${GH_API[@]}" "https://api.github.com/repos/$REPO/releases/latest" 2
   check_asset "CLI binary"   dockpanel-cli-linux-amd64
 else
   bad "could not read the latest release of $REPO"
+fi
+
+echo
+echo "── 5b. Class B — the newest TAG actually has a published RELEASE ──"
+
+# s310. v2.66.0 was tagged and pushed, and every signal a lazy check reads said
+# shipped: main and the tag were both on origin, verified separately, and all
+# four build jobs went green. There was no release object for eighteen minutes,
+# and nothing here would ever have said so — arm 5 above reads /releases/LATEST,
+# which answers with whatever published most recently. A tag that never publishes
+# does not make that arm fail. It makes it quietly describe the PREVIOUS release,
+# whose assets are entirely valid, and report a green ✓.
+#
+# That gap is not a reporting detail, because /releases/latest IS the install
+# path: scripts/setup.sh:890, scripts/install-agent.sh:202 and scripts/update.sh
+# :189 all resolve it, as do the panel's own update banner
+# (services/telemetry_collector.rs:20) and the marketing site's /security page.
+# So a publish that fails after the builds go green serves the PREVIOUS binaries
+# to every new install and every `update.sh` run, while README, FEATURES.md and
+# the docs all claim the new version — and `update.sh` redeploying the old tag
+# looks exactly like a successful deploy.
+#
+# This has happened. At s232 the v2.11.8 tag was on the remote with every build
+# job green, and the release step died at `Install cosign` on a sigstore network
+# error, so no release object existed at all and the smoke-test job that
+# `needs: release` was SKIPPED. Every lazy signal said shipped.
+#
+# ⚠ The grace window is the whole design problem, and getting it wrong makes this
+# arm worse than useless. This workflow also runs on any push touching
+# FEATURES.md — and EVERY release touches FEATURES.md, because the register
+# carries the assertion counts. So this arm fires roughly ninety seconds into an
+# eighteen-minute build, at a moment when the newest tag legitimately has no
+# release yet. An arm that goes red on every correct release trains the reader to
+# ignore a red run on ship day, which is the one day it matters. A tag is
+# therefore only a failure once it is old enough that the build must have
+# finished. v2.65.0 took 17m40s and v2.66.0 18m16s; 45 minutes is ~2.5x.
+TAG_GRACE_MIN=${TAG_GRACE_MIN:-45}
+
+if ! command -v jq >/dev/null 2>&1; then
+  bad "jq is not installed — the newest-tag check cannot parse the API response"
+elif tags=$("${GH_API[@]}" "https://api.github.com/repos/$REPO/tags?per_page=100" 2>/dev/null); then
+  # The tags endpoint does not promise an order, so sort rather than trusting it.
+  newest=$(jq -r '.[].name // empty' <<<"$tags" 2>/dev/null \
+           | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+  if [ -z "$newest" ]; then
+    bad "no vX.Y.Z tag could be read for $REPO — the newest-tag check lost its subject"
+  elif [ -z "${tag:-}" ]; then
+    # Arm 5 owns $tag. If it could not name the latest release, this arm has
+    # nothing to compare against and must say so rather than invent a verdict.
+    bad "arm 5 could not name the latest published release, so the newest tag went unchecked"
+  elif [ "$newest" = "$tag" ]; then
+    ok "the newest tag $newest is the latest published release"
+  else
+    # The exception path — and the only branch that spends extra API calls.
+    tagsha=$(jq -r --arg t "$newest" '.[] | select(.name == $t) | .commit.sha // empty' <<<"$tags" | head -1)
+    tagged_at=$("${GH_API[@]}" "https://api.github.com/repos/$REPO/commits/$tagsha" 2>/dev/null \
+                | jq -r '.commit.committer.date // empty')
+    if [ -z "$tagged_at" ]; then
+      bad "$newest has no published release and its age could not be read — treat it as an unpublished release, not as unknown"
+    else
+      age_min=$(( ( $(date -u +%s) - $(date -u -d "$tagged_at" +%s) ) / 60 ))
+      if [ "$age_min" -lt "$TAG_GRACE_MIN" ]; then
+        ok "$newest has no release yet, but it is only ${age_min}m old — inside the ${TAG_GRACE_MIN}m build window"
+        note "if this is still true on the next run the publish FAILED; /releases/latest still answers $tag"
+      else
+        bad "$newest was tagged ${age_min}m ago and has NO published release — /releases/latest still answers $tag, so every new install, every update.sh and the panel's update banner are being served $tag while the docs claim $newest"
+      fi
+    fi
+  fi
+else
+  bad "could not read the tag list for $REPO — the newest-tag check did not run"
 fi
 
 echo

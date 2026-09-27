@@ -56,21 +56,57 @@ async fn wp_with_plugins(domain: &str, args: &[&str]) -> Result<String, String> 
 }
 
 async fn wp_inner(domain: &str, args: &[&str], skip_plugins: bool) -> Result<String, String> {
-    ensure_cli().await?;
     let path = site_path(domain)?;
+    wp_at_root(&path, args, skip_plugins).await
+}
+
+/// Run a wp-cli command against an EXPLICIT filesystem root.
+///
+/// `wp_inner` derives the root from the domain and always lands on `public/`;
+/// the vulnerability scanner resolves its own root because a WordPress install
+/// is not always under `public/`. It therefore needs this same invocation with
+/// a different path — and hand-rolling a second one is exactly what went wrong:
+/// that copy shelled out to `php` against a phar under the agent's private
+/// tmp — a file nothing in this tree ever writes, and which `PrivateTmp=yes`
+/// puts out of reach of anyone who might place one there — and it
+/// omitted `--allow-root`, which the agent needs because it runs as root and
+/// wp-cli refuses outright without it. Both arms failed, and the scan reported
+/// a clean site.
+///
+/// So: every wp-cli invocation in this crate goes through here. One place
+/// decides the binary, `ensure_cli`, `--allow-root` and the skip policy.
+pub(crate) async fn wp_at_root(
+    root: &str,
+    args: &[&str],
+    skip_plugins: bool,
+) -> Result<String, String> {
+    ensure_cli().await?;
     let mut cmd = safe_command(WP_CLI);
     cmd.args(args)
         .arg("--allow-root")
-        .arg(format!("--path={path}"));
+        .arg(format!("--path={root}"));
     if skip_plugins {
         cmd.arg("--skip-plugins").arg("--skip-themes");
     }
-    let out = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("wp-cli error: {e}"))?;
+    // This is the crate's single wp-cli choke point (see the doc comment above),
+    // so it ran every plugin install, core update and db import unbounded — no
+    // timeout at all, and no kill_on_drop either. A hang here (a stalled
+    // download, a locked wp_options table) blocked the request forever, and even
+    // an upstream cancellation (the connection closing, a future request-level
+    // timeout) would have left the wp-cli child running orphaned rather than
+    // stopped — the exact "timeout doesn't actually stop the thing" class fixed
+    // elsewhere in the agent crate, just never reaching wordpress.rs's own only
+    // subprocess entry point.
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "wp-cli timed out".to_string())?
+    .map_err(|e| format!("wp-cli error: {e}"))?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -234,24 +270,39 @@ pub async fn install(
     wp(domain, &["core", "download", "--force"]).await?;
 
     // Create wp-config.php (--skip-plugins --skip-themes for safety)
-    let out = safe_command(WP_CLI)
-        .args([
-            "config",
-            "create",
-            &format!("--dbname={db_name}"),
-            &format!("--dbuser={db_user}"),
-            &format!("--dbpass={db_pass}"),
-            &format!("--dbhost={db_host}"),
-            "--skip-plugins",
-            "--skip-themes",
-            "--allow-root",
-            &format!("--path={path}"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("wp config create: {e}"))?;
+    //
+    // These two calls predate `wp_at_root` — the file's own doc comment on that
+    // function is what a hand-rolled second implementation already cost once —
+    // and never got folded into it, so they kept its exact pre-fix shape: no
+    // timeout, no kill_on_drop. Same fix, applied directly here rather than
+    // rerouting through wp_at_root (whose signature assumes --skip-plugins
+    // covers both plugins and themes together, which happens to match here, but
+    // these two calls carry additional db-credential args wp_at_root's plain
+    // `args: &[&str]` already accepts fine — kept separate only to avoid
+    // widening this session's diff into a call-site migration).
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        safe_command(WP_CLI)
+            .args([
+                "config",
+                "create",
+                &format!("--dbname={db_name}"),
+                &format!("--dbuser={db_user}"),
+                &format!("--dbpass={db_pass}"),
+                &format!("--dbhost={db_host}"),
+                "--skip-plugins",
+                "--skip-themes",
+                "--allow-root",
+                &format!("--path={path}"),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "wp config create timed out".to_string())?
+    .map_err(|e| format!("wp config create: {e}"))?;
 
     if !out.status.success() {
         return Err(format!(
@@ -261,25 +312,30 @@ pub async fn install(
     }
 
     // Install WordPress (--skip-plugins --skip-themes for safety)
-    let out = safe_command(WP_CLI)
-        .args([
-            "core",
-            "install",
-            &format!("--url={url}"),
-            &format!("--title={title}"),
-            &format!("--admin_user={admin_user}"),
-            &format!("--admin_password={admin_pass}"),
-            &format!("--admin_email={admin_email}"),
-            "--skip-plugins",
-            "--skip-themes",
-            "--allow-root",
-            &format!("--path={path}"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("wp core install: {e}"))?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        safe_command(WP_CLI)
+            .args([
+                "core",
+                "install",
+                &format!("--url={url}"),
+                &format!("--title={title}"),
+                &format!("--admin_user={admin_user}"),
+                &format!("--admin_password={admin_pass}"),
+                &format!("--admin_email={admin_email}"),
+                "--skip-plugins",
+                "--skip-themes",
+                "--allow-root",
+                &format!("--path={path}"),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "wp core install timed out".to_string())?
+    .map_err(|e| format!("wp core install: {e}"))?;
 
     if !out.status.success() {
         return Err(format!(
@@ -291,6 +347,20 @@ pub async fn install(
     // Fix ownership
     safe_command("chown")
         .args(["-R", "www-data:www-data", &path])
+        .output()
+        .await
+        .ok();
+
+    // wp-cli's `config create` leaves wp-config.php at the process umask's default
+    // (644 here) — tighten to 640, same fix wp_vulnerability.rs's "wp-config-perms"
+    // hardening check already applies, but on a POST-INSTALL opt-in pass only.
+    // This blocks reads from any OTHER local account on the box; it does not (and
+    // via chmod alone cannot) isolate this site from another tenant's own PHP-FPM
+    // pool or client-role shell, since every site currently shares the identical
+    // www-data:www-data identity — that is the separate, already-tracked
+    // per-site-OS-user architecture question (#85), unchanged by this fix.
+    safe_command("chmod")
+        .args(["640", &format!("{path}/wp-config.php")])
         .output()
         .await
         .ok();
@@ -398,15 +468,17 @@ pub async fn set_auto_update(domain: &str, enabled: bool) -> Result<(), String> 
          {marker}"
     );
 
-    // Get current crontab
-    let current = safe_command("crontab")
-        .args(["-l", "-u", "root"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+    // Get current crontab, FAIL-CLOSED.
+    //
+    // This used to be `.output().await.map(|o| …stdout…).unwrap_or_default()`,
+    // which collapsed two different things into the same empty string: a spawn
+    // failure (swallowed by `unwrap_or_default`) and a non-zero exit (the `map`
+    // never looked at `o.status`). Either one produced `""`, and the twenty lines
+    // below then hand `""` straight back to `crontab -` as root's COMPLETE new
+    // content — so a transient failure here rewrote root's entire crontab, every
+    // tenant's jobs and every system entry, down to at most this one WordPress
+    // line. Reached from an ordinary authenticated request naming ONE site.
+    let current = crate::services::crontab::read_crontab().await?;
 
     // Remove existing auto-update line for this domain — and ONLY this domain.
     let filtered: Vec<&str> = current
@@ -424,35 +496,7 @@ pub async fn set_auto_update(domain: &str, enabled: bool) -> Result<(), String> 
         new_crontab.push('\n');
     }
 
-    // Write crontab via stdin pipe
-    let mut child = safe_command("crontab")
-        .args(["-u", "root", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("crontab spawn: {e}"))?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(new_crontab.as_bytes())
-            .await
-            .map_err(|e| format!("crontab write: {e}"))?;
-    }
-
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("crontab wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "crontab failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-
-    Ok(())
+    crate::services::crontab::write_crontab(&new_crontab).await
 }
 
 /// Check if auto-update cron is enabled for a domain.
@@ -489,6 +533,7 @@ pub async fn create_update_snapshot(domain: &str) -> Result<String, String> {
         std::time::Duration::from_secs(120),
         safe_command("tar")
             .args(["czf", &snapshot_path, "-C", "/var/www", &format!("{domain}/public")])
+            .kill_on_drop(true)
             .output()
     ).await
         .map_err(|_| "Snapshot tar timed out".to_string())?
@@ -537,6 +582,7 @@ pub async fn rollback_from_snapshot(domain: &str, snapshot_path: &str) -> Result
         std::time::Duration::from_secs(120),
         safe_command("tar")
             .args(["xzf", snapshot_path, "-C", "/var/www"])
+            .kill_on_drop(true)
             .output()
     ).await
         .map_err(|_| "Rollback timed out".to_string())?
@@ -571,6 +617,7 @@ pub async fn health_check(domain: &str) -> bool {
             .args(["-u", "www-data", WP_CLI, "eval", "echo 'OK';",
                    "--skip-plugins", "--skip-themes", "--allow-root",
                    &format!("--path={}", site_path(domain).unwrap_or_default())])
+            .kill_on_drop(true)
             .output()
     ).await;
 
@@ -585,6 +632,14 @@ pub async fn health_check(domain: &str) -> bool {
 
 /// Update WordPress with snapshot + rollback on failure.
 pub async fn update_with_rollback(domain: &str) -> Result<serde_json::Value, String> {
+    // Held for the whole snapshot→update→rollback sequence: the snapshot at
+    // step 2 is a point-in-time copy of the docroot, and a rollback at step 6
+    // restores it unconditionally. Anything else that writes into this
+    // site's files while that window is open (hardening, a backup restore, a
+    // staging sync) would otherwise be silently discarded by the rollback, or
+    // itself discard the update — see site_lock's module doc.
+    let _guard = crate::site_lock::lock_site(domain).await;
+
     let mut log: Vec<String> = Vec::new();
 
     // 1. Health check before update

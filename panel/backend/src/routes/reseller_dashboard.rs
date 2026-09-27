@@ -14,6 +14,20 @@ use crate::error::{internal_error, err, ApiError};
 use crate::services::activity;
 use crate::AppState;
 
+/// The roles a reseller may act on among its own sub-accounts.
+///
+/// An ALLOW-LIST, and it must stay one. `admin` and `reseller` are absent by
+/// construction, so a privileged account that happens to carry a `reseller_id`
+/// can never be reached through the two handlers that read this. Writing it as
+/// `role <> 'admin'` would invert that property the first time a new privileged
+/// role is added.
+///
+/// `suspended` is included deliberately: a reseller must be able to delete an
+/// account the panel has suspended, and resetting the password of a suspended
+/// account changes a hash that cannot be used to sign in until an administrator
+/// restores the role — so including it grants no access the suspension withholds.
+const RESELLER_MANAGEABLE_ROLES: &[&str] = &["user", "client", "suspended"];
+
 #[derive(serde::Serialize)]
 pub struct ResellerDashboardData {
     pub panel_name: Option<String>,
@@ -180,9 +194,17 @@ pub async fn create_user(
     // and increments in one statement; release it if the INSERT then fails.
     reserve_reseller_user_slot(&state, claims.sub).await?;
 
+    // `email_verified` is TRUE for the same reason as the admin-side door: the
+    // reseller types the address and the password, and this handler sends no mail at
+    // all. Omitting the column left it FALSE with no `email_token`, so the account
+    // could never sign in once SMTP was configured and could never verify — and this
+    // path was the worse of the two, because the release valve added for #100
+    // (`POST /api/security/users/{id}/verify-email`) takes `AdminUser`, so a reseller
+    // could not free the client they had just created. They would have had to ask the
+    // panel's administrator to repair every single one.
     let (user_id, user_email) = match sqlx::query_as::<_, (Uuid, String)>(
-        "INSERT INTO users (email, password_hash, role, reseller_id) \
-         VALUES ($1, $2, 'user', $3) RETURNING id, email",
+        "INSERT INTO users (email, password_hash, role, reseller_id, email_verified) \
+         VALUES ($1, $2, 'user', $3, TRUE) RETURNING id, email",
     )
     .bind(&body.email)
     .bind(&hash)
@@ -211,6 +233,7 @@ pub async fn create_user(
         Some(&user_email),
         None,
         None,
+        claims.key_id,
     )
     .await;
 
@@ -229,6 +252,7 @@ pub async fn update_user(
     State(state): State<AppState>,
     ResellerUser(claims): ResellerUser,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify user belongs to this reseller (or admin has universal access)
@@ -240,10 +264,35 @@ pub async fn update_user(
             .map_err(|e| internal_error("update user", e))?
     } else {
         sqlx::query_as(
-            "SELECT id, email FROM users WHERE id = $1 AND reseller_id = $2 AND role = 'user'",
+            // ⚠ `role = ANY(...)`, not `role = 'user'`, and NOT `role <> 'admin'`.
+            //
+            // `list_users` above scopes on `reseller_id` alone, so a reseller's
+            // table shows every account beneath them whatever its role — and it
+            // renders Reset Password and Delete on every row (`ResellerUsers.tsx`
+            // has no role column at all). This predicate then resolved to `None`
+            // for anything that was not exactly `user`, and the caller met
+            // "User not found" about an account listed on the same screen with its
+            // site count beside it.
+            //
+            // Both ways in are ordinary admin actions, and one of them is the flow
+            // `docs/guides/roles-and-ownership.md` prescribes: setting an account's
+            // role to Client (`users::ASSIGNABLE_ROLES` contains it) or suspending
+            // it (which writes `role = 'suspended'`). `helpers.rs:235` and `:343`
+            // describe this exact mechanism — twice, as the reason an un-suspend
+            // must never guess a role — and the reseller side was never brought
+            // into step with it.
+            //
+            // Enumerated rather than negated on purpose: a role added to
+            // `ASSIGNABLE_ROLES` tomorrow must not silently become something a
+            // reseller may act on. `admin` and `reseller` are absent by
+            // construction, so no widening of this list can hand a reseller the
+            // password of an administrator who happens to carry their id.
+            "SELECT id, email FROM users \
+             WHERE id = $1 AND reseller_id = $2 AND role = ANY($3)",
         )
         .bind(id)
         .bind(claims.sub)
+        .bind(RESELLER_MANAGEABLE_ROLES)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| internal_error("update user", e))?
@@ -277,6 +326,8 @@ pub async fn update_user(
         crate::routes::auth::revoke_all_user_sessions(&state, id).await;
     }
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -285,7 +336,22 @@ pub async fn update_user(
         Some("user"),
         Some(&user.1),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "reseller.user.update",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("user"),
+        Some(&user.1),
         None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
 
@@ -297,6 +363,7 @@ pub async fn delete_user(
     State(state): State<AppState>,
     ResellerUser(claims): ResellerUser,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if id == claims.sub {
         return Err(err(
@@ -314,10 +381,15 @@ pub async fn delete_user(
             .map_err(|e| internal_error("delete user", e))?
     } else {
         sqlx::query_as(
-            "SELECT id, email FROM users WHERE id = $1 AND reseller_id = $2 AND role = 'user'",
+            // Same predicate as `update_user` — see the note there. Kept as one
+            // shared constant rather than two literals precisely because these two
+            // drifted apart from `list_users` and nothing noticed.
+            "SELECT id, email FROM users \
+             WHERE id = $1 AND reseller_id = $2 AND role = ANY($3)",
         )
         .bind(id)
         .bind(claims.sub)
+        .bind(RESELLER_MANAGEABLE_ROLES)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| internal_error("delete user", e))?
@@ -352,6 +424,8 @@ pub async fn delete_user(
         claims.email,
         user.1
     );
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -360,7 +434,22 @@ pub async fn delete_user(
         Some("user"),
         Some(&user.1),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "reseller.user.delete",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("user"),
+        Some(&user.1),
         None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
 

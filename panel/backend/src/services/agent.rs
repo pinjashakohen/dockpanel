@@ -25,8 +25,87 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 20;
 /// Maximum concurrent long-running agent operations (docker builds, etc.).
 const MAX_LONG_CONNECTIONS: usize = 5;
 
+/// Classify a failed remote send, and only count the ones that mean "offline".
+///
+/// ⚠ A timeout is not an unreachable agent, and conflating the two is worse now
+/// than it was. Every remote failure used to become `Connection`, which trips the
+/// circuit breaker and reaches the operator as "agent unreachable". A busy agent
+/// answering perfectly well would be reported as down — and moving remote long
+/// operations onto the small pool makes waiting, and therefore timing out, far
+/// more likely than it was.
+///
+/// The local twins already draw this line: an elapsed clock is a `Request`, which
+/// the breaker does not count. This is that rule, applied to the client that
+/// needed it most.
+fn remote_send_error(cb: &CircuitBreaker, e: reqwest::Error) -> AgentError {
+    if e.is_timeout() {
+        AgentError::Request(e.to_string())
+    } else {
+        cb.record_failure();
+        AgentError::Connection(e.to_string())
+    }
+}
+
+/// Take a permit within the caller's budget, and report what is left of it.
+///
+/// The budget a caller names is the time it has to spend before something above
+/// it stops waiting — the doc on `DB_RESTORE_TIMEOUT_SECS` sets 270s precisely
+/// so the 300s `TimeoutLayer` never fires first, because a timeout the panel
+/// owns is the only kind it can explain. Queuing outside that budget defeats it:
+/// the permit wait was unbounded, so the work started late and ran its full
+/// allowance on top, and the server cut the request off mid-flight with a
+/// bodyless 504 — the exact answer that doc exists to prevent.
+///
+/// So the wait is inside the budget, and a request that never got a permit says
+/// THAT, rather than borrowing the sentence for work that ran and overran.
+/// Nothing that reached the agent is described differently than before.
+async fn permit_within<'a>(
+    sem: &'a tokio::sync::Semaphore,
+    budget: Duration,
+    pool: &str,
+) -> Result<(tokio::sync::SemaphorePermit<'a>, Duration), AgentError> {
+    let start = std::time::Instant::now();
+    let permit = tokio::time::timeout(budget, sem.acquire())
+        .await
+        .map_err(|_| {
+            AgentError::Request(format!(
+                "timed out after {}s waiting for a free {pool} slot; the operation never started",
+                budget.as_secs()
+            ))
+        })?
+        .map_err(|e| AgentError::Connection(format!("{pool} semaphore closed: {e}")))?;
+    Ok((permit, budget.saturating_sub(start.elapsed())))
+}
+
 /// Maximum response size from agent (50MB).
 const MAX_RESPONSE_SIZE: usize = 50 * 1024 * 1024;
+
+/// How long a database restore/import may occupy a request before the panel stops waiting.
+///
+/// Deliberately BELOW the server's own ceiling rather than matched to the agent's work
+/// budget, and the gap is the whole point. The agent gives a restore 600s
+/// (`agent/src/services/database_backup.rs`), but `main.rs` wraps every route in a 300s
+/// `TimeoutLayer` and the generated nginx vhost sets `proxy_read_timeout 300s` — so a
+/// handler that waited 600s would be cut off by its own server at 300 and answer a
+/// bodyless 504 that no client can explain. Waiting slightly less means the timeout is
+/// OURS, which is what lets the handler say something true about it: a timeout here does
+/// not mean the import failed, it means we stopped watching. `agent_error` cannot make
+/// that distinction — `AgentError::Request` falls to the arm that mints an incident id —
+/// so the callers of this constant handle that variant themselves.
+///
+/// ⚠ A panel behind Cloudflare's proxy is cut at 100s regardless of any of this; the
+/// same caveat is recorded at `routes/migration.rs` for the migration importer.
+pub const DB_RESTORE_TIMEOUT_SECS: u64 = 270;
+
+/// A backup drill (scheduled or on-demand) spins a scratch container, restores a real
+/// backup into it end to end, then probes it — the agent-side budget for the slowest leg
+/// (volume: 300s restore + 60s read-probe) is 360s, several multiples of the plain 60s
+/// `post` cap. Unlike `DB_RESTORE_TIMEOUT_SECS`, drills always run inside a detached
+/// `tokio::spawn` (never awaited directly by an axum handler), so there is no 300s
+/// `TimeoutLayer`/nginx `proxy_read_timeout` ceiling to stay under here — the only cost of
+/// headroom is how long a stuck drill occupies the long-op semaphore. Set with margin over
+/// the 360s worst case for container pull/start overhead on a cold box.
+pub const DRILL_TIMEOUT_SECS: u64 = 420;
 
 /// Effectively-disabled total timeout for streamed remote requests.
 ///
@@ -192,12 +271,11 @@ impl AgentClient {
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, AgentError> {
         self.cb.check()?;
-        let _permit = self.cb.semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("connection semaphore closed: {e}"))
-        })?;
+        let (_permit, remaining) =
+            permit_within(&self.cb.semaphore, Duration::from_secs(60), "connection").await?;
 
         let result = tokio::time::timeout(
-            Duration::from_secs(60),
+            remaining,
             self.request_inner(method, path, body),
         )
         .await
@@ -303,6 +381,39 @@ impl AgentClient {
         self.request("PUT", path, Some(body)).await
     }
 
+    /// PUT with an explicit timeout, for the same reason `post_long` exists: some PUTs
+    /// do real work. Editing an app's environment recreates its container and may copy
+    /// the app's data onto a bind mount first, which does not fit the default budget.
+    pub async fn put_long(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, AgentError> {
+        self.cb.check()?;
+        let (_permit, remaining) = permit_within(
+            &self.cb.long_semaphore,
+            Duration::from_secs(timeout_secs),
+            "long operation",
+        )
+        .await?;
+
+        let result = tokio::time::timeout(
+            remaining,
+            self.request_inner("PUT", path, Some(body)),
+        )
+        .await
+        .map_err(|_| AgentError::Request(format!("agent request timed out after {timeout_secs}s")))?;
+
+        match &result {
+            Ok(_) => self.cb.record_success(),
+            Err(AgentError::Connection(_)) => self.cb.record_failure(),
+            _ => {}
+        }
+
+        result
+    }
+
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value, AgentError> {
         self.request("DELETE", path, None).await
     }
@@ -318,12 +429,11 @@ impl AgentClient {
     /// GET that returns raw bytes instead of JSON. Used for file downloads.
     pub async fn get_bytes(&self, path: &str) -> Result<(Vec<u8>, Option<String>), AgentError> {
         self.cb.check()?;
-        let _permit = self.cb.semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("connection semaphore closed: {e}"))
-        })?;
+        let (_permit, remaining) =
+            permit_within(&self.cb.semaphore, Duration::from_secs(120), "connection").await?;
 
         let result = tokio::time::timeout(
-            Duration::from_secs(120),
+            remaining,
             self.request_bytes_inner(path),
         )
         .await
@@ -404,12 +514,15 @@ impl AgentClient {
         timeout_secs: u64,
     ) -> Result<serde_json::Value, AgentError> {
         self.cb.check()?;
-        let _permit = self.cb.long_semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("long operation semaphore closed: {e}"))
-        })?;
+        let (_permit, remaining) = permit_within(
+            &self.cb.long_semaphore,
+            Duration::from_secs(timeout_secs),
+            "long operation",
+        )
+        .await?;
 
         let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
+            remaining,
             self.request_inner("POST", path, body),
         )
         .await
@@ -447,9 +560,17 @@ impl AgentClient {
         F: Fn(serde_json::Value) + Send + 'static,
     {
         self.cb.check()?;
-        let _permit = self.cb.long_semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("long operation semaphore closed: {e}"))
-        })?;
+        // A stream has no total budget by design — the idle clock bounds SILENCE,
+        // not runtime — so there is no allowance to subtract a queue wait from. The
+        // wait is bounded by that same idle figure instead: a stream that cannot
+        // even be started inside its own silence budget is stalled, and saying so
+        // beats waiting for ever behind work that may not finish.
+        let (_permit, _) = permit_within(
+            &self.cb.long_semaphore,
+            Duration::from_secs(idle_timeout_secs),
+            "long operation",
+        )
+        .await?;
 
         let ticks = Arc::new(AtomicU64::new(0));
         let probe = {
@@ -721,9 +842,10 @@ impl RemoteAgentClient {
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, AgentError> {
         self.cb.check()?;
-        let _permit = self.cb.semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("connection semaphore closed: {e}"))
-        })?;
+        // 60s to match this client's own default request timeout, so the wait
+        // cannot outlast the call it is waiting to make.
+        let (_permit, _) =
+            permit_within(&self.cb.semaphore, Duration::from_secs(60), "connection").await?;
 
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.http.request(method, &url)
@@ -756,10 +878,7 @@ impl RemoteAgentClient {
 
                 serde_json::from_slice(&bytes).map_err(|e| AgentError::Parse(e.to_string()))
             }
-            Err(e) => {
-                self.cb.record_failure();
-                Err(AgentError::Connection(e.to_string()))
-            }
+            Err(e) => Err(remote_send_error(&self.cb, e)),
         }
     }
 
@@ -783,20 +902,66 @@ impl RemoteAgentClient {
         self.request(reqwest::Method::PUT, path, Some(body)).await
     }
 
+    /// PUT with an explicit timeout — the remote twin of [`AgentClient::put_long`].
+    pub async fn put_long(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, AgentError> {
+        self.cb.check()?;
+        // The LONG pool, matching the local twin this function is named after. The
+        // third of three remote long-operation entry points that took the quick one.
+        let (_permit, remaining) = permit_within(
+            &self.cb.long_semaphore,
+            Duration::from_secs(timeout_secs),
+            "long operation",
+        )
+        .await?;
+
+        let url = format!("{}{}", self.base_url, path);
+        let result = self
+            .http
+            .put(&url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .timeout(remaining)
+            .json(&body)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                self.cb.record_success();
+                let status = resp.status();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| AgentError::Response(e.to_string()))?;
+
+                if !status.is_success() {
+                    let msg = String::from_utf8_lossy(&bytes).to_string();
+                    return Err(AgentError::Status(status.as_u16(), msg));
+                }
+
+                serde_json::from_slice(&bytes).map_err(|e| AgentError::Parse(e.to_string()))
+            }
+            Err(e) => Err(remote_send_error(&self.cb, e)),
+        }
+    }
+
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value, AgentError> {
         self.request(reqwest::Method::DELETE, path, None).await
     }
 
     pub async fn get_bytes(&self, path: &str) -> Result<(Vec<u8>, Option<String>), AgentError> {
         self.cb.check()?;
-        let _permit = self.cb.semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("connection semaphore closed: {e}"))
-        })?;
+        let (_permit, remaining) =
+            permit_within(&self.cb.semaphore, Duration::from_secs(120), "connection").await?;
 
         let url = format!("{}{}", self.base_url, path);
         let result = self.http.get(&url)
             .header("authorization", format!("Bearer {}", self.token))
-            .timeout(Duration::from_secs(120))
+            .timeout(remaining)
             .send()
             .await;
 
@@ -820,10 +985,7 @@ impl RemoteAgentClient {
 
                 Ok((bytes.to_vec(), content_disposition))
             }
-            Err(e) => {
-                self.cb.record_failure();
-                Err(AgentError::Connection(e.to_string()))
-            }
+            Err(e) => Err(remote_send_error(&self.cb, e)),
         }
     }
 
@@ -834,14 +996,22 @@ impl RemoteAgentClient {
         timeout_secs: u64,
     ) -> Result<serde_json::Value, AgentError> {
         self.cb.check()?;
-        let _permit = self.cb.semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("connection semaphore closed: {e}"))
-        })?;
+        // The LONG pool, as the local client has always used here. Taking the quick
+        // pool meant `MAX_LONG_CONNECTIONS` bounded nothing on a fleet — every
+        // remote build, import and restore competed with ordinary requests for the
+        // same 20 permits, so the limit that exists to stop long work starving the
+        // panel applied only to the machine the panel runs on.
+        let (_permit, remaining) = permit_within(
+            &self.cb.long_semaphore,
+            Duration::from_secs(timeout_secs),
+            "long operation",
+        )
+        .await?;
 
         let url = format!("{}{}", self.base_url, path);
         let mut req = self.http.post(&url)
             .header("authorization", format!("Bearer {}", self.token))
-            .timeout(Duration::from_secs(timeout_secs));
+            .timeout(remaining);
 
         if let Some(b) = body {
             req = req.json(&b);
@@ -863,10 +1033,7 @@ impl RemoteAgentClient {
 
                 serde_json::from_slice(&bytes).map_err(|e| AgentError::Parse(e.to_string()))
             }
-            Err(e) => {
-                self.cb.record_failure();
-                Err(AgentError::Connection(e.to_string()))
-            }
+            Err(e) => Err(remote_send_error(&self.cb, e)),
         }
     }
 
@@ -886,9 +1053,14 @@ impl RemoteAgentClient {
         F: Fn(serde_json::Value) + Send + 'static,
     {
         self.cb.check()?;
-        let _permit = self.cb.semaphore.acquire().await.map_err(|e| {
-            AgentError::Connection(format!("connection semaphore closed: {e}"))
-        })?;
+        // The LONG pool, as the local twin uses. See the note there on why the idle
+        // figure bounds the wait.
+        let (_permit, _) = permit_within(
+            &self.cb.long_semaphore,
+            Duration::from_secs(idle_timeout_secs),
+            "long operation",
+        )
+        .await?;
 
         let ticks = Arc::new(AtomicU64::new(0));
         let probe = {
@@ -1002,6 +1174,18 @@ impl AgentHandle {
         }
     }
 
+    pub async fn put_long(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, AgentError> {
+        match self {
+            Self::Local(c) => c.put_long(path, body, timeout_secs).await,
+            Self::Remote(c) => c.put_long(path, body, timeout_secs).await,
+        }
+    }
+
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value, AgentError> {
         match self {
             Self::Local(c) => c.delete(path).await,
@@ -1068,16 +1252,34 @@ pub struct AgentRegistry {
     remote_cache: Arc<RwLock<HashMap<Uuid, RemoteAgentClient>>>,
     /// Database pool for looking up server details.
     db: sqlx::PgPool,
+    /// Key `servers.agent_token` is encrypted under. Held here because
+    /// `for_server` is the single site that opens a stored dial-out token, and
+    /// a struct field is a dependency the compiler checks — an env read inside
+    /// the method would be a second source of truth for that key, silently
+    /// returning ciphertext-as-token if it were ever unset.
+    jwt_secret: String,
 }
 
 impl AgentRegistry {
-    pub fn new(local: AgentClient, db: sqlx::PgPool) -> Self {
+    pub fn new(local: AgentClient, db: sqlx::PgPool, jwt_secret: String) -> Self {
         Self {
             local,
             local_server_id: Arc::new(RwLock::new(None)),
             remote_cache: Arc::new(RwLock::new(HashMap::new())),
             db,
+            jwt_secret,
         }
+    }
+
+    /// The key stored credentials are encrypted under.
+    ///
+    /// Exposed so the UNATTENDED renewal loops can open a Cloudflare API token
+    /// for a DNS-01 renewal. They hold an `AgentRegistry` and no `AppState`, and
+    /// this struct is already the single place that key lives for background
+    /// work — re-reading it from the environment there would be the second
+    /// source of truth the field comment above exists to prevent.
+    pub fn jwt_secret(&self) -> &str {
+        &self.jwt_secret
     }
 
     /// Set the local server ID (called once on startup after ensure_local_server).
@@ -1141,6 +1343,17 @@ impl AgentRegistry {
             // an edge case.
             Some((_, _, _, true)) => Ok(AgentHandle::Local(self.local.clone())),
             Some((Some(url), token, fingerprint, false)) if !url.is_empty() => {
+                // The ONLY consumer of the stored dial-out token. `servers.agent_token`
+                // is encrypted at rest by every writer (`routes::servers::create_server`,
+                // `rotate_token`, and `ensure_local_server`); decrypt here — the single
+                // choke point every remote agent call funnels through — so no read site
+                // can forget to. `decrypt_credential_or_legacy` returns a pre-encryption
+                // plaintext token unchanged, so an existing fleet keeps dialling without
+                // a migration and without a re-enrolment.
+                let token = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+                    &token,
+                    &self.jwt_secret,
+                );
                 let client = RemoteAgentClient::new_with_pin(url, token, fingerprint);
                 self.remote_cache.write().await.insert(server_id, client.clone());
                 Ok(AgentHandle::Remote(client))
@@ -1225,7 +1438,29 @@ pub struct FleetMember {
 }
 
 /// Ensure the local server row exists in the DB. Returns the local server UUID.
-pub async fn ensure_local_server(db: &sqlx::PgPool, agent_token: &str) -> Uuid {
+///
+/// `jwt_secret` is threaded in rather than read from the environment because it
+/// is the key `servers.agent_token` is encrypted under, and both callers already
+/// hold it. An env read here would be an untestable second source of truth for
+/// the one value that decides whether the column can be opened again.
+pub async fn ensure_local_server(db: &sqlx::PgPool, agent_token: &str, jwt_secret: &str) -> Uuid {
+    // Encrypted at rest like every other stored credential. The local row's
+    // plaintext is never dialled — `AgentPool::for_server` short-circuits
+    // `is_local` to the Unix-socket handle before it looks at the token — so
+    // this row is write-only in practice; it is encrypted anyway so that "no
+    // plaintext credential lives in this column" is true of every row, which is
+    // what a sweep, a dump and the published promise can each rely on.
+    let agent_token_enc = match crate::services::secrets_crypto::encrypt_credential(
+        agent_token,
+        jwt_secret,
+    ) {
+        Ok(enc) => enc,
+        Err(e) => {
+            tracing::error!(error = %e, "could not encrypt the local agent token; storing it unencrypted");
+            agent_token.to_string()
+        }
+    };
+
     // Check if a local server already exists
     let existing: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM servers WHERE is_local = true LIMIT 1")
@@ -1237,7 +1472,7 @@ pub async fn ensure_local_server(db: &sqlx::PgPool, agent_token: &str) -> Uuid {
         // Update token + hash if changed
         let token_hash = crate::helpers::hash_agent_token(agent_token);
         let _ = sqlx::query("UPDATE servers SET agent_token = $1, agent_token_hash = $2, status = 'online' WHERE id = $3")
-            .bind(agent_token)
+            .bind(&agent_token_enc)
             .bind(&token_hash)
             .bind(id)
             .execute(db)
@@ -1268,7 +1503,7 @@ pub async fn ensure_local_server(db: &sqlx::PgPool, agent_token: &str) -> Uuid {
          RETURNING id",
     )
     .bind(user_id)
-    .bind(agent_token)
+    .bind(&agent_token_enc)
     .bind(&token_hash)
     .fetch_one(db)
     .await

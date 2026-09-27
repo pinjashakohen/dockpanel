@@ -1,23 +1,64 @@
 import { useState, useEffect } from "react";
 import { api } from "../api";
+import { useAuth } from "../context/AuthContext";
+import RegisteredCertificates from "../components/RegisteredCertificates";
 
 interface Certificate {
-  site_id: string;
+  /** null on the admin host-wide view for a certificate no site row explains. */
+  site_id: string | null;
   domain: string;
   expiry: string | null;
-  days_left: number;
+  /** null when the panel does not know this certificate's expiry. */
+  days_left: number | null;
   status: string;
+  /** Admin view only. */
+  owner_email?: string | null;
+  issuer?: string | null;
+  /** The Compose stack this certificate belongs to, if it belongs to one. */
+  stack_id?: string | null;
+  /** false = on disk, belonging to neither a site nor an ACME stack, so nothing here can renew it. */
+  managed?: boolean;
+  /** true = read back out of the panel's own record because the agent could not be reached. */
+  stale?: boolean;
+  /** CA-suggested ARI renewal window start (RFC 9773), or null if not yet checked / not a site row. */
+  renewal_at?: string | null;
 }
 
-const STATUS_STYLES: Record<string, { bg: string; text: string; label: string }> = {
+// Exported so the registry section below the site table paints the SAME badge
+// for the same status word — one vocabulary, one map, checked against the
+// backend ladder by a pin.
+export const STATUS_STYLES: Record<string, { bg: string; text: string; label: string }> = {
   expired: { bg: "bg-danger-500/15", text: "text-danger-400", label: "Expired" },
   critical: { bg: "bg-danger-500/15", text: "text-danger-400", label: "Critical" },
   warning: { bg: "bg-warn-500/15", text: "text-warn-400", label: "Warning" },
+  // Not a rung of the clock like the four around it. It says the machinery that
+  // is supposed to replace this certificate is failing right now, which the days
+  // column beside it cannot express at any value — a certificate with 300 days
+  // left and a failing renewal read "OK" until the last month of its life.
+  renewal_failed: { bg: "bg-danger-500/15", text: "text-danger-400", label: "Renewal failed" },
   ok: { bg: "bg-rust-500/15", text: "text-rust-400", label: "OK" },
+  // A certificate the panel did not issue arrives with no expiry, and "no
+  // information" used to fall through the `|| STATUS_STYLES.ok` below into the
+  // single most reassuring badge on the page.
+  unknown: { bg: "bg-dark-600", text: "text-dark-200", label: "Unknown" },
 };
 
 export default function Certificates() {
+  // The LIST is open on purpose — it is `AuthUser` and filtered to the caller's
+  // own sites, so a site owner seeing their own certificates here is the
+  // intended behaviour and must not be gated. Renewing and deleting are not:
+  // both are administrator-only, so an owner was shown a row whose only two
+  // controls were the two things they would be refused.
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [certs, setCerts] = useState<Certificate[]>([]);
+  // Mirrors the Sites page's "All sites on this server": a separate ADMIN route
+  // rather than a role branch inside the tenant list, so a per-caller list can
+  // never quietly start returning other people's rows.
+  const [allCerts, setAllCerts] = useState(false);
+  // false = this server's agent is too old to enumerate certificates, so the
+  // host-wide half of the list is missing and the page must say so.
+  const [hostScan, setHostScan] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [message, setMessage] = useState({ text: "", type: "" });
@@ -26,21 +67,43 @@ export default function Certificates() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const loadCerts = () => {
-    api.get<{ certificates: Certificate[] }>("/monitors/certificates")
-      .then((data) => setCerts(data.certificates || []))
+    api.get<{ certificates: Certificate[]; host_scan?: boolean }>(
+      allCerts ? "/admin/certificates" : "/monitors/certificates",
+    )
+      .then((data) => {
+        setCerts(data.certificates || []);
+        setHostScan(data.host_scan !== false);
+        // Clears a PREVIOUS failure. Without it the banner and the count line
+        // below both keep describing a request that has since succeeded, and
+        // toggling the admin checkbox is the ordinary way to reach that state.
+        setError("");
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
     loadCerts();
-  }, []);
+  }, [allCerts]);
+
+  // ⛔ ONE IDENTITY PER ROW, and it is never null. `renewingId === cert.site_id`
+  //    was safe only while every row carrying controls had a site id; a stack row
+  //    has `site_id: null`, so the moment such a row gains a button that
+  //    comparison is `null === null` for EVERY stack row at once and they all
+  //    spin together on one click.
+  const rowId = (cert: Certificate) => cert.site_id ?? cert.stack_id ?? cert.domain;
 
   const handleRenew = async (cert: Certificate) => {
-    setRenewingId(cert.site_id);
+    setRenewingId(rowId(cert));
     setMessage({ text: "", type: "" });
     try {
-      await api.post(`/ssl/${cert.site_id}/renew`);
+      // A stack has no `sites` row, so the site-shaped route could never address
+      // one — which is why this page used to say it could do nothing at all.
+      await api.post(
+        cert.stack_id != null
+          ? `/stacks/${cert.stack_id}/renew-ssl`
+          : `/ssl/${cert.site_id}/renew`,
+      );
       setMessage({ text: `Certificate renewed for ${cert.domain}`, type: "success" });
       loadCerts();
     } catch (e) {
@@ -85,11 +148,38 @@ export default function Certificates() {
 
   return (
     <div>
-      <p className="text-sm text-dark-200 font-mono mb-4">
-        {certs.length > 0
-          ? `${certs.length} SSL certificate${certs.length > 1 ? "s" : ""} tracked`
-          : "No SSL certificates found"}
-      </p>
+      <div className="flex items-center justify-between gap-4 mb-4">
+        <p className="text-sm text-dark-200 font-mono">
+          {/* An unread list is not an empty one. On failure `certs` is still
+              `[]`, so this line used to answer "No SSL certificates found" —
+              the page's most reassuring sentence — directly beside the error
+              banner saying the request had failed. */}
+          {error
+            ? "Certificate list unavailable"
+            : certs.length > 0
+              ? `${certs.length} SSL certificate${certs.length > 1 ? "s" : ""} tracked`
+              : "No SSL certificates found"}
+        </p>
+        {isAdmin && (
+          <label className="flex items-center gap-2 text-sm text-dark-200 select-none cursor-pointer">
+            <input
+              type="checkbox"
+              checked={allCerts}
+              onChange={(e) => { setLoading(true); setAllCerts(e.target.checked); }}
+              className="rounded border-dark-500 bg-dark-800 text-rust-500 focus:ring-rust-500"
+            />
+            All certificates on this server
+          </label>
+        )}
+      </div>
+
+      {allCerts && !hostScan && (
+        <div className="bg-warn-500/10 text-warn-400 text-sm px-4 py-3 rounded-lg border border-warn-500/20 mb-4">
+          This server's agent is older than the panel and cannot enumerate certificates,
+          so this list shows only certificates attached to a site. Update the agent to
+          see certificates the panel did not issue.
+        </div>
+      )}
 
       {error && (
         <div className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20 mb-4">
@@ -127,30 +217,103 @@ export default function Certificates() {
                 <th className="text-left px-4 py-3 text-xs font-medium text-dark-300 uppercase font-mono">Expiry</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-dark-300 uppercase font-mono">Days Left</th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-dark-300 uppercase font-mono">Status</th>
-                <th className="text-right px-4 py-3 text-xs font-medium text-dark-300 uppercase font-mono">Actions</th>
+                {allCerts && <th className="text-left px-4 py-3 text-xs font-medium text-dark-300 uppercase font-mono">Owner</th>}
+                {isAdmin && <th className="text-right px-4 py-3 text-xs font-medium text-dark-300 uppercase font-mono">Actions</th>}
               </tr>
             </thead>
             <tbody>
               {certs.map((cert) => {
-                const style = STATUS_STYLES[cert.status] || STATUS_STYLES.ok;
+                const style = STATUS_STYLES[cert.status] || STATUS_STYLES.unknown;
                 return (
-                  <tr key={cert.site_id} className="border-b border-dark-600/50 last:border-b-0">
+                  <tr key={cert.site_id ?? `unmanaged:${cert.domain}`} className="border-b border-dark-600/50 last:border-b-0">
                     <td className="px-4 py-3 font-mono text-dark-50">{cert.domain}</td>
                     <td className="px-4 py-3 text-dark-200 font-mono">
                       {cert.expiry ? new Date(cert.expiry).toLocaleDateString() : "Unknown"}
                     </td>
                     <td className="px-4 py-3 font-mono">
-                      <span className={cert.days_left <= 7 ? "text-danger-400 font-bold" : cert.days_left <= 30 ? "text-warn-400" : "text-dark-100"}>
-                        {cert.days_left < 0 ? `${Math.abs(cert.days_left)}d overdue` : `${cert.days_left}d`}
+                      <span className={cert.days_left === null ? "text-dark-300" : cert.days_left <= 7 ? "text-danger-400 font-bold" : cert.days_left <= 30 ? "text-warn-400" : "text-dark-100"}>
+                        {cert.days_left === null ? "—" : cert.days_left < 0 ? `${Math.abs(cert.days_left)}d overdue` : `${cert.days_left}d`}
                       </span>
+                      {/* The CA's own suggested renewal window (RFC 9773 ARI) — a
+                          date the auto-healer already fetches, stores and acts on,
+                          just never showed. Distinct from "days left": ARI often
+                          opens weeks before expiry, so an operator watching only
+                          the countdown has no way to see the window the healer is
+                          actually waiting for. */}
+                      {cert.renewal_at && (
+                        <div
+                          className="text-[10px] text-dark-300 font-mono mt-0.5"
+                          title="The Certificate Authority's suggested renewal window (ACME Renewal Information). DockPanel's auto-healer renews automatically once this window opens — this is not a deadline you need to act on."
+                        >
+                          CA suggests renewal {new Date(cert.renewal_at) <= new Date() ? "now" : `~${new Date(cert.renewal_at).toLocaleDateString()}`}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${style.bg} ${style.text}`}>
                         {style.label}
                       </span>
                     </td>
+                    {allCerts && (
+                      <td className="px-4 py-3 text-dark-200 font-mono">
+                        {cert.owner_email ?? (
+                          <span
+                            className="text-dark-300"
+                            title={
+                              cert.issuer
+                                ? `On disk, attached to no site. Issued by ${cert.issuer}.`
+                                : "On disk, attached to no site."
+                            }
+                          >
+                            Not a site
+                          </span>
+                        )}
+                      </td>
+                    )}
+                    {isAdmin && (
                     <td className="px-4 py-3 text-right">
-                      {deleteTarget === cert.site_id ? (
+                      {cert.managed === false ? (
+                        // Neither a site nor an ACME stack stands behind this file,
+                        // so nothing on this page can renew or remove it — and
+                        // rendering a control anyway is the defect this page exists
+                        // to remove: one that cannot do what it says.
+                        // ⚠ The old spelling of this branch tested `site_id === null`,
+                        // which was the same question ONLY while a stack could never
+                        // be managed here. It can now, and a stack's `site_id` is
+                        // null, so that test would have hidden the very control this
+                        // ship adds. `managed` is the handler's own answer.
+                        <span
+                          className="text-xs text-dark-300"
+                          title="This certificate belongs to no site and no Let's Encrypt stack on this server, so DockPanel cannot renew or remove it from here."
+                        >
+                          Not managed here
+                        </span>
+                      ) : cert.stale ? (
+                        // The panel's stored record, shown because the agent could
+                        // not be reached. Renewing goes THROUGH that agent, so a
+                        // button here would post to a host already known to be
+                        // silent.
+                        <span
+                          className="text-xs text-dark-300"
+                          title="This server's agent could not be reached, so this row is what DockPanel last recorded. Renewing needs the agent."
+                        >
+                          Agent unreachable
+                        </span>
+                      ) : cert.stack_id != null ? (
+                        // A Compose stack. It has no `sites` row, so it gets the
+                        // stack-shaped route and no Delete: removing a stack's
+                        // certificate is not a thing this page can do, and offering
+                        // it would be another control that cannot keep its word.
+                        <button
+                          onClick={() => handleRenew(cert)}
+                          disabled={renewingId === rowId(cert)}
+                          className="px-2 py-1 text-xs text-dark-300 hover:text-dark-50 bg-dark-700 rounded hover:bg-dark-600 transition-colors disabled:opacity-50 flex items-center gap-1 ml-auto"
+                          title="Reissue this stack's Let's Encrypt certificate"
+                        >
+                          {renewingId === rowId(cert) && <span className="w-3 h-3 border-2 border-dark-400/30 border-t-dark-200 rounded-full animate-spin" />}
+                          {renewingId === rowId(cert) ? "Renewing..." : "Renew"}
+                        </button>
+                      ) : deleteTarget === cert.site_id ? (
                         <div className="flex items-center justify-end gap-1">
                           <button
                             onClick={() => handleDelete(cert)}
@@ -171,12 +334,12 @@ export default function Certificates() {
                         <div className="flex items-center justify-end gap-1">
                           <button
                             onClick={() => handleRenew(cert)}
-                            disabled={renewingId === cert.site_id}
+                            disabled={renewingId === rowId(cert)}
                             className="px-2 py-1 text-xs text-dark-300 hover:text-dark-50 bg-dark-700 rounded hover:bg-dark-600 transition-colors disabled:opacity-50 flex items-center gap-1"
                             title="Renew certificate"
                           >
-                            {renewingId === cert.site_id && <span className="w-3 h-3 border-2 border-dark-400/30 border-t-dark-200 rounded-full animate-spin" />}
-                            {renewingId === cert.site_id ? "Renewing..." : "Renew"}
+                            {renewingId === rowId(cert) && <span className="w-3 h-3 border-2 border-dark-400/30 border-t-dark-200 rounded-full animate-spin" />}
+                            {renewingId === rowId(cert) ? "Renewing..." : "Renew"}
                           </button>
                           <button
                             onClick={() => setDeleteTarget(cert.site_id)}
@@ -190,6 +353,7 @@ export default function Certificates() {
                         </div>
                       )}
                     </td>
+                    )}
                   </tr>
                 );
               })}
@@ -197,6 +361,12 @@ export default function Certificates() {
           </table>
         </div>
       )}
+
+      {/* The registry is a host-wide, admin-only resource: registering writes a
+          key pair to the server's disk and deleting can break a live vhost, so
+          the whole section is gated the way Renew and Delete above are — not
+          just its buttons. The site list above stays open on purpose. */}
+      {isAdmin && <RegisteredCertificates />}
     </div>
   );
 }

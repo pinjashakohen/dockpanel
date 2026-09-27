@@ -23,12 +23,13 @@
  */
 
 export const measurements = {
-  /** Published release assets, linux/amd64, v2.44.0. Verified by the GitHub API. */
+  /** Published release assets, linux/amd64, v2.240.0. Verified by the GitHub API. */
   binary: {
-    api: 22,
-    agent: 21,
-    cli: 1.7,
-    total: 45,
+    api: 25,
+    agent: 22,
+    cli: 3.9,
+    mcp: 6.1,
+    total: 57,
   },
 
   /**
@@ -57,7 +58,7 @@ export const measurements = {
   },
 
   /** Docker app templates in the catalogue. Derived from source by the pin suite. */
-  templates: 153,
+  templates: 147,
 
   /** Install to a working login, Ubuntu 24.04, 1 vCPU. */
   installSeconds: 47,

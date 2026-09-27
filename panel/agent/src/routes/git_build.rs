@@ -75,6 +75,48 @@ fn is_valid_build_context(ctx: &str) -> bool {
     !ctx.contains("..") && !ctx.starts_with('/')
 }
 
+/// A persistent-volume field is CONTAINER-path only (#118) — the host side is
+/// always derived under `GIT_DATA_DIR/{name}` and never taken from the request,
+/// so the only injection surface left is the container path feeding that
+/// derivation. `..` is rejected here, before it ever reaches
+/// `std::fs::create_dir_all`: that call walks `..` components using the OS's own
+/// path resolution and can create a directory OUTSIDE the intended prefix before
+/// the later `canonicalize` + prefix check ever runs, exactly the way a symlink
+/// escape would. Otherwise deliberately loose — this only stops the dangerous
+/// set, matching `is_valid_dockerfile`/`is_valid_build_context` above.
+fn is_valid_volume_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path.len() <= 200
+        && !path.contains("..")
+        && !path.contains("//")
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+}
+
+/// At most this many declared volumes per deploy — a sane bound on an
+/// operator-editable list, not a resource limit the deploy itself needs.
+const MAX_VOLUMES: usize = 10;
+
+fn validate_volumes(volumes: &[String]) -> Result<(), &'static str> {
+    if volumes.len() > MAX_VOLUMES {
+        return Err("too many volumes declared (max 10)");
+    }
+    if !volumes.iter().all(|v| is_valid_volume_path(v)) {
+        return Err(
+            "invalid volume path: must be an absolute container path with no '..' or '//'",
+        );
+    }
+    let mut sorted = volumes.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != volumes.len() {
+        return Err("duplicate volume path");
+    }
+    Ok(())
+}
+
 /// Validate that an image_tag is a dockpanel-managed tag and has no path traversal.
 fn is_valid_image_tag(tag: &str) -> bool {
     tag.starts_with("dockpanel-git-") && !tag.contains('/')
@@ -152,13 +194,35 @@ struct DeployRequest {
     memory_mb: Option<u64>,
     cpu_percent: Option<u64>,
     ssl_email: Option<String>,
+    /// `none` / `acme` / `provided`, or absent from a panel that predates the
+    /// field — `TlsIntent::from_request` keeps that case reading `ssl_email`
+    /// presence exactly as this endpoint always has.
+    tls_mode: Option<String>,
+    /// The registered-certificate alias, `provided` mode only.
+    tls_certificate: Option<String>,
     #[serde(default)]
     scope: String,
+    /// Container paths to bind-mount durably under `GIT_DATA_DIR/{name}` (#118).
+    /// Absent from a panel that predates the field, exactly like every other
+    /// `#[serde(default)]` here — an old panel simply never declares volumes.
+    #[serde(default)]
+    volumes: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct KeygenRequest {
     name: String,
+}
+
+/// The OLD domain a rename is walking away from, plus the port that proves the
+/// vhost is still this deploy's. `host_port` is not optional in spirit: without
+/// it `ownership::app_vhost` cannot tell "still ours" from "re-claimed since",
+/// and it fails CLOSED — so a missing port leaves the vhost in place.
+#[derive(Deserialize)]
+struct ReleaseDomainRequest {
+    domain: String,
+    #[serde(default)]
+    host_port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -290,9 +354,42 @@ async fn deploy_container(
             return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
         }
     }
+    if let Err(msg) = validate_volumes(&body.volumes) {
+        return Err(err(StatusCode::BAD_REQUEST, msg));
+    }
 
     let scope = scope_of(&body.scope);
+
+    // Previews must never gain durable local storage (#118): a throwaway PR
+    // container writing into its own persistent directory defeats the point of
+    // it being throwaway, and TTL teardown would then be destroying real data
+    // rather than a re-clonable checkout. The panel is not trusted to enforce
+    // this on its own — it is the boundary a request actually crosses, and a
+    // future bug there must not be the only thing standing between a preview
+    // and durable storage.
+    if scope != ownership::GitScope::Deploy && !body.volumes.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "volumes are not supported for preview deployments",
+        ));
+    }
+
     let name = scope.scoped(&body.name);
+
+    // Decide the TLS shape BEFORE anything runs — mirrors
+    // `docker_apps::TlsIntent::from_request`'s own front-door discipline: a
+    // request naming a mode it cannot honour is refused with nothing done,
+    // not a running container and a warning. `use_traefik` is always false
+    // here: a git deploy has exactly one reverse-proxy path (nginx), unlike
+    // Docker Apps, so the Traefik+provided refusal `from_request` can raise
+    // never fires for this caller.
+    let tls = super::docker_apps::TlsIntent::from_request(
+        body.tls_mode.as_deref(),
+        body.ssl_email.as_deref(),
+        body.tls_certificate.as_deref(),
+        false,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
 
     tracing::info!(
         "Git deploy: {} (image: {}, port: {}→{})",
@@ -310,12 +407,13 @@ async fn deploy_container(
         &state.templates,
         body.memory_mb,
         body.cpu_percent,
-        body.ssl_email.as_deref(),
+        tls,
+        &body.volumes,
     )
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
 
-    Ok(Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "container_id": result.container_id,
         "blue_green": result.blue_green,
         // What was ACTUALLY created, so the caller records a name rather than
@@ -324,7 +422,31 @@ async fn deploy_container(
         // otherwise store the scoped name for a container the agent had created
         // under the old one — a row pointing at nothing.
         "container_name": format!("dockpanel-git-{name}"),
-    })))
+    });
+    // Absent entirely for a blue-green update, which never touched TLS — see
+    // `GitDeployResult::ssl`'s doc comment. Present for anything that did.
+    if let Some(ssl) = result.ssl {
+        response["ssl"] = serde_json::json!(ssl);
+    }
+    if let Some(mode) = result.tls_mode {
+        response["tls_mode"] = serde_json::json!(mode);
+    }
+    if let Some(ref alias) = result.tls_certificate {
+        response["tls_certificate"] = serde_json::json!(alias);
+    }
+    if let Some(ref warning) = result.tls_warning {
+        response["proxy_warning"] = serde_json::json!(warning);
+        // Only a refused REGISTERED certificate is the outage this feature
+        // exists to prevent (an ACME failure can still be ordered later, and
+        // has always been a background warning) — so this flag, which the
+        // panel's own `provided_tls_refusal`-style check keys on, is set only
+        // for that case, mirroring `docker_apps::expose_domain`'s wire shape.
+        if result.tls_mode == Some("provided") {
+            response["tls_refused"] = serde_json::json!(true);
+        }
+    }
+
+    Ok(Json(response))
 }
 
 /// POST /git/keygen — Generate SSH deploy key.
@@ -369,6 +491,22 @@ async fn cleanup(
     .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
 
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /git/release-domain — drop a vhost + certs this deploy no longer holds.
+///
+/// The rename half of `/git/cleanup`. A Git Deploy that changes its domain used
+/// to leave the OLD vhost proxying to the still-running container, with a
+/// certificate that kept renewing, while the panel released the name for anyone
+/// else to claim. Same ownership gate as the delete path, for the same reason.
+async fn release_domain(
+    Json(body): Json<ReleaseDomainRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if body.domain.is_empty() || !is_safe_nginx_domain(&body.domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    git_build::release_domain_artifacts(&body.domain, body.host_port).await;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -510,63 +648,33 @@ async fn run_hook(Json(body): Json<HookRequest>) -> Result<Json<serde_json::Valu
 }
 
 #[derive(Deserialize)]
-struct PreBuildHookRequest {
-    name: String,
-    command: String,
-}
-
-/// POST /git/pre-build-hook — Run a whitelisted command on the host in the git repo directory.
-async fn pre_build_hook(Json(body): Json<PreBuildHookRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
-    if !super::is_valid_name(&body.name) { return Err(err(StatusCode::BAD_REQUEST, "Invalid name")); }
-    if body.command.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "Empty command")); }
-
-    // Only allow whitelisted commands — arbitrary shell execution is not permitted.
-    if !ALLOWED_PRE_BUILD.contains(&body.command.as_str()) {
-        return Err(err(StatusCode::BAD_REQUEST, "Command not allowed. Permitted commands: npm install, npm ci, yarn install, pnpm install, composer install, bundle install, pip install -r requirements.txt, pip3 install -r requirements.txt, cargo build --release"));
-    }
-
-    let git_dir = format!("/var/lib/dockpanel/git/{}", body.name);
-    if !std::path::Path::new(&git_dir).exists() {
-        return Err(err(StatusCode::NOT_FOUND, "Git repo not found"));
-    }
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        safe_command("sh")
-            .args(["-c", &body.command])
-            .current_dir(&git_dir)
-            .env("HOME", &git_dir)
-            .env("NODE_ENV", "production")
-            .output()
-    ).await
-        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Hook timed out (300s)"))?
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-    let truncated = if combined.len() > 50_000 { format!("{}...\n[truncated]", &combined[..50_000]) } else { combined };
-
-    Ok(Json(serde_json::json!({
-        "success": output.status.success(),
-        "output": truncated,
-    })))
-}
-
-#[derive(Deserialize)]
 struct AutoDetectRequest {
     name: String,
     #[serde(default = "default_dockerfile")]
     dockerfile: String,
     #[serde(default = "default_context")]
     build_context: String,
+    /// Whitelisted install command to fold into the auto-generated Dockerfile's
+    /// RUN line. Replaces the removed /git/pre-build-hook host-exec route —
+    /// this is the only place ALLOWED_PRE_BUILD content still reaches this
+    /// crate, and it never touches a host shell: it only ever becomes text
+    /// written into a Dockerfile that `docker build` later executes.
+    #[serde(default)]
+    pre_build_cmd: Option<String>,
 }
 
-/// POST /git/auto-detect — Auto-detect language and generate Dockerfile if missing.
+/// POST /git/auto-detect — Auto-detect language and generate Dockerfile if missing,
+/// optionally splicing a whitelisted install command into it as a RUN line.
 async fn auto_detect(Json(body): Json<AutoDetectRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
     if !super::is_valid_name(&body.name) { return Err(err(StatusCode::BAD_REQUEST, "Invalid name")); }
     if !is_valid_build_context(&body.build_context) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid build_context path"));
+    }
+    let pre_build_cmd = body.pre_build_cmd.as_deref().filter(|c| !c.trim().is_empty());
+    if let Some(cmd) = pre_build_cmd {
+        if !ALLOWED_PRE_BUILD.contains(&cmd) {
+            return Err(err(StatusCode::BAD_REQUEST, "Command not allowed. Permitted commands: npm install, npm ci, yarn install, pnpm install, composer install, bundle install, pip install -r requirements.txt, pip3 install -r requirements.txt, cargo build --release"));
+        }
     }
 
     // Check if the original Dockerfile exists before calling auto-detect
@@ -574,8 +682,9 @@ async fn auto_detect(Json(body): Json<AutoDetectRequest>) -> Result<Json<serde_j
     let context_dir = if body.build_context == "." { deploy_dir.clone() } else { format!("{deploy_dir}/{}", body.build_context) };
     let original_exists = std::path::Path::new(&context_dir).join(&body.dockerfile).exists();
 
-    let dockerfile = git_build::auto_generate_dockerfile(&body.name, &body.dockerfile, &body.build_context)
-        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    let (dockerfile, pre_build_applied, pre_build_note) = git_build::auto_generate_dockerfile(
+        &body.name, &body.dockerfile, &body.build_context, pre_build_cmd,
+    ).map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
 
     // auto_generated is true only if the original didn't exist (meaning the function created one)
     let auto_generated = !original_exists;
@@ -583,6 +692,8 @@ async fn auto_detect(Json(body): Json<AutoDetectRequest>) -> Result<Json<serde_j
     Ok(Json(serde_json::json!({
         "dockerfile": dockerfile,
         "auto_generated": auto_generated,
+        "pre_build_applied": pre_build_applied,
+        "pre_build_note": pre_build_note,
     })))
 }
 
@@ -660,13 +771,13 @@ pub fn router() -> Router<AppState> {
         .route("/git/deploy", post(deploy_container))
         .route("/git/keygen", post(keygen))
         .route("/git/cleanup", post(cleanup))
+        .route("/git/release-domain", post(release_domain))
         .route("/git/prune", post(prune))
         .route("/git/stop", post(stop_container))
         .route("/git/start", post(start_container))
         .route("/git/restart", post(restart_container))
         .route("/git/logs", post(container_logs))
         .route("/git/hook", post(run_hook))
-        .route("/git/pre-build-hook", post(pre_build_hook))
         .route("/git/auto-detect", post(auto_detect))
         .route("/git/compose-check", post(compose_check))
         .route("/git/nixpacks-build", post(nixpacks_build_handler))
@@ -674,7 +785,43 @@ pub fn router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_nginx_domain;
+    use super::{is_safe_nginx_domain, is_valid_volume_path, validate_volumes};
+
+    #[test]
+    fn volume_path_rejects_traversal_and_free_form_hosts() {
+        // `..` must be rejected before `create_dir_all` ever sees it — that call
+        // walks path components using the OS's own resolution and can create a
+        // directory outside GIT_DATA_DIR before canonicalize's prefix check runs.
+        for p in [
+            "../etc/passwd",
+            "/data/../../etc",
+            "data",     // not absolute
+            "/",        // the root itself
+            "",
+            "//data",   // empty segment
+            "/data;rm", // outside the allowed charset
+        ] {
+            assert!(!is_valid_volume_path(p), "{p:?} must be rejected");
+        }
+        let too_long = format!("/{}", "a".repeat(200));
+        assert!(!is_valid_volume_path(&too_long), "a 200+ char path must be rejected");
+    }
+
+    #[test]
+    fn volume_path_allows_ordinary_container_paths() {
+        for p in ["/data", "/app/uploads", "/var/lib/app-data", "/a"] {
+            assert!(is_valid_volume_path(p), "{p:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn validate_volumes_rejects_duplicates_and_the_over_limit_case() {
+        assert!(validate_volumes(&["/data".to_string(), "/data".to_string()]).is_err());
+        let too_many: Vec<String> = (0..11).map(|i| format!("/d{i}")).collect();
+        assert!(validate_volumes(&too_many).is_err());
+        assert!(validate_volumes(&["/data".to_string(), "/uploads".to_string()]).is_ok());
+        assert!(validate_volumes(&[]).is_ok());
+    }
 
     #[test]
     fn safe_nginx_domain_blocks_injection_and_traversal() {

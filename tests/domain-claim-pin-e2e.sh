@@ -79,6 +79,15 @@ subj() { local t; t=$(code "$1"); [ -n "$t" ] || return 1; printf '%s' "$t"; }
 has()   { grep -qE -- "$2" <<< "$1"; }
 count() { grep -cE -- "$2" <<< "$1" || true; }
 
+# Counts OCCURRENCES, not lines — and comments are stripped first, because a pin
+# greps raw source and would otherwise match the sentence describing the check.
+#
+# `count()` above is `grep -c`, which counts matching LINES. Any arm asking "how
+# many of X" is therefore wrong by default, because the natural way to write the
+# regression puts both variants on ONE line (`a == x || a == y`) and the line
+# count stays 1. Measured SURVIVING at s347 (#420) — this is not hypothetical.
+occurrences() { grep -oE -- "$2" <<< "$(sed 's://.*::' <<< "$1")" | wc -l; }
+
 # Only DEAD-CODE markers belong here. An earlier suite also forbade `let _ =` and
 # `return false;` and immediately reded three arms on code verified by hand
 # minutes earlier — both are ordinary Rust (lesson #133). A guard added to make a
@@ -158,15 +167,36 @@ if S=$(subj "$CLAIM"); then
   else
     bad "a Docker app is no longer reported as an occupant"
   fi
-  # FAILS CLOSED. `unwrap_or_default()` here would turn an unreachable agent into
-  # "no apps own this domain" — a guard that cannot see is the whole bug.
-  if has "$O" 'get\("/apps"\)[^;]*\.await[^;]*\n?[[:space:]]*\.map_err' \
-     || derives "$O" 'map_err\(\|e\| agent_error'; then
-    ok "an unreachable agent fails the claim rather than allowing it"
+  # FLEET-WIDE. This arm used to pin the opposite property — that ONE agent was
+  # asked and that an unreachable one failed the claim closed. Both halves were
+  # correct for a single handle and both were replaced at s322, so the arm was
+  # rewritten rather than deleted: the three SQL legs above are fleet-wide, an
+  # app's domain is invisible to SQL, and asking only the caller's host meant a
+  # domain held by an app on host B passed a claim made on host A.
+  if derives "$O" 'online_fleet\('; then
+    ok "the Docker-app leg asks every online member, like the SQL legs above it"
   else
-    bad "the Docker-app leg no longer fails closed"
+    bad "the Docker-app leg is back to asking a single host — a domain held by an app on another member passes"
   fi
-  if has "$O" 'get\("/apps"\).*unwrap_or'; then
+  # A member that will not answer is REPORTED, never silently skipped. Failing
+  # closed across a whole fleet would let one sick box block every domain claim
+  # everywhere, so the trade is deliberate — but it must be audible, because
+  # failing open in silence is what produced the bug in the first place.
+  # Flattened: `has` is line-based grep, and the match spans the `Err(e) => {`
+  # newline. An arm that can never match is an arm that reports on nothing.
+  if has "$(tr '\n' ' ' <<< "$O")" 'Err\(e\)[^}]*tracing::warn!'; then
+    ok "a member that cannot be asked is logged by name rather than treated as free"
+  else
+    bad "the Docker-app leg skips an unreachable member without saying so — that is failing open in silence"
+  fi
+  # FLATTENED (#383). rustfmt breaks this chain at every `.`, so `get("/apps")`
+  # and the `unwrap_or` that swallows its error land on different lines and a
+  # line-oriented grep sees NEITHER — an ABSENCE arm that cannot match reports
+  # "clean" about code it cannot see. The gap is BOUNDED to one statement
+  # (`[^;]`), never `.*`: flattening widens matching, and a widened absence arm
+  # must still not be able to leap a statement boundary.
+  OFLAT=$(tr '\n' ' ' <<< "$O" | tr -s ' ')
+  if has "$OFLAT" 'get\( *"/apps" *\)[^;]{0,160}unwrap_or'; then
     bad "the Docker-app leg swallows agent errors (fails OPEN)"
   else
     ok "the Docker-app leg does not swallow agent errors"
@@ -454,6 +484,190 @@ if S=$(subj "$APPS_BE"); then
     ok "the app deploy settles its domain claim before spawning (and before DNS)"
   else
     bad "the app deploy's domain claim no longer precedes the spawned side effects"
+  fi
+fi
+
+echo
+echo "== §F  the client gate lives at the choke point, and no caller can fake it =="
+
+# s312 / GitHub #51. A `client` holds sites and may not bring a NEW domain into
+# service. The gate is one check inside ensure_claimable rather than a role check
+# at each creating handler, for the reason this whole file exists: git_deploys,
+# docker_apps and stacks all materialise a served vhost WITHOUT inserting into
+# `sites`, so gates bolted onto the four `INSERT INTO sites` sites would have left
+# three doors open. These arms pin the choke point, not the spelling.
+if S=$(subj "$CLAIM"); then
+  B=$(fnbody "$S" ensure_claimable)
+  if [ -z "$B" ]; then
+    bad "§F: could not extract ensure_claimable — the arms are not measuring anything"
+  else
+    if derives "$B" 'may_claim_new'; then
+      ok "the shared guard consults the claim-permission rule"
+    else
+      bad "the shared guard no longer consults the claim-permission rule"
+    fi
+    # Ordering: refusing AFTER the occupancy lookup would let a client probe which
+    # domains are free by reading which error comes back.
+    g=$(grep -nE 'may_claim_new' <<< "$B" | head -1 | cut -d: -f1)
+    o=$(grep -nE 'find_occupant' <<< "$B" | head -1 | cut -d: -f1)
+    if [ -n "$g" ] && [ -n "$o" ] && [ "$g" -lt "$o" ]; then
+      ok "the permission check precedes the occupancy lookup"
+    else
+      bad "a refused claimant still learns whether the domain was free"
+    fi
+  fi
+
+  R=$(fnbody "$S" may_claim_new)
+  if [ -z "$R" ]; then
+    bad "§F: could not extract may_claim_new"
+  elif derives "$R" 'Holder::New'; then
+    ok "the rule is keyed on the NEW-domain transition, not on a resource kind"
+  else
+    bad "the rule stopped keying on Holder::New — a rename may now be refused, or a create allowed"
+  fi
+fi
+
+# The arm that matters most. Every call site must pass a role it READ from the
+# request; a literal makes the gate vacuous while leaving every other arm green.
+# Flattened, because these calls are formatted across many lines.
+BYPASS=0
+for f in "$SITES" "$STAGING" "$MIG" "$GITDEP" "$APPS_BE" panel/backend/src/routes/stacks.rs; do
+  S=$(subj "$f") || continue
+  F=$(tr '\n' ' ' <<< "$S")
+  # A string literal in the role position of a call to the guard.
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    BYPASS=$((BYPASS+1))
+    bad "$(basename "$f") passes a hardcoded role to the guard: $hit"
+  done < <(grep -oE 'ensure_claimable\([^;]*"(admin|reseller|user|client)"[^;]*\)' <<< "$F")
+done
+[ "$BYPASS" -eq 0 ] && ok "no claim path hardcodes the role the gate reads"
+
+# And the rule must actually be reachable from a real role value: the string the
+# gate compares against has to be the same one the database CHECK permits.
+MIGR=$(ls panel/backend/migrations/*client_role.sql 2>/dev/null | head -1)
+if [ -n "$MIGR" ] && [ -f "$MIGR" ]; then
+  if grep -qE "CHECK \(role IN \(.*'client'.*\)\)" "$MIGR"; then
+    ok "the database permits the role value the gate refuses on"
+  else
+    bad "the migration does not admit 'client' — the gate can never fire"
+  fi
+else
+  bad "no client-role migration found — the gate refuses a value no account can hold"
+fi
+
+echo "== §G  a mail domain is a domain HOLDER, and only an admin may claim over it =="
+
+# s347 / GitHub #106. Client-scoped mail matches `mail_domains.domain` against the
+# domain of a site the caller owns — which makes `sites.domain` an authorisation
+# key, and that column is writable by the very account being authorised. Before
+# this, the occupancy oracle asked sites, git deploys, stacks and each agent's
+# apps, and never asked about mail: so a non-admin could point a site they already
+# owned at a name whose mailboxes existed and mint their own access to them. The
+# collision had no nginx symptom, which is why it survived — a mail-only domain
+# has no vhost to overwrite.
+
+if S=$(subj "$CLAIM"); then
+  B=$(fnbody "$S" find_occupant)
+  if [ -z "$B" ]; then
+    bad "§G: could not extract find_occupant"
+  else
+    if derives "$B" 'mail_domains'; then
+      ok "the occupancy oracle asks whether a mail domain holds the name"
+    else
+      bad "find_occupant no longer asks about mail domains — a non-admin can claim a name whose mailboxes exist"
+    fi
+
+    # Ordering is load-bearing, not cosmetic. `ensure_claimable` TOLERATES this
+    # occupant for an administrator, so a mail domain reported IN PLACE OF a vhost
+    # holder would let an admin claim over a live site, git deploy, stack or app.
+    # Asking last makes that impossible by construction.
+    m=$(grep -nE 'mail_domains' <<< "$B" | head -1 | cut -d: -f1)
+    a=$(grep -nE '"/apps"' <<< "$B" | head -1 | cut -d: -f1)
+    if [ -n "$m" ] && [ -n "$a" ] && [ "$m" -gt "$a" ]; then
+      ok "the mail question is asked LAST, after every holder that must always refuse"
+    else
+      bad "the mail leg no longer runs last — a tolerated occupant can now mask a vhost collision"
+    fi
+
+    # Fleet-wide and case-folded, like the three SQL legs above it. A server term
+    # here would let the same name be claimed on a second host while its mailboxes
+    # live on the first.
+    q=$(grep -oE 'SELECT id FROM mail_domains[^"]*' <<< "$B" | head -1)
+    if [ -n "$q" ] && ! grep -qE 'server_id' <<< "$q"; then
+      ok "the mail leg is fleet-wide, matching the sites/git/stack legs"
+    else
+      bad "the mail leg grew a server term — a name can be claimed on one host while its mail lives on another"
+    fi
+    if [ -n "$q" ] && grep -qE 'lower\(domain\)' <<< "$q"; then
+      ok "the mail leg folds case rather than trusting the writer's convention"
+    else
+      bad "the mail comparison is case-sensitive — EXAMPLE.com walks past a row holding example.com"
+    fi
+  fi
+
+  E=$(fnbody "$S" ensure_claimable)
+  if [ -z "$E" ]; then
+    bad "§G: could not extract ensure_claimable"
+  else
+    if derives "$E" 'may_claim_mail_held'; then
+      ok "the guard consults the mail-claim rule before tolerating an occupant"
+    else
+      bad "the guard stopped consulting the mail-claim rule — either every claim is refused, or every claim is allowed"
+    fi
+    # The tolerance must name exactly ONE variant. Folding a second occupant into
+    # that branch would let an administrator claim over a live vhost, and it would
+    # look like a one-word change.
+    #
+    # ⚠ OCCURRENCES, not lines. The shared `count` is `grep -c`, which counts
+    # matching LINES — and the natural way to write this regression puts the
+    # second variant on the SAME line (`!= A && != B`), so a line count reports
+    # one and the arm passes. Measured: that mutation SURVIVED this arm until it
+    # was rewritten to count occurrences. `wc -l` on `grep -o` output is safe
+    # under pipefail — wc consumes all input, so there is no SIGPIPE (unlike a
+    # pipe into `grep -q`).
+    n=$(grep -oE 'Occupant::' <<< "$E" | wc -l)
+    if [ "$n" -eq 1 ]; then
+      ok "exactly one occupant is tolerated, and it is named explicitly"
+    else
+      bad "the tolerance branch names $n occupants — it must name only the mail one"
+    fi
+    if derives "$E" 'Occupant::MailDomain'; then
+      ok "the tolerated occupant is the mail domain"
+    else
+      bad "the tolerance is no longer keyed on the mail occupant"
+    fi
+  fi
+
+  # Fails CLOSED, unlike its sibling. `may_claim_new` returns true for a role it
+  # does not recognise, so drift merely un-restricts. This one must return false,
+  # so drift refuses — an unknown role string must never be able to take a mailbox.
+  #
+  # ⚠ s348: this arm USED TO BE A FALSE GREEN, and it was measured as one. It
+  # asked only whether the body `derives` the administrator comparison — a
+  # PRESENCE test. The regression that matters here does not REMOVE that
+  # comparison, it ADDS one beside it, so `role == "admin" || role == "client"`
+  # still contained the string the arm looked for and the suite printed 60/60
+  # green while the gate admitted clients. A presence test cannot see a widening;
+  # only a count can. So the arm now asserts BOTH halves of the sentence it has
+  # always claimed to make: the administrator is admitted, and NOTHING else is.
+  G=$(fnbody "$S" may_claim_mail_held)
+  if [ -z "$G" ]; then
+    bad "§G: could not extract may_claim_mail_held"
+  elif ! derives "$G" 'role == "admin"'; then
+    bad "the mail gate stopped failing closed — a role it does not recognise may now claim a name whose mailboxes exist"
+  elif [ "$(occurrences "$G" 'role[[:space:]]*==')" -ne 1 ]; then
+    bad "the mail gate compares the role more than once — a second admitted role would hand a name whose mailboxes exist to a non-administrator, which is the escalation this gate exists to refuse"
+  else
+    ok "the mail gate admits the administrator role and NOTHING else — exactly one role comparison"
+  fi
+
+  # The refusal has to say WHAT holds the name. "In use" with no owner is the
+  # sentence this whole module was written to stop printing.
+  if derives "$S" 'Occupant::MailDomain =>'; then
+    ok "the mail occupant carries a message of its own"
+  else
+    bad "the mail occupant has no message — the refusal cannot name what holds the domain"
   fi
 fi
 

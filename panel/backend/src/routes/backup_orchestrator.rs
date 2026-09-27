@@ -110,11 +110,16 @@ pub struct DatabaseBackup {
     pub db_type: String,
     pub db_name: String,
     pub encrypted: bool,
+    /// Which `derive_backup_encryption_key_for_version` derivation actually
+    /// produced this file's passphrase — restore MUST use this, not
+    /// `CURRENT_BACKUP_KEY_VERSION`, or a backup written under an older
+    /// derivation becomes permanently unrestorable the moment the
+    /// derivation changes again.
+    pub encryption_key_version: i16,
     pub uploaded: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub sha256_hash: Option<String>,
     pub previous_hash: Option<String>,
-    pub chain_valid: Option<bool>,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -131,7 +136,6 @@ pub struct VolumeBackup {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub sha256_hash: Option<String>,
     pub previous_hash: Option<String>,
-    pub chain_valid: Option<bool>,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -262,12 +266,22 @@ pub struct ServerSla {
 
 /// GET /api/backup-orchestrator/all — Unified fleet-wide backup list across site, database, and volume backups.
 ///
-/// Admin-only, paginated. Optional filters: `kind` (site|database|volume) and `server_id`.
+/// Scoped, not truly fleet-wide despite the name: an admin sees the local server plus any
+/// server THEY registered, same predicate `list_volume_backups`/`chain_report` use (v2.184.0
+/// / this session). Before this fix `AdminUser` alone gated it — a flat, unscoped CTE handing
+/// every admin account the backup ids and resource names (site domains, db/container:volume
+/// names, filenames, sizes) of the ENTIRE fleet, including servers another admin registered.
+/// That id was also the exact discovery channel a caller needed to walk into the (now also
+/// fixed) unscoped chain-report endpoints.
+///
+/// Optional filters: `kind` (site|database|volume) and `server_id`.
 /// Site backups derive their server via `sites.server_id`; database and volume backups carry
-/// `server_id` directly (nullable — NULL is joined to the unique local server row).
+/// `server_id` directly (nullable — a NULL row predates the fleet backfill and is treated as
+/// local, matching the COALESCE default below; it is visible to every admin the same as any
+/// other local-server row, never scoped away).
 pub async fn list_all_backups(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
     Query(params): Query<UnifiedBackupsQuery>,
 ) -> Result<Json<UnifiedBackupsResponse>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
@@ -314,6 +328,7 @@ pub async fn list_all_backups(
            FROM unified u LEFT JOIN servers srv ON srv.id = u.server_id \
           WHERE ($1::uuid IS NULL OR u.server_id = $1) \
             AND ($2::text IS NULL OR u.kind = $2) \
+            AND (u.server_id IS NULL OR srv.is_local OR srv.user_id = $5) \
           ORDER BY u.created_at DESC LIMIT $3 OFFSET $4"
     );
 
@@ -322,19 +337,23 @@ pub async fn list_all_backups(
         .bind(&kind_filter)
         .bind(limit)
         .bind(offset)
+        .bind(claims.sub)
         .fetch_all(&state.db)
         .await
         .map_err(|e| internal_error("list all backups", e))?;
 
     let count_sql = format!(
-        "{cte} SELECT COUNT(*)::bigint FROM unified u \
+        "{cte} SELECT COUNT(*)::bigint FROM unified u LEFT JOIN servers srv ON srv.id = u.server_id \
           WHERE ($1::uuid IS NULL OR u.server_id = $1) \
-            AND ($2::text IS NULL OR u.kind = $2)"
+            AND ($2::text IS NULL OR u.kind = $2) \
+            AND (u.server_id IS NULL OR srv.is_local OR srv.user_id = $3) \
+          "
     );
 
     let (total,): (i64,) = sqlx::query_as(&count_sql)
         .bind(params.server_id)
         .bind(&kind_filter)
+        .bind(claims.sub)
         .fetch_one(&state.db)
         .await
         .map_err(|e| internal_error("list all backups count", e))?;
@@ -435,6 +454,12 @@ pub async fn health(
 
     // Find stale sites (no backup in > 7 days)
     //
+    // The join admits only archives that landed where they were meant to. An
+    // upload that exhausted its retries still writes a row — that row is what
+    // makes the local file reapable — but it is not off-site, so counting it as
+    // a fresh backup would quietly disarm this list for exactly the site whose
+    // destination is down.
+    //
     // `last_backup` is Option because the HAVING clause deliberately admits sites
     // that have NEVER been backed up — those are the ones that matter most — and
     // a LEFT JOIN miss makes MAX() NULL. Decoding that into a bare DateTime made
@@ -444,6 +469,7 @@ pub async fn health(
     let stale_sites: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
         "SELECT s.domain, MAX(b.created_at) as last_backup \
          FROM sites s LEFT JOIN backups b ON b.site_id = s.id \
+                                        AND (b.destination_id IS NULL OR b.uploaded) \
          GROUP BY s.id, s.domain \
          HAVING MAX(b.created_at) IS NULL OR MAX(b.created_at) < NOW() - INTERVAL '7 days' \
          ORDER BY MAX(b.created_at) NULLS FIRST LIMIT 10"
@@ -705,7 +731,7 @@ pub async fn create_policy(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "backup_policy.create",
-        Some("backup_policy"), Some(&req.name), None, None,
+        Some("backup_policy"), Some(&req.name), None, None, claims.key_id,
     ).await;
 
     fire_event(&state.db, "backup_policy.created", serde_json::json!({
@@ -848,7 +874,7 @@ pub async fn protect_all(
 
     activity::log_activity(
         db, claims.sub, &claims.email, "backup_policy.protect_all",
-        Some("backup_policy"), Some(policy_name), None, None,
+        Some("backup_policy"), Some(policy_name), None, None, claims.key_id,
     ).await;
 
     fire_event(db, "backup_policy.created", serde_json::json!({
@@ -878,7 +904,6 @@ pub struct CreateDbBackupRequest {
 pub async fn create_db_backup(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Json(req): Json<CreateDbBackupRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Fetch database details (join with sites for user ownership and server_id)
@@ -893,6 +918,30 @@ pub async fn create_db_backup(
 
     let (db_id, db_name, engine, user, password_enc, server_id) =
         row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
+
+    // Dump on the host the SITE lives on. This handler already held the answer: the
+    // join above reads `s.server_id` and the INSERT below stamps the new row with it,
+    // while the dump itself went to whatever agent the caller's server switcher named
+    // (an HTTP header with a local-agent fallback). So the archive was written on host
+    // A and the row claimed host B — a guaranteed lie the moment the two disagree, and
+    // three consumers read that column to decide where to act: the verifier
+    // (`services/backup_verifier.rs`) looks for the file on the named host, the drill
+    // scheduler (`services/drill_scheduler.rs`) restores from it there, and the
+    // retention pruner in `services/auto_healer.rs` only unlinks a path on the host the
+    // row names — so a mislabelled archive is never verified, never drilled, and never
+    // pruned, and it grows on a machine nothing is watching.
+    //
+    // The credential is the sharper half: the body below carries this database's
+    // DECRYPTED password, so a stale server selection decided which machine received a
+    // secret it has no business holding. Resolving before the decrypt keeps a refusal
+    // from ever unwrapping it.
+    //
+    // `backup_policy_executor` runs this exact dump from the same join and has always
+    // resolved `agents.for_server(s.server_id)` for it. The scheduled path was right and
+    // the operator-pressed button never adopted it — that asymmetry is the whole defect.
+    let agent = crate::helpers::agent_for_site_server(
+        &state, server_id, &format!("database {db_name}"),
+    ).await?;
 
     // Decrypt the database password (handles both encrypted and legacy plaintext)
     let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(&password_enc, &state.config.jwt_secret);
@@ -927,9 +976,9 @@ pub async fn create_db_backup(
 
     // v2.8.2: integrity chain — same pattern as routes/backups.rs for site backups.
     let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let previous_hash: Option<String> = sqlx::query_scalar(
+    let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT sha256_hash FROM database_backups WHERE database_id = $1 ORDER BY created_at DESC LIMIT 1"
-    ).bind(db_id).fetch_optional(&state.db).await.unwrap_or(None);
+    ).bind(db_id).fetch_optional(&state.db).await.unwrap_or(None).flatten();
 
     let backup: DatabaseBackup = sqlx::query_as(
         "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, sha256_hash, previous_hash, chain_valid) \
@@ -944,7 +993,7 @@ pub async fn create_db_backup(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "db_backup.create",
-        Some("database"), Some(&db_name), Some(&filename), None,
+        Some("database"), Some(&db_name), Some(&filename), None, claims.key_id,
     ).await;
 
     fire_event(&state.db, "db_backup.created", serde_json::json!({
@@ -983,7 +1032,6 @@ pub async fn list_db_backups(
 pub async fn delete_db_backup(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backup: Option<DatabaseBackup> = sqlx::query_as(
@@ -1002,6 +1050,19 @@ pub async fn delete_db_backup(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid backup filename"));
     }
 
+    // Unlink the archive on the host that HOLDS it, which is the host its own row
+    // names — not the one the caller's server switcher happened to be pointing at.
+    // The `SELECT db.*` above already loaded `server_id`; only the dispatch ignored it.
+    // Deleting through the caller's scope asked some other machine to unlink a path it
+    // never had, and the DELETE below then ran regardless: the real archive survived
+    // with its only record destroyed, invisible to the retention pruner that would
+    // eventually have reclaimed it. Where the same dump name exists on both hosts —
+    // policy-driven dumps are named per database, so it does — the wrong machine's
+    // backup was destroyed instead.
+    let agent = crate::helpers::agent_for_site_server(
+        &state, backup.server_id, &format!("database {}", backup.db_name),
+    ).await?;
+
     // Delete from agent
     let agent_path = format!("/db-backups/{}/{}", backup.db_name, backup.filename);
     agent.delete(&agent_path).await
@@ -1018,8 +1079,8 @@ pub async fn delete_db_backup(
 pub async fn restore_db_backup(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Look up the backup record, verify ownership
     let backup: Option<DatabaseBackup> = sqlx::query_as(
@@ -1032,6 +1093,21 @@ pub async fn restore_db_backup(
     .map_err(|e| internal_error("restore db backup", e))?;
 
     let backup = backup.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+
+    // One host governs BOTH directions here, and it is the archive's: the agent reads
+    // the dump off its own disk and pipes it into its own `dockpanel-db-{name}`
+    // container, so source and destination are the same machine by construction. That
+    // is precisely why taking it from the caller's scope was destructive rather than
+    // merely wrong — a container of that name answers on every host that runs this
+    // database, and the name is unique only per site. The caller's machine would find
+    // a container, find a dump beside it, and overwrite a live database the operator
+    // was not even looking at, then report success. Pinning to `backup.server_id`
+    // instead means a restore either lands on the machine the dump came from or is
+    // refused; if that host has since stopped running the container, the agent fails
+    // loudly, which is the direction that can be recovered from.
+    let agent = crate::helpers::agent_for_site_server(
+        &state, backup.server_id, &format!("database {}", backup.db_name),
+    ).await?;
 
     // Fetch database credentials (join with sites for user/password)
     let creds: Option<(String, String, String)> = sqlx::query_as(
@@ -1053,9 +1129,21 @@ pub async fn restore_db_backup(
     // backup_policy_executor with a key derived from the process JWT secret; the restore MUST
     // use the SAME derivation. The previous code read backup_destinations.encryption_key — a
     // column nothing ever writes — so every encrypted-backup restore 400'd and DR was silently
-    // broken in encrypted mode (lesson #70). Use the shared single-source-of-truth derivation.
+    // broken in encrypted mode (lesson #70).
+    //
+    // ⚠ s434: uses the row's OWN `encryption_key_version`, not
+    // `derive_backup_encryption_key` (== always-current). The derivation
+    // changed once already (a leaky v1 → a safe v2, see
+    // `secrets_crypto::derive_backup_encryption_key_v2`'s doc), and a backup
+    // written under v1 stays restorable only if restore reproduces v1 for
+    // THAT row specifically — reading `CURRENT_BACKUP_KEY_VERSION` here would
+    // silently derive the WRONG passphrase for every backup older than
+    // whatever the derivation happens to be today.
     let encryption_key: Option<String> = if backup.encrypted {
-        Some(crate::services::backup_policy_executor::derive_backup_encryption_key(&state.config.jwt_secret))
+        Some(crate::services::backup_policy_executor::derive_backup_encryption_key_for_version(
+            backup.encryption_key_version,
+            &state.config.jwt_secret,
+        ))
     } else {
         None
     };
@@ -1078,12 +1166,36 @@ pub async fn restore_db_backup(
     }
 
     let agent_path = format!("/db-backups/{}/restore/{}", backup.db_name, backup.filename);
-    let result = agent.post(&agent_path, Some(body)).await
+    // `post` and not `post_long` was a 60-second budget on an operation the agent gives
+    // 600 (agent/src/services/database_backup.rs), on both transports — the local client
+    // times out at 60s and the remote reqwest client defaults to the same. Any restore of
+    // a database bigger than a toy therefore reported `agent request timed out after 60s`,
+    // which `agent_error` turns into a bare incident id, WHILE THE RESTORE CARRIED ON
+    // SUCCEEDING inside the container. The operator was told their restore failed, on a
+    // path whose whole purpose is disaster recovery.
+    let result = agent
+        .post_long(&agent_path, Some(body), crate::services::agent::DB_RESTORE_TIMEOUT_SECS)
+        .await
         .map_err(|e| agent_error("Database restore", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "db_backup.restore",
-        Some("database"), Some(&backup.db_name), Some(&backup.filename), None,
+        Some("database"), Some(&backup.db_name), Some(&backup.filename), ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "db_backup.restore",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("database"),
+        Some(&backup.db_name),
+        Some(&backup.filename),
+        None,
+        "info",
+        claims.key_id,
     ).await;
 
     fire_event(&state.db, "db_backup.restored", serde_json::json!({
@@ -1138,9 +1250,9 @@ pub async fn create_volume_backup(
     // v2.8.2: integrity chain. Scope previous_hash by (container_id, volume_name)
     // so re-creating the same logical volume re-chains rather than forking.
     let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let previous_hash: Option<String> = sqlx::query_scalar(
+    let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
         "SELECT sha256_hash FROM volume_backups WHERE container_id = $1 AND volume_name = $2 ORDER BY created_at DESC LIMIT 1"
-    ).bind(&req.container_id).bind(&req.volume_name).fetch_optional(&state.db).await.unwrap_or(None);
+    ).bind(&req.container_id).bind(&req.volume_name).fetch_optional(&state.db).await.unwrap_or(None).flatten();
 
     let backup: VolumeBackup = sqlx::query_as(
         "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid) \
@@ -1155,7 +1267,7 @@ pub async fn create_volume_backup(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "volume_backup.create",
-        Some("volume"), Some(&req.container_name), Some(&filename), None,
+        Some("volume"), Some(&req.container_name), Some(&filename), None, claims.key_id,
     ).await;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({
@@ -1168,15 +1280,26 @@ pub async fn create_volume_backup(
 /// GET /api/backup-orchestrator/volume-backups — List volume backups.
 pub async fn list_volume_backups(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
     Query(params): Query<PaginationQuery>,
 ) -> Result<Json<Vec<VolumeBackup>>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
 
+    // Scoped the same way `restore_volume_backup` below scopes its own lookup:
+    // this machine, or a server this operator added. Before this fix the query
+    // was a flat, unfiltered `SELECT *` — every admin account's volume-backup
+    // metadata (container/volume names, filenames, sizes, hashes, server_id)
+    // was visible to every OTHER admin account, unlike the sibling
+    // `list_db_backups` above, which has always scoped by `s.user_id`. A row
+    // whose `server_id` predates the fleet backfill (NULL) is excluded by the
+    // JOIN rather than shown to nobody-in-particular, matching how the restore
+    // path below refuses it outright.
     let backups: Vec<VolumeBackup> = sqlx::query_as(
-        "SELECT * FROM volume_backups ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        "SELECT vb.* FROM volume_backups vb \
+         JOIN servers sv ON sv.id = vb.server_id AND (sv.is_local OR sv.user_id = $1) \
+         ORDER BY vb.created_at DESC LIMIT $2 OFFSET $3"
     )
-    .bind(limit).bind(offset)
+    .bind(claims.sub).bind(limit).bind(offset)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("list volume backups", e))?;
 
@@ -1187,27 +1310,97 @@ pub async fn list_volume_backups(
 pub async fn restore_volume_backup(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Look up the volume backup record
+    // Look up the volume backup record, scoped to the machines this operator runs.
+    //
+    // The scope has to land in the SAME commit as the body fix below, and that
+    // ordering is the whole point. Until now this route could not succeed at all —
+    // it sent no request body, so the agent's `Json` extractor answered 415 before
+    // any handler ran — and a route that always fails closed hides whatever else is
+    // wrong with it. Fixing only the body would have made an unscoped restore work
+    // for the first time: `volume_backups` has no owner column, only `server_id`,
+    // and the agent is resolved from that row, so any administrator could unpack a
+    // backup over a live volume on a server somebody else registered.
+    //
+    // The predicate is the one `SITE_CALLER_PREDICATE`'s admin arm draws and
+    // `approve_deploy` reuses — this machine, or a server this operator added — and
+    // `u.role` is read from the DATABASE, not from `claims.role`, because a JWT
+    // keeps asserting the role it was minted with until it expires.
+    //
+    // A NULL `server_id` (a row predating the fleet backfill) no longer reaches the
+    // 409 below: it cannot satisfy the scope, so it 404s here. Refusing it earlier
+    // is the same answer for the same reason — there is no safe guess about which
+    // machine's volume to overwrite — and it also stops the id of a backup on
+    // another operator's server from being distinguishable from one that does not.
     let backup: Option<VolumeBackup> = sqlx::query_as(
-        "SELECT * FROM volume_backups WHERE id = $1"
+        "SELECT * FROM volume_backups vb WHERE vb.id = $1 AND EXISTS (\
+             SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+             AND sv.id = vb.server_id AND (sv.is_local OR sv.user_id = u.id))"
     )
     .bind(id)
+    .bind(claims.sub)
     .fetch_optional(&state.db).await
     .map_err(|e| internal_error("restore volume backup", e))?;
 
     let backup = backup.ok_or_else(|| err(StatusCode::NOT_FOUND, "Volume backup not found"))?;
 
-    // Call agent to restore volume
+    // Source and destination are the same host for a volume restore: the agent unpacks
+    // a tar from its own disk straight over its own Docker volume. So `server_id`
+    // governs both ends, and `create_volume_backup` above deliberately records the host
+    // that actually wrote the archive for exactly this reader. Restoring through the
+    // caller's scope did NOT merely fail to find the file — policy-driven volume
+    // archives are named per container and volume, so an identically-named tar sits on
+    // every host running that container, and the caller's machine would happily unpack
+    // ITS OWN archive over ITS OWN live volume: a restore nobody requested, on a server
+    // the operator was not viewing, reported as the success of a different one. A NULL
+    // here is a row written before the fleet backfill; refusing it is correct, because
+    // there is no safe guess about which machine's volume to overwrite.
+    let agent = crate::helpers::agent_for_site_server(
+        &state, backup.server_id, &format!("volume {}", backup.volume_name),
+    ).await?;
+
+    // Call agent to restore volume.
+    //
+    // The body is not optional and never was. `restore` on the agent side takes
+    // `Json<VolumeRestoreRequest>`, whose single field `volume_name` is what tells
+    // it which volume to unpack over; a required `Json` extractor rejects a request
+    // carrying no `content-type` with 415 before the handler runs, and neither
+    // agent transport sets that header when the body is `None`
+    // (`services/agent.rs` sets it only `if body.is_some()`, and the remote twin
+    // only calls `.json()` inside `if let Some(b)`). So every call this route has
+    // ever made was refused in the transport layer — the sibling `restore_db_backup`
+    // passes `Some(body)` and worked, which is the asymmetry that hid it.
+    //
+    // The volume drill cannot catch this: `services/backup_drill.rs` re-implements
+    // the restore rather than calling this path, so a green drill says nothing
+    // about whether the real restore runs.
     let agent_path = format!("/volume-backups/{}/restore/{}", backup.container_name, backup.filename);
-    let result = agent.post(&agent_path, None).await
+    let result = agent.post(
+        &agent_path,
+        Some(serde_json::json!({ "volume_name": backup.volume_name })),
+    ).await
         .map_err(|e| agent_error("Volume restore", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "volume_backup.restore",
-        Some("volume"), Some(&backup.container_name), Some(&backup.filename), None,
+        Some("volume"), Some(&backup.container_name), Some(&backup.filename), ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "volume_backup.restore",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("volume"),
+        Some(&backup.container_name),
+        Some(&backup.filename),
+        None,
+        "info",
+        claims.key_id,
     ).await;
 
     fire_event(&state.db, "volume_backup.restored", serde_json::json!({
@@ -1220,6 +1413,52 @@ pub async fn restore_volume_backup(
 
 // ── Verification ────────────────────────────────────────────────────────────
 
+/// Resolve the host a stored backup actually lives on, from the backup's own row.
+///
+/// Verify and drill are the two endpoints that take nothing but `(backup_type,
+/// backup_id)` — no site, no database, no container — so there was nothing in the
+/// request to pin a host to and both simply used whatever agent `ServerScope` handed
+/// over. That reads one machine's disk looking for another machine's archive. For a
+/// verification the result is a `failed` row that says more about the caller's server
+/// switcher than about the backup, which then feeds the SLA and stale-backup panels as
+/// though the archive were bad. For a drill it is worse: a drill RESTORES.
+///
+/// The lookup is a deliberate extra round-trip taken BEFORE the tracking row is
+/// inserted — the same ordering `services/backup_verifier.rs::verify_one` spells out and
+/// for the same reason: a row written `running` against a host we then decline to reach
+/// is a permanent record of work that never happened, and the sweeper's driving queries
+/// skip any backup that already has one.
+///
+/// Returns the server id beside the handle so the caller can stamp its own row with the
+/// host that did the work. It stays `Option` because these columns are nullable for rows
+/// predating the fleet backfill; by the time this returns, `agent_for_site_server` has
+/// already refused the `None` case, so what gets bound is always `Some`.
+async fn agent_for_backup(
+    state: &AppState,
+    backup_type: &str,
+    backup_id: Uuid,
+) -> Result<(Option<Uuid>, crate::services::agent::AgentHandle), ApiError> {
+    // `backups` carries no server_id of its own — a site backup reaches its host through
+    // the site, the same hop the unified list and the SLA queries above already make.
+    let sql = match backup_type {
+        "site" => "SELECT s.server_id FROM backups b JOIN sites s ON s.id = b.site_id WHERE b.id = $1",
+        "database" => "SELECT server_id FROM database_backups WHERE id = $1",
+        "volume" => "SELECT server_id FROM volume_backups WHERE id = $1",
+        _ => return Err(err(StatusCode::BAD_REQUEST, "Invalid backup type")),
+    };
+
+    let server_id: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(sql)
+        .bind(backup_id)
+        .fetch_optional(&state.db).await
+        .map_err(|e| internal_error("resolve backup host", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+
+    let agent = crate::helpers::agent_for_site_server(
+        state, server_id, &format!("{backup_type} backup {backup_id}"),
+    ).await?;
+    Ok((server_id, agent))
+}
+
 #[derive(serde::Deserialize)]
 pub struct VerifyRequest {
     pub backup_type: String, // site, database, volume
@@ -1230,19 +1469,29 @@ pub struct VerifyRequest {
 pub async fn trigger_verify(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,
-    ServerScope(scope_server_id, agent): ServerScope,
     Json(req): Json<VerifyRequest>,
 ) -> Result<(StatusCode, Json<BackupVerification>), ApiError> {
+    // Read the archive on the host that holds it, resolved from the backup's own row.
+    // The agent used to come from `ServerScope` — and the row below was then stamped
+    // with that same scope, so the record and the work agreed with each other while
+    // both pointed at a machine chosen by a request header. `backup_verifier.rs`, the
+    // scheduled half of this very feature, has always resolved `for_server(server_id)`
+    // from the row; only the operator-pressed button kept reading the switcher.
+    //
+    // This also moves the unsupported-type rejection to a synchronous 400. It used to
+    // be an `Invalid backup type` string produced inside the spawned task, i.e. a 202
+    // followed by a `failed` verification row for a request that was never valid.
+    let (server_id, agent) = agent_for_backup(&state, &req.backup_type, req.backup_id).await?;
+
     // Create pending verification record. `server_id` is bound rather than left
-    // NULL: the verification ran against the agent `ServerScope` resolved, so the
-    // row can say which host actually read the archive. Leaving it NULL is what
+    // NULL: it names the host that actually read the archive. Leaving it NULL is what
     // made this column dead in every writer while the UI still rendered a Server
     // field for it.
     let verification: BackupVerification = sqlx::query_as(
         "INSERT INTO backup_verifications (backup_type, backup_id, server_id, status, started_at) \
          VALUES ($1, $2, $3, 'running', NOW()) RETURNING *"
     )
-    .bind(&req.backup_type).bind(req.backup_id).bind(scope_server_id)
+    .bind(&req.backup_type).bind(req.backup_id).bind(server_id)
     .fetch_one(&state.db).await
     .map_err(|e| internal_error("trigger verify", e))?;
 
@@ -1405,19 +1654,35 @@ pub struct DrillRequest {
 pub async fn trigger_drill(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
     Json(req): Json<DrillRequest>,
 ) -> Result<(StatusCode, Json<BackupDrill>), ApiError> {
     if req.backup_type != "site" && req.backup_type != "database" && req.backup_type != "volume" {
         return Err(err(StatusCode::BAD_REQUEST, "Unsupported backup_type"));
     }
 
-    // Insert pending drill record so the UI gets immediate feedback.
+    // A drill is a real restore, so the host must come from the backup's row and
+    // nowhere else. Driven by `ServerScope` this reached for one machine's archive on
+    // another: with site backups it merely failed, but policy-driven database and volume
+    // archives are named deterministically per resource, so an identically-named file
+    // sits on every host running that resource — and the caller's machine would find it,
+    // restore ITS OWN archive over ITS OWN live data, and report the result under the
+    // server the operator had selected. `drill_scheduler.rs::dispatch_policy_drills`
+    // resolves `for_server(row.server_id)` and refuses rather than substituting, with the
+    // comment that "a drill that runs elsewhere certifies disaster recovery for a machine
+    // it never tested". The scheduled path had it right; this button never adopted it.
+    let (server_id, agent) = agent_for_backup(&state, &req.backup_type, req.backup_id).await?;
+
+    // Insert pending drill record so the UI gets immediate feedback. `server_id` is
+    // bound now that one is known: `drill_scheduler`'s concurrency guard counts running
+    // drills BY SERVER, and a NULL from this handler was invisible to it — an
+    // operator-pressed drill could not hold off the scheduled one, so two restores could
+    // land on the same host at once. It also fills the Server column the drills table
+    // renders, which was blank for every manually triggered row.
     let drill: BackupDrill = sqlx::query_as(
-        "INSERT INTO backup_drills (backup_type, backup_id, triggered_by, status, started_at) \
-         VALUES ($1, $2, $3, 'running', NOW()) RETURNING *"
+        "INSERT INTO backup_drills (backup_type, backup_id, server_id, triggered_by, status, started_at) \
+         VALUES ($1, $2, $3, $4, 'running', NOW()) RETURNING *"
     )
-    .bind(&req.backup_type).bind(req.backup_id).bind(claims.sub)
+    .bind(&req.backup_type).bind(req.backup_id).bind(server_id).bind(claims.sub)
     .fetch_one(&state.db).await
     .map_err(|e| internal_error("trigger drill", e))?;
 
@@ -1426,8 +1691,11 @@ pub async fn trigger_drill(
     let backup_type = req.backup_type.clone();
     let backup_id = req.backup_id;
 
-    // Run drill async — the agent call can take 20-60s (DB drill is slower:
-    // engine container boot + full restore + ANALYZE).
+    // Run drill async. Uses post_long: a plain `post` caps the whole round trip at 60s,
+    // but the agent-side restore this triggers is budgeted 220s (database) to 360s
+    // (volume: 300s restore + 60s probe) — see drill_scheduler.rs's identical fix for the
+    // scheduled path, which this on-demand button shares the same underlying agent
+    // handlers with.
     tokio::spawn(async move {
         let result: Result<serde_json::Value, String> = match backup_type.as_str() {
             "site" => {
@@ -1439,7 +1707,7 @@ pub async fn trigger_drill(
                 match row {
                     Ok(Some((domain, filename))) => {
                         let body = serde_json::json!({ "domain": domain, "filename": filename });
-                        agent.post("/backups/drill/site", Some(body)).await.map_err(|e| e.to_string())
+                        agent.post_long("/backups/drill/site", Some(body), crate::services::agent::DRILL_TIMEOUT_SECS).await.map_err(|e| e.to_string())
                     }
                     Ok(None) => Err("Site backup not found".to_string()),
                     Err(e) => {
@@ -1460,7 +1728,7 @@ pub async fn trigger_drill(
                             "db_name": db_name,
                             "filename": filename,
                         });
-                        agent.post("/backups/drill/db", Some(body)).await.map_err(|e| e.to_string())
+                        agent.post_long("/backups/drill/db", Some(body), crate::services::agent::DRILL_TIMEOUT_SECS).await.map_err(|e| e.to_string())
                     }
                     Ok(None) => Err("Database backup not found".to_string()),
                     Err(e) => {
@@ -1480,7 +1748,7 @@ pub async fn trigger_drill(
                             "container_name": container_name,
                             "filename": filename,
                         });
-                        agent.post("/backups/drill/volume", Some(body)).await.map_err(|e| e.to_string())
+                        agent.post_long("/backups/drill/volume", Some(body), crate::services::agent::DRILL_TIMEOUT_SECS).await.map_err(|e| e.to_string())
                     }
                     Ok(None) => Err("Volume backup not found".to_string()),
                     Err(e) => {
@@ -1570,7 +1838,6 @@ pub struct ChainReportBackup {
     pub size_bytes: i64,
     pub sha256_hash: Option<String>,
     pub previous_hash: Option<String>,
-    pub chain_valid: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     // Kind-specific extras — exactly one set is populated, the others are None.
     pub site_id: Option<Uuid>,
@@ -1606,9 +1873,15 @@ pub struct ChainReportDrill {
     pub error_message: Option<String>,
 }
 
+// No validity verdict here, deliberately. `chain_valid` is written TRUE by every
+// one of its seven INSERTs — five literal, two by column default — is UPDATEd
+// nowhere, and no verifier exists that could ever compute it: `previous_hash` is
+// copied out of the newest row rather than recomputed from the predecessor
+// artifact. A verdict this document cannot evaluate has no business being
+// rendered in it, so the report carries what the panel genuinely recorded and
+// stops there. Re-adding a verdict field means building the verifier first.
 #[derive(serde::Serialize)]
 pub struct ChainIntegrity {
-    pub chain_valid: bool,
     pub verifications_passed: i64,
     pub drills_passed: i64,
 }
@@ -1645,31 +1918,43 @@ async fn build_chain_report(
     state: &AppState,
     kind: &'static str,
     backup_id: Uuid,
+    caller_id: Uuid,
 ) -> Result<ChainReport, ApiError> {
+    // Every branch below joins `servers` and scopes by `sv.is_local OR sv.user_id =
+    // caller_id` — the same predicate `list_volume_backups`/`restore_volume_backup`
+    // already established for this exact fleet (v2.184.0). Before this fix `AdminUser`
+    // alone gated these two handlers, and every query here was a bare `WHERE id = $1`:
+    // any admin could pull another admin's backup provenance (site domain, db/container
+    // names, filenames, full hash chain, every verification and drill) as JSON or PDF —
+    // the same bug `list_all_backups` below carries, just reached through a different
+    // route. A `server_id` predating the fleet backfill (NULL, database/volume only —
+    // `sites.server_id` is NOT NULL) fails closed via the JOIN rather than falling back
+    // to "visible to nobody in particular", matching the established precedent.
     let backup = match kind {
         "site" => {
             let row: Option<(
                 Uuid, Uuid, String, String, i64,
-                Option<String>, Option<String>, Option<bool>,
+                Option<String>, Option<String>,
                 chrono::DateTime<chrono::Utc>,
             )> = sqlx::query_as(
                 "SELECT b.id, b.site_id, s.domain, b.filename, b.size_bytes, \
-                        b.sha256_hash, b.previous_hash, b.chain_valid, b.created_at \
+                        b.sha256_hash, b.previous_hash, b.created_at \
                    FROM backups b JOIN sites s ON s.id = b.site_id \
+                   JOIN servers sv ON sv.id = s.server_id AND (sv.is_local OR sv.user_id = $2) \
                   WHERE b.id = $1"
             )
             .bind(backup_id)
+            .bind(caller_id)
             .fetch_optional(&state.db).await
             .map_err(|e| internal_error("chain report: load site backup", e))?;
 
-            let (id, site_id, resource_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+            let (id, site_id, resource_name, filename, size_bytes, sha256_hash, previous_hash, created_at) =
                 row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
             ChainReportBackup {
                 kind: "site".into(),
                 id, resource_name, filename, size_bytes,
                 sha256_hash, previous_hash,
-                chain_valid: chain_valid.unwrap_or(true),
                 created_at,
                 site_id: Some(site_id),
                 database_id: None, container_id: None, volume_name: None, db_type: None,
@@ -1678,26 +1963,27 @@ async fn build_chain_report(
         "database" => {
             let row: Option<(
                 Uuid, Uuid, String, String, String, i64,
-                Option<String>, Option<String>, Option<bool>,
+                Option<String>, Option<String>,
                 chrono::DateTime<chrono::Utc>,
             )> = sqlx::query_as(
-                "SELECT id, database_id, db_name, db_type, filename, size_bytes, \
-                        sha256_hash, previous_hash, chain_valid, created_at \
-                   FROM database_backups \
-                  WHERE id = $1"
+                "SELECT db.id, db.database_id, db.db_name, db.db_type, db.filename, db.size_bytes, \
+                        db.sha256_hash, db.previous_hash, db.created_at \
+                   FROM database_backups db \
+                   JOIN servers sv ON sv.id = db.server_id AND (sv.is_local OR sv.user_id = $2) \
+                  WHERE db.id = $1"
             )
             .bind(backup_id)
+            .bind(caller_id)
             .fetch_optional(&state.db).await
             .map_err(|e| internal_error("chain report: load database backup", e))?;
 
-            let (id, database_id, resource_name, db_type, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+            let (id, database_id, resource_name, db_type, filename, size_bytes, sha256_hash, previous_hash, created_at) =
                 row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
             ChainReportBackup {
                 kind: "database".into(),
                 id, resource_name, filename, size_bytes,
                 sha256_hash, previous_hash,
-                chain_valid: chain_valid.unwrap_or(true),
                 created_at,
                 site_id: None,
                 database_id: Some(database_id),
@@ -1708,19 +1994,21 @@ async fn build_chain_report(
         "volume" => {
             let row: Option<(
                 Uuid, String, String, String, String, i64,
-                Option<String>, Option<String>, Option<bool>,
+                Option<String>, Option<String>,
                 chrono::DateTime<chrono::Utc>,
             )> = sqlx::query_as(
-                "SELECT id, container_id, container_name, volume_name, filename, size_bytes, \
-                        sha256_hash, previous_hash, chain_valid, created_at \
-                   FROM volume_backups \
-                  WHERE id = $1"
+                "SELECT vb.id, vb.container_id, vb.container_name, vb.volume_name, vb.filename, vb.size_bytes, \
+                        vb.sha256_hash, vb.previous_hash, vb.created_at \
+                   FROM volume_backups vb \
+                   JOIN servers sv ON sv.id = vb.server_id AND (sv.is_local OR sv.user_id = $2) \
+                  WHERE vb.id = $1"
             )
             .bind(backup_id)
+            .bind(caller_id)
             .fetch_optional(&state.db).await
             .map_err(|e| internal_error("chain report: load volume backup", e))?;
 
-            let (id, container_id, container_name, volume_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+            let (id, container_id, container_name, volume_name, filename, size_bytes, sha256_hash, previous_hash, created_at) =
                 row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
             ChainReportBackup {
@@ -1729,7 +2017,6 @@ async fn build_chain_report(
                 resource_name: format!("{container_name}:{volume_name}"),
                 filename, size_bytes,
                 sha256_hash, previous_hash,
-                chain_valid: chain_valid.unwrap_or(true),
                 created_at,
                 site_id: None, database_id: None,
                 container_id: Some(container_id),
@@ -1797,8 +2084,6 @@ async fn build_chain_report(
 
     let verifications_passed = verifications.iter().filter(|v| v.status == "passed").count() as i64;
     let drills_passed = drills.iter().filter(|d| d.status == "passed").count() as i64;
-    let chain_valid = backup.chain_valid;
-
     Ok(ChainReport {
         panel_version: env!("CARGO_PKG_VERSION").to_string(),
         generated_at: chrono::Utc::now(),
@@ -1806,7 +2091,6 @@ async fn build_chain_report(
         verifications,
         drills,
         chain_integrity: ChainIntegrity {
-            chain_valid,
             verifications_passed,
             drills_passed,
         },
@@ -1841,11 +2125,11 @@ fn slug(s: &str) -> String {
 /// verification + every restore drill).
 pub async fn chain_report_json(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
     Path((kind, id)): Path<(String, Uuid)>,
 ) -> Result<Json<ChainReport>, ApiError> {
     let kind = parse_chain_kind(&kind)?;
-    let report = build_chain_report(&state, kind, id).await?;
+    let report = build_chain_report(&state, kind, id, claims.sub).await?;
     Ok(Json(report))
 }
 
@@ -1854,11 +2138,11 @@ pub async fn chain_report_json(
 /// /var/lib/dockpanel/typst (~30MB, one-time). 503 if install/compile fails.
 pub async fn chain_report_pdf(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
     Path((kind, id)): Path<(String, Uuid)>,
 ) -> Result<axum::response::Response, ApiError> {
     let kind = parse_chain_kind(&kind)?;
-    let report = build_chain_report(&state, kind, id).await?;
+    let report = build_chain_report(&state, kind, id, claims.sub).await?;
     let json_value = serde_json::to_value(&report)
         .map_err(|e| internal_error("chain report: serialize", e))?;
 

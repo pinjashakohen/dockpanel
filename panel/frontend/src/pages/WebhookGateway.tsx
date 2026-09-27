@@ -8,6 +8,11 @@ interface Endpoint {
   id: string; name: string; description: string | null; token: string;
   verify_mode: string; enabled: boolean; total_received: number;
   last_received_at: string | null; created_at: string;
+  // Whether the endpoint holds a secret it can actually verify with. The secret
+  // itself is no longer sent to the browser, so this is the only thing the
+  // screen can ask — and it has to ask, because an endpoint stored before the
+  // presence check can name a verification mode it cannot perform.
+  verify_secret_set: boolean;
 }
 
 interface Delivery {
@@ -80,7 +85,16 @@ export default function WebhookGateway() {
     }
   }, [selectedEndpoint]);
 
+  // Picking a verification mode and leaving either field empty is the one
+  // combination the backend refuses, because an endpoint cannot be edited
+  // afterwards — it would have to be deleted and created again. Refusing it here
+  // too means the operator sees it while the form is still open.
+  const verifyHalvesMissing =
+    epForm.verify_mode !== "none" &&
+    (!epForm.verify_secret.trim() || !epForm.verify_header.trim());
+
   const createEndpoint = async () => {
+    if (verifyHalvesMissing) return;
     try {
       await api.post("/webhook-gateway/endpoints", epForm);
       setShowEpForm(false);
@@ -97,6 +111,16 @@ export default function WebhookGateway() {
       await api.delete(`/webhook-gateway/endpoints/${id}`);
       setEndpoints(endpoints.filter(e => e.id !== id));
       if (selectedEndpoint === id) setSelectedEndpoint(null);
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
+    }
+  };
+
+  const toggleEndpoint = async (ep: Endpoint) => {
+    try {
+      await api.put(`/webhook-gateway/endpoints/${ep.id}`, { enabled: !ep.enabled });
+      setEndpoints(endpoints.map(e => e.id === ep.id ? { ...e, enabled: !ep.enabled } : e));
+      setMessage({ text: ep.enabled ? "Endpoint paused — it will refuse inbound deliveries" : "Endpoint resumed", type: "success" });
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
     }
@@ -124,9 +148,31 @@ export default function WebhookGateway() {
     }
   };
 
-  const replayDelivery = async (id: string) => {
+  const toggleRoute = async (r: Route) => {
     try {
-      const r = await api.post<{ replayed_to: number }>(`/webhook-gateway/deliveries/${id}/replay`, {});
+      await api.put(`/webhook-gateway/routes/${r.id}`, { enabled: !r.enabled });
+      setRoutes(routes.map(x => x.id === r.id ? { ...x, enabled: !r.enabled } : x));
+      setMessage({ text: r.enabled ? "Route paused — nothing will be forwarded to it" : "Route resumed", type: "success" });
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
+    }
+  };
+
+  // Replaying a delivery the gateway REFUSED is a real capability — the guide
+  // documents it, and the usual cause is a sender configured with the wrong
+  // secret rather than a forged payload. It is also the one action here that
+  // sends an externally-supplied body onward under the panel's own credentials,
+  // so it asks first instead of firing on the click that sits beside a red
+  // Invalid badge.
+  const replayDelivery = async (d: Delivery) => {
+    if (d.signature_valid === false &&
+        !window.confirm(
+          "This delivery failed signature verification and was never forwarded.\n\n" +
+          "Replaying sends it to this endpoint's matching routes anyway, with their stored headers attached.\n\n" +
+          "Replay it?"
+        )) return;
+    try {
+      const r = await api.post<{ replayed_to: number }>(`/webhook-gateway/deliveries/${d.id}/replay`, {});
       setMessage({ text: `Replayed to ${r.replayed_to} route(s)`, type: "success" });
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
@@ -226,8 +272,17 @@ export default function WebhookGateway() {
                   </div>
                 </div>
               )}
-              <div className="flex justify-end">
-                <button onClick={createEndpoint} className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium font-mono hover:bg-rust-600">Create</button>
+              <div className="flex items-center justify-end gap-3">
+                {verifyHalvesMissing && (
+                  <span className="text-xs text-warn-400 font-mono">
+                    Signature verification needs both a secret and the header carrying it — an endpoint cannot be edited afterwards.
+                  </span>
+                )}
+                <button
+                  onClick={createEndpoint}
+                  disabled={verifyHalvesMissing}
+                  className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium font-mono hover:bg-rust-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                >Create</button>
               </div>
             </div>
           )}
@@ -242,7 +297,7 @@ export default function WebhookGateway() {
               <table className="w-full">
                 <thead>
                   <tr className="bg-dark-900 border-b border-dark-500">
-                    {["Name", "Verification", "Received", "Last", ""].map(h => (
+                    {["Name", "Status", "Verification", "Received", "Last", ""].map(h => (
                       <th key={h} className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3">{h}</th>
                     ))}
                   </tr>
@@ -252,12 +307,39 @@ export default function WebhookGateway() {
                     <tr key={ep.id} className={`hover:bg-dark-700/30 transition-colors cursor-pointer ${selectedEndpoint === ep.id ? "bg-dark-700/20" : ""}`}
                       onClick={() => setSelectedEndpoint(ep.id)}>
                       <td className="px-5 py-4 text-sm text-dark-50 font-mono">{ep.name}</td>
-                      <td className="px-5 py-4 text-xs text-dark-200 font-mono">{ep.verify_mode}</td>
+                      <td className="px-5 py-4 text-xs font-mono">
+                        {ep.enabled
+                          ? <span className="px-2 py-0.5 bg-rust-500/10 text-rust-400 rounded-md">Receiving</span>
+                          : <span className="px-2 py-0.5 bg-dark-600 text-dark-200 rounded-md">Paused</span>}
+                      </td>
+                      <td className="px-5 py-4 text-xs font-mono">
+                        {/* The mode alone used to be the whole cell, so an
+                            endpoint that named a verification mode it could not
+                            perform read exactly like one that could. */}
+                        <span className="text-dark-200">{ep.verify_mode}</span>
+                        {ep.verify_mode !== "none" && !ep.verify_secret_set && (
+                          <span className="ml-2 px-2 py-0.5 bg-danger-500/10 text-danger-400 rounded-md"
+                            title="This endpoint names a verification mode but holds no secret, so it can verify nothing. Deliveries to it are rejected. Delete it and create it again with a secret and a signature header.">
+                            no secret — rejecting
+                          </span>
+                        )}
+                      </td>
                       <td className="px-5 py-4 text-sm text-dark-200 font-mono">{ep.total_received}</td>
                       <td className="px-5 py-4 text-xs text-dark-300 font-mono">{ep.last_received_at ? formatDate(ep.last_received_at) : "Never"}</td>
                       <td className="px-5 py-4">
-                        <button onClick={e => { e.stopPropagation(); deleteEndpoint(ep.id); }}
-                          className="px-3 py-1 bg-danger-500/10 text-danger-400 rounded-md text-xs font-medium font-mono hover:bg-danger-500/20">Delete</button>
+                        <div className="flex gap-2 justify-end">
+                          {/* Shutting the door used to mean Delete, which cascades
+                              away every delivery and route recorded against it. */}
+                          <button onClick={e => { e.stopPropagation(); toggleEndpoint(ep); }}
+                            title={ep.enabled
+                              ? "Stop accepting inbound deliveries. Deliveries already recorded are kept."
+                              : "Start accepting inbound deliveries again."}
+                            className="px-3 py-1 bg-dark-700 text-dark-100 rounded-md text-xs font-medium font-mono hover:bg-dark-600">
+                            {ep.enabled ? "Pause" : "Resume"}
+                          </button>
+                          <button onClick={e => { e.stopPropagation(); deleteEndpoint(ep.id); }}
+                            className="px-3 py-1 bg-danger-500/10 text-danger-400 rounded-md text-xs font-medium font-mono hover:bg-danger-500/20">Delete</button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -332,7 +414,7 @@ export default function WebhookGateway() {
                       </td>
                       <td className="px-4 py-3 text-xs text-dark-300 font-mono">{d.forward_duration_ms ? `${d.forward_duration_ms}ms` : "-"}</td>
                       <td className="px-4 py-3">
-                        <button onClick={e => { e.stopPropagation(); replayDelivery(d.id); }}
+                        <button onClick={e => { e.stopPropagation(); replayDelivery(d); }}
                           className="px-2 py-1 bg-accent-500/10 text-accent-400 rounded text-xs font-mono hover:bg-accent-500/20">Replay</button>
                       </td>
                     </tr>
@@ -406,7 +488,7 @@ export default function WebhookGateway() {
               <table className="w-full">
                 <thead>
                   <tr className="bg-dark-900 border-b border-dark-500">
-                    {["Name", "Destination", "Filter", "Retries", "Forwarded", "Last Status", ""].map(h => (
+                    {["Name", "Status", "Destination", "Filter", "Retries", "Forwarded", "Last Status", ""].map(h => (
                       <th key={h} className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-4 py-3">{h}</th>
                     ))}
                   </tr>
@@ -415,6 +497,11 @@ export default function WebhookGateway() {
                   {routes.map(r => (
                     <tr key={r.id} className="hover:bg-dark-700/30 transition-colors">
                       <td className="px-4 py-3 text-sm text-dark-50 font-mono">{r.name}</td>
+                      <td className="px-4 py-3 text-xs font-mono">
+                        {r.enabled
+                          ? <span className="px-2 py-0.5 bg-rust-500/10 text-rust-400 rounded-md">Forwarding</span>
+                          : <span className="px-2 py-0.5 bg-dark-600 text-dark-200 rounded-md">Paused</span>}
+                      </td>
                       <td className="px-4 py-3 text-xs text-dark-200 font-mono truncate max-w-[200px]">{r.destination_url}</td>
                       <td className="px-4 py-3 text-xs text-dark-300 font-mono">{r.filter_path ? `${r.filter_path}=${r.filter_value}` : "-"}</td>
                       <td className="px-4 py-3 text-xs text-dark-200 font-mono">{r.retry_count}</td>
@@ -425,8 +512,17 @@ export default function WebhookGateway() {
                         ) : "-"}
                       </td>
                       <td className="px-4 py-3">
-                        <button onClick={() => deleteRoute(r.id)}
-                          className="px-2 py-1 bg-danger-500/10 text-danger-400 rounded text-xs font-mono hover:bg-danger-500/20">Delete</button>
+                        <div className="flex gap-2 justify-end">
+                          <button onClick={() => toggleRoute(r)}
+                            title={r.enabled
+                              ? "Stop forwarding to this destination. The route and its counters are kept."
+                              : "Resume forwarding to this destination."}
+                            className="px-2 py-1 bg-dark-700 text-dark-100 rounded text-xs font-mono hover:bg-dark-600">
+                            {r.enabled ? "Pause" : "Resume"}
+                          </button>
+                          <button onClick={() => deleteRoute(r.id)}
+                            className="px-2 py-1 bg-danger-500/10 text-danger-400 rounded text-xs font-mono hover:bg-danger-500/20">Delete</button>
+                        </div>
                       </td>
                     </tr>
                   ))}

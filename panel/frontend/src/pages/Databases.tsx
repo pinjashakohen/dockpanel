@@ -1,15 +1,25 @@
 import { useState, useEffect, useRef, useCallback, FormEvent } from "react";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
+import { useAuth } from "../context/AuthContext";
 
 interface Site {
   id: string;
   domain: string;
 }
 
+// A Docker Stack a database can be provisioned against instead of a Site
+// (GH #64: standalone DB provisioning for Docker Apps). Stacks are admin-only
+// throughout the panel, so this list is only ever fetched/shown for admins.
+interface Stack {
+  id: string;
+  name: string;
+}
+
 interface Database {
   id: string;
-  site_id: string;
+  site_id: string | null;
+  stack_id: string | null;
   name: string;
   engine: string;
   db_user: string;
@@ -57,6 +67,7 @@ function SchemaBrowser({ database, onClose }: { database: Database; onClose: () 
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [tableSchema, setTableSchema] = useState<QueryResult | null>(null);
   const [tableIndexes, setTableIndexes] = useState<QueryResult | null>(null);
+  const [detailError, setDetailError] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -71,16 +82,36 @@ function SchemaBrowser({ database, onClose }: { database: Database; onClose: () 
     })();
   }, [database.id]);
 
+  // Settled, not all-or-nothing, and never silent. These are two independent
+  // endpoints against two independent statements; sharing one `Promise.all` meant
+  // the first rejection discarded the other's result, so when the columns query
+  // broke in `29d959b` it took the working index pane down with it. And the
+  // rejection landed in a bare `catch {}`, which is why five months of a dead pane
+  // produced not one report: the panes render empty either way, so an empty pane
+  // could mean "no columns", "request failed" or "never asked".
   const loadTableDetails = async (table: string) => {
     setSelectedTable(table);
-    try {
-      const [schema, indexes] = await Promise.all([
-        api.get<QueryResult>(`/databases/${database.id}/tables/${encodeURIComponent(table)}`),
-        api.get<QueryResult>(`/databases/${database.id}/indexes/${encodeURIComponent(table)}`),
-      ]);
-      setTableSchema(schema);
-      setTableIndexes(indexes);
-    } catch { /* ignore */ }
+    setTableSchema(null);
+    setTableIndexes(null);
+    setDetailError("");
+
+    const [schema, indexes] = await Promise.allSettled([
+      api.get<QueryResult>(`/databases/${database.id}/tables/${encodeURIComponent(table)}`),
+      api.get<QueryResult>(`/databases/${database.id}/indexes/${encodeURIComponent(table)}`),
+    ]);
+
+    if (schema.status === "fulfilled") setTableSchema(schema.value);
+    if (indexes.status === "fulfilled") setTableIndexes(indexes.value);
+
+    const failed = [
+      schema.status === "rejected" ? "columns" : null,
+      indexes.status === "rejected" ? "indexes" : null,
+    ].filter(Boolean);
+    if (failed.length) {
+      const reason = [schema, indexes].find(r => r.status === "rejected") as PromiseRejectedResult;
+      const detail = reason.reason instanceof Error ? reason.reason.message : "request failed";
+      setDetailError(`Could not load ${failed.join(" or ")} for ${table}: ${detail}`);
+    }
   };
 
   const tables = overview?.tables?.rows || [];
@@ -143,8 +174,15 @@ function SchemaBrowser({ database, onClose }: { database: Database; onClose: () 
 
           {/* Right: Table detail + relationships */}
           <div className="flex-1 space-y-4">
-            {selectedTable && tableSchema ? (
+            {selectedTable && (tableSchema || tableIndexes || detailError) ? (
               <>
+                {detailError && (
+                  <div className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20">
+                    {detailError}
+                  </div>
+                )}
+
+                {tableSchema && (
                 <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
                   <div className="px-4 py-3 border-b border-dark-600 flex items-center justify-between">
                     <h3 className="text-sm font-medium text-dark-100 font-mono">{selectedTable}</h3>
@@ -173,8 +211,10 @@ function SchemaBrowser({ database, onClose }: { database: Database; onClose: () 
                     </tbody>
                   </table>
                 </div>
+                )}
 
-                {/* Indexes */}
+                {/* Indexes. Rendered independently of the columns pane above — they are
+                    separate endpoints and one must not be able to blank the other. */}
                 {tableIndexes && tableIndexes.rows?.length > 0 && (
                   <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
                     <div className="px-4 py-3 border-b border-dark-600">
@@ -496,7 +536,7 @@ function SqlBrowser({
                   )}
                   Execute
                 </button>
-                <span className="text-xs text-dark-500">Ctrl+Enter</span>
+                <span className="text-xs text-dark-400">Ctrl+Enter</span>
               </div>
               {result && (
                 <span className="text-xs text-dark-300">
@@ -552,7 +592,7 @@ function SqlBrowser({
                       key={i}
                       className="hover:bg-dark-700/30 transition-colors"
                     >
-                      <td className="px-3 py-1.5 text-[10px] text-dark-500 font-mono">
+                      <td className="px-3 py-1.5 text-[10px] text-dark-400 font-mono">
                         {i + 1}
                       </td>
                       {row.map((val, j) => (
@@ -562,7 +602,7 @@ function SqlBrowser({
                           title={val}
                         >
                           {val === "" || val === "\\N" ? (
-                            <span className="text-dark-500 italic text-xs">
+                            <span className="text-dark-400 italic text-xs">
                               NULL
                             </span>
                           ) : (
@@ -604,7 +644,7 @@ function SqlBrowser({
           {!result && !queryError && !queryLoading && (
             <div className="bg-dark-800 rounded-lg border border-dark-500 p-12 text-center flex-1 flex flex-col items-center justify-center">
               <svg
-                className="w-10 h-10 text-dark-500 mb-3"
+                className="w-10 h-10 text-dark-400 mb-3"
                 fill="none"
                 viewBox="0 0 24 24"
                 stroke="currentColor"
@@ -619,7 +659,7 @@ function SqlBrowser({
               <p className="text-dark-300 text-sm">
                 Select a table or write a query
               </p>
-              <p className="text-dark-500 text-xs mt-1">
+              <p className="text-dark-400 text-xs mt-1">
                 Ctrl+Up/Down to navigate query history
               </p>
             </div>
@@ -630,18 +670,243 @@ function SqlBrowser({
   );
 }
 
+/* ─── Import a dump the operator placed on the server ───────────── */
+
+interface DumpFile {
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+  /** Present when the file is not a database backup at all (agent's verdict). */
+  unsupported?: string;
+  /** Present when it IS a backup but cannot go into THIS database (panel's verdict). */
+  import_blocked?: string;
+}
+
+function formatBytes(n: number): string {
+  if (n >= 1_073_741_824) return `${(n / 1_073_741_824).toFixed(1)} GB`;
+  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+function ImportDatabase({ database, onClose }: { database: Database; onClose: () => void }) {
+  const [dumps, setDumps] = useState<DumpFile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [done, setDone] = useState("");
+  const [confirmFile, setConfirmFile] = useState<string | null>(null);
+  const [importing, setImporting] = useState<string | null>(null);
+
+  const dir = `/var/backups/dockpanel/databases/${database.name}`;
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const list = await api.get<DumpFile[]>(`/databases/${database.id}/dumps`);
+      setDumps(Array.isArray(list) ? list : []);
+      setError("");
+    } catch (e) {
+      // Binding and surfacing is the whole point: a listing that fails silently is
+      // indistinguishable from a directory with nothing in it, which is exactly the
+      // ambiguity this feature exists to remove.
+      setError(e instanceof Error ? e.message : "Could not read the dump directory");
+    } finally {
+      setLoading(false);
+    }
+  }, [database.id]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const handleImport = async (filename: string) => {
+    if (confirmFile !== filename) {
+      setConfirmFile(filename);
+      return;
+    }
+    setConfirmFile(null);
+    setError("");
+    setNotice("");
+    setDone("");
+    setImporting(filename);
+    try {
+      await api.post(`/databases/${database.id}/import`, { filename });
+      setDone(`Imported ${filename} into ${database.name}.`);
+    } catch (e) {
+      // A 504 here is the panel giving up on WATCHING, not the import failing — the
+      // backend says so in as many words and the operator must not be told to retry, so
+      // it gets its own tone rather than the red banner that means "this did not happen".
+      if (e instanceof ApiError && (e.status === 504 || e.status === 524)) {
+        setNotice(
+          e.status === 524
+            ? `The import is still running on the server — it was NOT cancelled and must not be started again. The connection was cut by Cloudflare at 100 seconds, which is shorter than the panel's own limit. Browse the tables in a few minutes to see it finish.`
+            : e.message
+        );
+      } else {
+        setError(e instanceof Error ? e.message : "Import failed");
+      }
+    } finally {
+      setImporting(null);
+    }
+  };
+
+  const importable = dumps.filter((d) => !d.unsupported && !d.import_blocked);
+  const rejected = dumps.filter((d) => d.unsupported || d.import_blocked);
+
+  return (
+    <div className="animate-fade-up">
+      <div className="flex items-center gap-3 mb-5 pb-4 border-b border-dark-600">
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors">
+          &larr; Back
+        </button>
+        <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">Import</h1>
+        <span className="text-sm font-mono text-dark-50">{database.name}</span>
+        <span className="px-2 py-0.5 bg-dark-700 text-dark-200 rounded text-xs font-medium">{database.engine}</span>
+      </div>
+
+      <div className="bg-dark-800 border border-dark-600 rounded-lg p-4 mb-5">
+        <p className="text-sm text-dark-200">
+          Put the dump on the server yourself, then pick it here. The file manager is not the
+          route: an upload travels base64-encoded inside a JSON body and tops out around 1.5 MB,
+          which no real dump fits inside.
+        </p>
+        <p className="text-xs text-dark-400 mt-2">
+          Copy it into <code className="text-dark-200">{dir}</code> over SSH, as root:
+        </p>
+        <pre className="mt-2 px-3 py-2 bg-dark-900 border border-dark-600 rounded text-xs font-mono text-dark-200 overflow-x-auto">
+{`mkdir -p ${dir}
+scp dump.sql.gz root@server:${dir}/
+chmod 600 ${dir}/dump.sql.gz`}
+        </pre>
+        <p className="text-xs text-dark-400 mt-2">
+          The directory only exists once this database has been backed up at least once, so
+          create it if it is missing. It is root-owned and re-tightened to{" "}
+          <code className="text-dark-200">0700</code> every time the agent starts.{" "}
+          <code className="text-dark-200">/tmp/</code> will not work: the agent runs with a
+          private <code className="text-dark-200">/tmp</code> and cannot see the host's.
+        </p>
+      </div>
+
+      {error && <div className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20 mb-4">{error}</div>}
+      {notice && <div className="bg-warn-500/10 text-warn-400 text-sm px-4 py-3 rounded-lg border border-warn-500/20 mb-4">{notice}</div>}
+      {done && <div className="bg-accent-500/10 text-accent-400 text-sm px-4 py-3 rounded-lg border border-accent-500/20 mb-4">{done}</div>}
+
+      {loading && <p className="text-dark-400 text-sm">Reading {dir}...</p>}
+
+      {!loading && !error && importable.length === 0 && rejected.length === 0 && (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 p-12 text-center">
+          <p className="text-dark-200 font-medium">Nothing here to import</p>
+          <p className="text-dark-300 text-sm mt-2 max-w-md mx-auto">
+            No <code className="text-dark-200">.sql.gz</code> or{" "}
+            <code className="text-dark-200">.archive.gz</code> file is in{" "}
+            <code className="text-dark-200">{dir}</code>. Copy one there with the commands above,
+            then refresh.
+          </p>
+          <button
+            onClick={load}
+            className="mt-4 px-3 py-1.5 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
+          >
+            Refresh
+          </button>
+        </div>
+      )}
+
+      {!loading && importable.length > 0 && (
+        <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
+          <div className="px-5 py-3 border-b border-dark-600 flex items-center justify-between">
+            <span className="text-xs uppercase tracking-widest font-mono text-dark-400">Available dumps</span>
+            <button
+              onClick={load}
+              className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
+            >
+              Refresh
+            </button>
+          </div>
+          {importable.map((d) => (
+            <div key={d.filename} className="px-5 py-3 border-b border-dark-700 last:border-0 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-mono text-dark-50 truncate">{d.filename}</div>
+                <div className="text-xs text-dark-400 mt-0.5">
+                  {formatBytes(d.size_bytes)} &middot; {d.created_at}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {confirmFile === d.filename ? (
+                  <>
+                    <span className="text-xs text-danger-400">Replace data in {database.name}?</span>
+                    <button
+                      onClick={() => handleImport(d.filename)}
+                      disabled={importing !== null}
+                      className="px-2 py-1 bg-danger-600 text-white rounded text-xs hover:bg-danger-700 disabled:opacity-50"
+                    >
+                      {importing === d.filename ? "..." : "Yes"}
+                    </button>
+                    <button
+                      onClick={() => setConfirmFile(null)}
+                      className="px-2 py-1 bg-dark-600 text-dark-100 rounded text-xs hover:bg-dark-500"
+                    >
+                      No
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => handleImport(d.filename)}
+                    disabled={importing !== null}
+                    className="px-2 py-1 rounded text-xs font-medium bg-rust-500/15 text-rust-400 hover:bg-rust-500/25 disabled:opacity-50 transition-colors"
+                  >
+                    {importing === d.filename ? "Importing..." : "Import"}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {rejected.length > 0 && (
+        <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden mt-5">
+          <div className="px-5 py-3 border-b border-dark-600">
+            <span className="text-xs uppercase tracking-widest font-mono text-dark-400">
+              In the directory, but not importable
+            </span>
+          </div>
+          {rejected.map((d) => (
+            <div key={d.filename} className="px-5 py-3 border-b border-dark-700 last:border-0">
+              <div className="text-sm font-mono text-dark-300 truncate">{d.filename}</div>
+              <div className="text-xs text-warn-400 mt-1">{d.unsupported || d.import_blocked}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {importing && (
+        <p className="text-xs text-dark-400 mt-4">
+          Importing streams the dump straight into the database container. Large dumps can take
+          several minutes — leave this page open.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ─── Main Databases Page ───────────────────────────────────────── */
 
 export default function Databases() {
   const [databases, setDatabases] = useState<Database[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
+  const [stacks, setStacks] = useState<Stack[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
 
-  // Form state
+  // Form state. GH #64: a database is now owned by a Site OR a Stack — never both
+  // (chk_databases_owner). Stacks are admin-only throughout the panel, so ownerType
+  // only ever offers "stack" for admins; a non-admin's request is unaffected.
+  const [ownerType, setOwnerType] = useState<"site" | "stack">("site");
   const [siteId, setSiteId] = useState("");
+  const [stackId, setStackId] = useState("");
   const [dbName, setDbName] = useState("");
   const [engine, setEngine] = useState("postgres");
   const [submitting, setSubmitting] = useState(false);
@@ -662,18 +927,31 @@ export default function Databases() {
   const [browseDb, setBrowseDb] = useState<Database | null>(null);
   const [schemaDb, setSchemaDb] = useState<Database | null>(null);
 
+  // Import state. Admin-only, matching the server: the dump directory is keyed by
+  // database NAME and a name outlives the database that made it, so a tenant-reachable
+  // listing would expose a previous holder's leftover dumps. Putting a file there needs
+  // root anyway — there is no per-site SFTP — so no non-admin can use this door for its
+  // intended purpose in the first place.
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+  const [importTargetDb, setImportTargetDb] = useState<Database | null>(null);
+
   // Password reset state
   const [resettingPw, setResettingPw] = useState<string | null>(null);
   const [pwResetSuccess, setPwResetSuccess] = useState<string | null>(null);
 
   const fetchData = async () => {
     try {
-      const [dbs, sitesData] = await Promise.all([
+      const [dbs, sitesData, stacksData] = await Promise.all([
         api.get<Database[]>("/databases"),
         api.get<Site[]>("/sites"),
+        // Stacks are admin-only server-side (require_admin) — skip the call
+        // entirely for non-admins rather than surfacing its 403 as a page error.
+        isAdmin ? api.get<Stack[]>("/stacks") : Promise.resolve([] as Stack[]),
       ]);
       setDatabases(dbs);
       setSites(sitesData);
+      setStacks(stacksData);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load data");
     } finally {
@@ -683,7 +961,8 @@ export default function Databases() {
 
   useEffect(() => {
     fetchData();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
@@ -692,7 +971,8 @@ export default function Databases() {
     setSubmitting(true);
     try {
       await api.post("/databases", {
-        site_id: siteId,
+        site_id: ownerType === "site" ? siteId : undefined,
+        stack_id: ownerType === "stack" ? stackId : undefined,
         name: dbName,
         engine,
       });
@@ -787,6 +1067,12 @@ export default function Databases() {
   const getSiteDomain = (siteId: string) =>
     sites.find((s) => s.id === siteId)?.domain || "Unknown";
 
+  const getStackName = (stackId: string) =>
+    stacks.find((s) => s.id === stackId)?.name || "Unknown stack";
+
+  const getOwnerLabel = (db: Database) =>
+    db.stack_id ? getStackName(db.stack_id) : getSiteDomain(db.site_id ?? "");
+
   // Schema Browser mode
   if (schemaDb) {
     return (
@@ -801,6 +1087,21 @@ export default function Databases() {
     return (
       <div className="p-6 lg:p-8">
         <SqlBrowser database={browseDb} onClose={() => setBrowseDb(null)} />
+      </div>
+    );
+  }
+
+  // Import mode
+  if (importTargetDb) {
+    return (
+      <div className="p-6 lg:p-8">
+        <ImportDatabase
+          database={importTargetDb}
+          onClose={() => {
+            setImportTargetDb(null);
+            fetchData();
+          }}
+        />
       </div>
     );
   }
@@ -857,34 +1158,96 @@ export default function Databases() {
           onSubmit={handleCreate}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 mb-6 space-y-4"
         >
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div>
-              <label htmlFor="db-site" className="block text-sm font-medium text-dark-100 mb-1">
-                Site
-              </label>
-              <select
-                id="db-site"
-                value={siteId}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setSiteId(val);
-                  if (val) {
-                    const selectedSite = sites.find((s) => s.id === val);
-                    if (selectedSite) {
-                      setDbName(selectedSite.domain.replace(/\./g, '_').replace(/-/g, '_'));
-                    }
-                  }
-                }}
-                className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800"
-              >
-                <option value="">-- Select a site --</option>
-                {sites.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.domain}
-                  </option>
-                ))}
-              </select>
+          {/* Owner type toggle — Stacks are admin-only throughout the panel, so this
+              only appears once the operator has at least one to pick from. Everyone
+              else keeps the plain Site picker unchanged. */}
+          {isAdmin && stacks.length > 0 && (
+            <div className="flex gap-2" role="radiogroup" aria-label="Database owner type">
+              {(["site", "stack"] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  role="radio"
+                  aria-checked={ownerType === t}
+                  onClick={() => {
+                    setOwnerType(t);
+                    setSiteId("");
+                    setStackId("");
+                    setDbName("");
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    ownerType === t
+                      ? "bg-rust-500/10 text-rust-400 border-rust-500/30"
+                      : "text-dark-300 border-dark-600 hover:text-dark-100 hover:border-dark-400"
+                  }`}
+                >
+                  {t === "site" ? "Owned by a Site" : "Owned by a Stack"}
+                </button>
+              ))}
             </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {ownerType === "site" ? (
+              <div>
+                <label htmlFor="db-site" className="block text-sm font-medium text-dark-100 mb-1">
+                  Site
+                </label>
+                <select
+                  id="db-site"
+                  value={siteId}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setSiteId(val);
+                    if (val) {
+                      const selectedSite = sites.find((s) => s.id === val);
+                      if (selectedSite) {
+                        setDbName(selectedSite.domain.replace(/\./g, '_').replace(/-/g, '_'));
+                      }
+                    }
+                  }}
+                  className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800"
+                >
+                  <option value="">-- Select a site --</option>
+                  {sites.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.domain}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div>
+                <label htmlFor="db-stack" className="block text-sm font-medium text-dark-100 mb-1">
+                  Stack
+                </label>
+                <select
+                  id="db-stack"
+                  value={stackId}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setStackId(val);
+                    if (val) {
+                      const selectedStack = stacks.find((s) => s.id === val);
+                      if (selectedStack) {
+                        setDbName(selectedStack.name.replace(/[^a-zA-Z0-9]/g, '_'));
+                      }
+                    }
+                  }}
+                  className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800"
+                >
+                  <option value="">-- Select a stack --</option>
+                  {stacks.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-dark-300 mt-1">
+                  Reachable from the stack's own containers at this database's name — no
+                  extra networking to configure.
+                </p>
+              </div>
+            )}
             <div>
               <label htmlFor="db-name" className="block text-sm font-medium text-dark-100 mb-1">
                 Database Name
@@ -896,10 +1259,11 @@ export default function Databases() {
                 onChange={(e) => setDbName(e.target.value)}
                 required
                 placeholder="my_database"
-                pattern="[a-zA-Z0-9_]+"
+                pattern="[a-zA-Z0-9][a-zA-Z0-9_]*"
+                title="Letters, numbers and underscores. Must start with a letter or a number."
                 className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm"
               />
-              <p className="text-xs text-dark-300 mt-1">Name for your database instance</p>
+              <p className="text-xs text-dark-300 mt-1">Letters, numbers and underscores — must start with a letter or a number</p>
             </div>
             <div>
               <label htmlFor="db-engine" className="block text-sm font-medium text-dark-100 mb-1">
@@ -981,7 +1345,7 @@ export default function Databases() {
                     Engine
                   </th>
                   <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">
-                    Site
+                    Owner
                   </th>
                   <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">
                     Port
@@ -1007,7 +1371,7 @@ export default function Databases() {
                       {engineLabels[db.engine] || db.engine}
                     </td>
                     <td className="px-5 py-4 text-sm text-dark-200 hidden md:table-cell font-mono">
-                      {getSiteDomain(db.site_id)}
+                      {getOwnerLabel(db)}
                     </td>
                     <td className="px-5 py-4 text-sm text-dark-200 font-mono hidden sm:table-cell">
                       {db.port || "\u2014"}
@@ -1029,6 +1393,15 @@ export default function Databases() {
                         >
                           Schema
                         </button>
+                        {isAdmin && (
+                          <button
+                            onClick={() => setImportTargetDb(db)}
+                            className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
+                            title="Import a .sql.gz dump you placed on the server"
+                          >
+                            Import
+                          </button>
+                        )}
                         <button
                           onClick={async () => {
                             try {
@@ -1039,11 +1412,20 @@ export default function Databases() {
                                 retention_hours: cfg.retention_hours || 24,
                               });
                               setError("");
-                              setSuccessMsg(`Point-in-time recovery ${newEnabled ? "enabled" : "disabled"} for ${db.name}`);
-                            } catch (e) { setError(e instanceof Error ? e.message : "Failed to toggle PITR"); }
+                              // The flag is stored and nothing consumes it: no WAL is
+                              // archived, no binlog retained, and the restore endpoint
+                              // answers 501. Saying "recovery enabled" promised a
+                              // recoverability nothing behind this button can deliver —
+                              // the worst place in the product to be optimistic.
+                              setSuccessMsg(
+                                newEnabled
+                                  ? `Retention preference saved for ${db.name}. Point-in-time recovery is not implemented — nothing is being archived, and restore is unavailable. Use scheduled backups.`
+                                  : `Retention preference cleared for ${db.name}.`
+                              );
+                            } catch (e) { setError(e instanceof Error ? e.message : "Failed to save retention preference"); }
                           }}
                           className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-300 hover:bg-dark-600 transition-colors"
-                          title="Toggle point-in-time recovery (WAL/binlog)"
+                          title="Store a PITR retention preference. Point-in-time recovery itself is not implemented — nothing is archived and restore returns 501."
                         >
                           PITR
                         </button>
@@ -1172,16 +1554,27 @@ export default function Databases() {
                     </div>
                   </div>
 
-                  {/* Individual fields */}
+                  {/* Individual fields.
+                      Two of these carry a `hint`, because two of them are the reason
+                      this panel generates support questions. A managed database is
+                      published on the host's loopback only and sits on a bridge with
+                      container-to-container traffic switched off — so "Host" does not
+                      work from inside a container, and "Internal Host" is a container
+                      NAME rather than a hostname anything can resolve. Stating that
+                      here is the whole fix: the field was inviting a connection
+                      attempt that cannot succeed, and then saying nothing when it
+                      failed. GitHub #107. */}
                   <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                     {[
-                      { label: "Host", value: credentials.host, key: "host" },
+                      { label: "Host", value: credentials.host, key: "host",
+                        hint: "From a shell on this server. The port is published on the host's loopback only, so this will not work from inside another container or from off-box." },
                       { label: "Port", value: String(credentials.port), key: "port" },
                       { label: "Database", value: credentials.database, key: "database" },
                       { label: "Username", value: credentials.username, key: "username" },
                       { label: "Password", value: credentials.password, key: "password" },
-                      { label: "Internal Host", value: credentials.internal_host, key: "internal_host" },
-                    ].map((field) => (
+                      { label: "Internal Host", value: credentials.internal_host, key: "internal_host",
+                        hint: "The Docker container's name — for docker exec, docker logs and the CLI. It is not a hostname you can connect to." },
+                    ].map((field: { label: string; value: string; key: string; hint?: string }) => (
                       <div key={field.key}>
                         <label className="block text-xs font-medium text-dark-200 mb-1">
                           {field.label}
@@ -1206,6 +1599,9 @@ export default function Databases() {
                             )}
                           </button>
                         </div>
+                        {field.hint && (
+                          <p className="text-xs text-dark-400 mt-1 leading-snug">{field.hint}</p>
+                        )}
                       </div>
                     ))}
                   </div>

@@ -10,7 +10,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::auth::{AdminUser, AuthUser, ServerScope};
-use crate::error::{agent_error, ApiError};
+use crate::error::{agent_error, err, internal_error, ApiError};
 use crate::routes::sites::ProvisionStep;
 use crate::services::activity;
 use crate::services::agent::AgentHandle;
@@ -62,17 +62,195 @@ pub async fn diagnostics(
     Ok(Json(data))
 }
 
-/// POST /api/agent/diagnostics/fix — Proxy to agent's diagnostics fix (admin).
+/// POST /api/agent/diagnostics/fix — Apply a one-click fix.
+///
+/// Mostly a proxy to the agent, with ONE fix the agent cannot perform and the
+/// panel can.
+///
+/// **`renew-ssl:{domain}` was a button that could only fail.** The agent's
+/// diagnostics offers it on every certificate inside 30 days
+/// (`diagnostics.rs::check_ssl_expiry`), but `apply_fix` has no arm for it, so it
+/// fell through to `Unknown fix action` — which the agent's route maps to
+/// **500**, and `agent_error` preserves an agent's own sentence only for 4xx. So
+/// the operator got `Operation failed. Reference: {uuid}`: indistinguishable
+/// from a transient fault, which invites a retry, and every click wrote a
+/// `tracing::error!` incident describing a working agent as broken.
+///
+/// The agent cannot fix this itself and never could — renewal needs the site's
+/// runtime, root, PHP version and an ACME contact, all of which live in the
+/// panel's database, and an agent has no database. So the panel takes the fix.
+/// Doing it here rather than in the agent is also what makes it ARRIVE:
+/// `security_scanner` already records the same reasoning — "an agent is only
+/// updated when somebody updates it… declining here is what makes the fix arrive
+/// with the PANEL".
+///
+/// A certificate under `/etc/dockpanel/ssl` with no `sites` row — a DNS-01
+/// wildcard apex, or one placed by hand — now gets a sentence saying so instead
+/// of an incident id. That is still a refusal, but it is an ANSWER.
 pub async fn diagnostics_fix(
-    State(_state): State<AppState>,
-    crate::auth::AdminUser(_claims): crate::auth::AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
+    State(state): State<AppState>,
+    crate::auth::AdminUser(claims): crate::auth::AdminUser,
+    ServerScope(server_id, agent): ServerScope,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let fix_id = body.get("fix_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    if let Some(domain) = fix_id.strip_prefix("renew-ssl:") {
+        // Resolution is two statements on purpose, and it lives HERE rather than
+        // behind a helper because this is the handler that chooses a destination:
+        // a reader — and the wrong-host-dispatch census — must be able to see the
+        // host being named without following a call.
+        //
+        // The first statement names the row ON THE HOST THAT RAISED THE FINDING.
+        // `sites.domain` is unique only per server (`idx_sites_domain_server`), so
+        // a lookup on the name alone can hand back a different machine's site and
+        // this handler would renew the wrong one — the same defect this ship fixes
+        // in `security_scanner`. The second re-reads it through
+        // `SITE_CALLER_PREDICATE`, the shared authorisation every other site
+        // handler uses, so this new door decides nothing about who may open it:
+        // reuse carries the mechanism, never the gate.
+        let site_id: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM sites WHERE domain = $1 AND server_id = $2",
+        )
+        .bind(domain)
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| crate::error::internal_error("diagnostics ssl fix lookup", e))?;
+
+        let Some((site_id,)) = site_id else {
+            // A certificate under /etc/dockpanel/ssl with no `sites` row. Still a
+            // refusal, but a 4xx with a sentence, so `agent_error`'s sibling rule
+            // cannot later collapse it into an incident id the way the agent's 500
+            // did.
+            //
+            // ⚠ It must NOT claim the certificate came from outside DockPanel,
+            // because very often it did not: the agent issues certificates for
+            // Docker apps, Compose stacks, Git deploys and mail domains, and NONE
+            // of those becomes a `sites` row — a Docker app has no table at all, it
+            // exists only as a labelled container. Saying "whatever put it there is
+            // what renews it" to an operator whose own panel put it there is the
+            // same species of defect as the button this branch replaced. So the
+            // refusal names what the panel actually found, and stops there.
+            //
+            // These lookups are deliberately not server-scoped. `mail_domains.server_id`
+            // was NULL on every panel-created row for five months and
+            // `git_deploys.domain` is nullable, so a server term here would turn a
+            // true "a mail domain claims this name" into a silent "nothing does" —
+            // trading a wrong sentence for a wronger one. Naming the owner
+            // approximately is worth more than naming nothing precisely.
+            let claimed_by: Option<(String,)> = sqlx::query_as(
+                "SELECT 'mail domain' FROM mail_domains WHERE domain = $1 \
+                 UNION ALL SELECT 'Git deploy' FROM git_deploys WHERE domain = $1 \
+                 UNION ALL SELECT 'Docker app' FROM container_sleep_config WHERE domain = $1 \
+                 UNION ALL SELECT 'Compose stack' FROM docker_stacks WHERE lower(domain) = lower($1) \
+                 LIMIT 1",
+            )
+            .bind(domain)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
+            // A stack is the one claimant whose answer depends on its TLS MODE.
+            // "DockPanel issued this and a redeploy reissues it" is true of an
+            // `acme` stack and FALSE of a `provided` one, whose live certificate
+            // is the operator's own, served from the registry — the expiring
+            // file this button was clicked about is then a leftover under the
+            // per-domain tree, and redeploying reissues nothing. Telling that
+            // operator to redeploy is the same species of wrong sentence this
+            // whole branch exists to stop.
+            //
+            // ⛔ Read through `effective_tls_mode`, never a CASE in the SQL
+            // above: the NULL⇒ssl_email rule has ONE spelling, and a second one
+            // here would drift exactly where it decides what to tell an
+            // operator about their own certificate. Unscoped by server for the
+            // same reason as the claimant probe above.
+            let stack_mode = if claimed_by.as_ref().map(|(k,)| k.as_str()) == Some("Compose stack") {
+                let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT tls_mode, ssl_email FROM docker_stacks WHERE lower(domain) = lower($1)",
+                )
+                .bind(domain)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None);
+                row.map(|(m, e)| {
+                    crate::routes::stacks::effective_tls_mode(m.as_deref(), e.as_deref())
+                })
+            } else {
+                None
+            };
+
+            let tail = match claimed_by {
+                Some((_,)) if matches!(stack_mode, Some(mode) if mode != "acme") => {
+                    "A Compose stack in this panel uses that name, but it serves a registered \
+                     certificate rather than a Let's Encrypt one — so this expiring file is a \
+                     leftover from before that change, and nothing renews it because nothing \
+                     serves it. Removing it is safe; the stack is unaffected."
+                        .to_string()
+                }
+                Some((kind,)) => format!(
+                    "A {kind} in this panel uses that name, and DockPanel issued this \
+                     certificate for it — but only certificates attached to a SITE can be \
+                     renewed from here. Redeploy that {kind} to reissue it."
+                ),
+                None => "No site, mail domain, Git deploy, Docker app or Compose stack in \
+                         this panel claims that name — so this is a certificate DockPanel \
+                         does not manage, such as a DNS-01 wildcard or one installed by \
+                         hand, and it is renewed wherever it was issued."
+                    .to_string(),
+            };
+
+            return Err(crate::error::err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("No site named {domain} is registered on this server. {tail}"),
+            ));
+        };
+
+        let site: crate::models::Site = sqlx::query_as(&format!(
+            "SELECT s.* FROM sites s WHERE {}",
+            crate::helpers::SITE_CALLER_PREDICATE
+        ))
+        .bind(site_id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| crate::error::internal_error("diagnostics ssl fix", e))?
+        .ok_or_else(|| crate::error::err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+        // The renewal's own `{ok, domain}` body is deliberately dropped: this
+        // endpoint answers the Diagnostics screen, which reads `{success, message}`.
+        // The `?` is the load-bearing part — a PRECONDITION_FAILED from
+        // `resolve_acme_contact`, or a 4xx the agent authored, reaches the operator
+        // as that sentence instead of a reference id.
+        let _renewed =
+            crate::routes::ssl::renew_for_site(&state, &site, claims.sub, &claims.email).await?;
+
+        activity::log_activity_on_server(
+            &state.db, claims.sub, &claims.email, "diagnostics.fix",
+            Some("renew-ssl"), Some(domain), None, None, Some(server_id), claims.key_id,
+        ).await;
+
+        // The shape the Diagnostics screen reads.
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "message": format!("Renewed the certificate for {domain}"),
+        })));
+    }
+
     let data = agent
         .post("/diagnostics/fix", Some(body))
         .await
         .map_err(|e| agent_error("Diagnostics fix", e))?;
+
+    let (action, target) = match fix_id.split_once(':') {
+        Some((a, t)) => (a.to_string(), Some(t.to_string())),
+        None => (fix_id.clone(), None),
+    };
+    activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "diagnostics.fix",
+        Some(&action), target.as_deref(), None, None, Some(server_id), claims.key_id,
+    ).await;
+
     Ok(Json(data))
 }
 
@@ -102,7 +280,7 @@ pub async fn disk_cleanup(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "system.cleanup",
-        None, None, None, None,
+        None, None, None, None, claims.key_id,
     ).await;
 
     Ok(Json(data))
@@ -122,7 +300,7 @@ pub async fn change_hostname(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "system.hostname_change",
-        None, None, None, None,
+        None, None, None, None, claims.key_id,
     ).await;
 
     Ok(Json(data))
@@ -184,6 +362,7 @@ pub async fn updates_apply(
     let db = state.db.clone();
     let email = claims.email.clone();
     let user_id = claims.sub;
+    let key_id = claims.key_id;
 
     tokio::spawn(async move {
         let emit = |step: &str, label: &str, status: &str, msg: Option<String>| {
@@ -263,7 +442,7 @@ pub async fn updates_apply(
         {
             Ok(()) => {
                 activity::log_activity(&db, user_id, &email, "system.updates.apply",
-                    Some("system"), Some("packages"), None, None).await;
+                    Some("system"), Some("packages"), None, None, key_id).await;
             }
             Err(e) => {
                 emit("update", "Failed to apply updates", "error", Some(format!("{e}")));
@@ -307,7 +486,7 @@ pub async fn system_reboot(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "system.reboot",
-        Some("system"), Some("server"), None, None,
+        Some("system"), Some("server"), None, None, claims.key_id,
     ).await;
 
     Ok(Json(data))
@@ -430,7 +609,7 @@ pub(crate) async fn install_service_with_log(
                 // worth finding later.
                 activity::log_activity(
                     &db, claims_sub, &email, "service.install",
-                    Some("system"), Some(&svc), None, None,
+                    Some("system"), Some(&svc), None, None, None,
                 ).await;
             }
             Err(e) => {
@@ -520,9 +699,17 @@ pub async fn install_log(
         }
     });
 
+    // The underlying channel closes (and this stream ends) once the install
+    // finishes and its map entry is dropped — but an install in progress at
+    // shutdown time can still run well past the graceful-drain window, so
+    // race it against the panel's own shutdown signal too.
     Ok(
-        Sse::new(snapshot_stream.chain(live_stream))
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping")),
+        Sse::new(
+            snapshot_stream
+                .chain(live_stream)
+                .take_until(crate::helpers::shutdown_signal_fut(&state)),
+        )
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping")),
     )
 }
 
@@ -541,10 +728,16 @@ pub async fn add_ssh_key(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = agent.post("/ssh-keys", Some(body)).await.map_err(|e| agent_error("Add SSH key", e))?;
-    activity::log_activity(&state.db, claims.sub, &claims.email, "ssh.key.add", Some("system"), None, None, None).await;
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(&state.db, claims.sub, &claims.email, "ssh.key.add", Some("system"), None, None, ip.as_deref(), claims.key_id).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "ssh.key.add", Some(&claims.email), ip.as_deref(),
+        Some("system"), None, None, None, "warning", claims.key_id,
+    ).await;
     Ok(Json(result))
 }
 
@@ -553,9 +746,15 @@ pub async fn remove_ssh_key(
     AdminUser(claims): AdminUser,
     axum::extract::Path(fingerprint): axum::extract::Path<String>,
     ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = agent.delete(&format!("/ssh-keys/{fingerprint}")).await.map_err(|e| agent_error("Remove SSH key", e))?;
-    activity::log_activity(&state.db, claims.sub, &claims.email, "ssh.key.remove", Some("system"), None, None, None).await;
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(&state.db, claims.sub, &claims.email, "ssh.key.remove", Some("system"), None, None, ip.as_deref(), claims.key_id).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "ssh.key.remove", Some(&claims.email), ip.as_deref(),
+        Some("system"), None, None, None, "warning", claims.key_id,
+    ).await;
     Ok(Json(result))
 }
 
@@ -576,7 +775,7 @@ pub async fn enable_auto_updates(
     ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = agent.post("/auto-updates/enable", None).await.map_err(|e| agent_error("Enable auto-updates", e))?;
-    activity::log_activity(&state.db, claims.sub, &claims.email, "auto-updates.enable", Some("system"), None, None, None).await;
+    activity::log_activity(&state.db, claims.sub, &claims.email, "auto-updates.enable", Some("system"), None, None, None, claims.key_id).await;
     Ok(Json(result))
 }
 
@@ -586,38 +785,58 @@ pub async fn disable_auto_updates(
     ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = agent.post("/auto-updates/disable", None).await.map_err(|e| agent_error("Disable auto-updates", e))?;
-    activity::log_activity(&state.db, claims.sub, &claims.email, "auto-updates.disable", Some("system"), None, None, None).await;
+    activity::log_activity(&state.db, claims.sub, &claims.email, "auto-updates.disable", Some("system"), None, None, None, claims.key_id).await;
     Ok(Json(result))
 }
 
-// ── Panel IP Whitelist ──────────────────────────────────────────────────
-
-pub async fn get_panel_whitelist(
-    State(_state): State<AppState>,
-    AdminUser(_claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = agent.get("/panel-whitelist").await.map_err(|e| agent_error("Whitelist", e))?;
-    Ok(Json(result))
-}
-
-pub async fn set_panel_whitelist(
-    State(state): State<AppState>,
-    AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = agent.post("/panel-whitelist", Some(body)).await.map_err(|e| agent_error("Set whitelist", e))?;
-    activity::log_activity(&state.db, claims.sub, &claims.email, "panel.whitelist.update", Some("system"), None, None, None).await;
-    Ok(Json(result))
-}
-
+// The "Panel IP Whitelist" proxy that stood here was removed in v2.90.0. It relayed a
+// list of addresses to the agent, which wrote them to a file on the agent host that
+// nothing on any install ever read — no nginx include, no enforcement, nowhere. The
+// panel's real IP restriction is a setting enforced at every session-minting door in
+// `auth.rs`, and it now owns the single operator control on the Account tab.
+//
 pub async fn install_powerdns(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // pdns_api_url/pdns_api_key live in the global `settings` table (no per-server
+    // row), but installation is per-server (this handler is ServerScope-scoped, same
+    // as Redis/Fail2Ban/Cloudflare Tunnel). Installing on a second server would
+    // silently overwrite the first server's credentials — every existing PowerDNS
+    // zone would then point at the wrong authoritative server with no error anywhere.
+    // `pdns_server_id` records which server currently owns the saved credentials;
+    // absent means either no install yet or a pre-existing install from before this
+    // check shipped (grandfathered — not blocked).
+    let owner: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM settings WHERE key = 'pdns_server_id'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("check pdns owner", e))?;
+    if let Some((owner_id_str,)) = owner {
+        if let Ok(owner_id) = owner_id_str.parse::<Uuid>() {
+            if owner_id != server_id {
+                let owner_name: Option<(String,)> = sqlx::query_as(
+                    "SELECT name FROM servers WHERE id = $1",
+                )
+                .bind(owner_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| internal_error("look up pdns owner server", e))?;
+                let label = owner_name.map(|(n,)| n).unwrap_or_else(|| owner_id.to_string());
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "PowerDNS is already configured for server '{label}'. Uninstall it there first — installing on a second server would overwrite those credentials and orphan its DNS zones."
+                    ),
+                ));
+            }
+        }
+    }
+
     // Optional {"backend":"sqlite"|"pgsql"} forwarded to the agent (issue #63).
     // Absent/invalid → None, so the agent applies its pgsql default (back-compat).
     let forward_body = serde_json::from_slice::<serde_json::Value>(&body).ok()
@@ -639,6 +858,8 @@ pub async fn install_powerdns(
     let jwt_secret = state.config.jwt_secret.clone();
     let user_id = claims.sub;
     let email = claims.email.clone();
+    let key_id = claims.key_id;
+    let ip = crate::routes::client_ip(&headers);
 
     tokio::spawn(async move {
         let emit = |step: &str, lbl: &str, status: &str, msg: Option<String>| {
@@ -658,7 +879,12 @@ pub async fn install_powerdns(
 
         emit("install", "Installing PowerDNS", "in_progress", None);
 
-        match agent.post("/services/install/powerdns", forward_body).await {
+        // `post_long` for the same reason as the mail installers — this is an apt install
+        // plus a service start, and 60s is not a budget for that.
+        match agent
+            .post_long("/services/install/powerdns", forward_body, 900)
+            .await
+        {
             Ok(result) => {
                 // Auto-save API URL and key to settings
                 if let (Some(url), Some(key)) = (
@@ -675,13 +901,21 @@ pub async fn install_powerdns(
                         .bind(&encrypted_key)
                         .execute(&db)
                         .await;
+                    let _ = sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('pdns_server_id', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()")
+                        .bind(server_id.to_string())
+                        .execute(&db)
+                        .await;
                 }
 
                 emit("install", "Installing PowerDNS", "done", None);
                 emit("complete", "PowerDNS installed", "done", None);
                 activity::log_activity(
                     &db, user_id, &email, "service.install",
-                    Some("system"), Some("powerdns"), None, None,
+                    Some("system"), Some("powerdns"), None, ip.as_deref(), key_id,
+                ).await;
+                crate::services::security_hardening::audit_log(
+                    &db, "service.install", Some(&email), ip.as_deref(),
+                    Some("system"), Some("powerdns"), None, None, "warning", key_id,
                 ).await;
                 tracing::info!("Service installed: PowerDNS");
             }
@@ -729,6 +963,18 @@ pub async fn install_redis(
     ServerScope(_server_id, agent): ServerScope,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     install_service_with_log(&state, agent, claims.sub, &claims.email, "Redis", "/services/install/redis", None).await
+}
+
+/// Install `sshpass` on the scoped server, for password-authenticated SFTP
+/// backup destinations. `ServerScope` rather than a `server_id` in the body:
+/// this runs a package transaction as root, so the target must be a server the
+/// caller is proven to own, not one they can name. Issue #93.
+pub async fn install_sshpass(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "sshpass", "/services/install/sshpass", None).await
 }
 
 pub async fn install_nodejs(
@@ -800,9 +1046,100 @@ pub async fn uninstall_fail2ban(
 pub async fn uninstall_powerdns(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    install_service_with_log(&state, agent, claims.sub, &claims.email, "PowerDNS (uninstall)", "/services/uninstall/powerdns", None).await
+    // Custom (not the shared install_service_with_log helper) because a successful
+    // uninstall must also free the `pdns_server_id` ownership slot install_powerdns
+    // guards on — otherwise uninstalling here would leave this server permanently
+    // recorded as the owner and block ever installing PowerDNS anywhere else.
+    let install_id = Uuid::new_v4();
+
+    crate::helpers::register_provision_log(
+        &state.provision_logs,
+        &state.deploy_owners,
+        install_id,
+        claims.sub,
+        32,
+    );
+
+    let logs = state.provision_logs.clone();
+    let db = state.db.clone();
+    let user_id = claims.sub;
+    let email = claims.email.clone();
+    let key_id = claims.key_id;
+    let ip = crate::routes::client_ip(&headers);
+
+    tokio::spawn(async move {
+        let emit = |step: &str, lbl: &str, status: &str, msg: Option<String>| {
+            let ev = ProvisionStep {
+                step: step.into(),
+                label: lbl.into(),
+                status: status.into(),
+                message: msg,
+            };
+            if let Ok(mut map) = logs.lock() {
+                if let Some((history, tx, _)) = map.get_mut(&install_id) {
+                    history.push(ev.clone());
+                    let _ = tx.send(ev);
+                }
+            }
+        };
+
+        emit("install", "Uninstalling PowerDNS", "in_progress", None);
+
+        match agent
+            .post_long("/services/uninstall/powerdns", None, INSTALL_AGENT_TIMEOUT_SECS)
+            .await
+        {
+            Ok(_) => {
+                // Only clear the saved credentials if THIS server is the recorded
+                // owner (or no owner was ever recorded — pre-existing install from
+                // before pdns_server_id shipped). Uninstalling on a server that never
+                // owned the install must not wipe another server's live credentials.
+                let owner: Result<Option<(String,)>, _> = sqlx::query_as(
+                    "SELECT value FROM settings WHERE key = 'pdns_server_id'",
+                )
+                .fetch_optional(&db)
+                .await;
+                let owned_by_this_server = match owner {
+                    Ok(Some((id_str,))) => id_str.parse::<Uuid>().map(|id| id == server_id).unwrap_or(true),
+                    Ok(None) => true,
+                    Err(_) => false,
+                };
+                if owned_by_this_server {
+                    let _ = sqlx::query("DELETE FROM settings WHERE key IN ('pdns_api_url', 'pdns_api_key', 'pdns_server_id')")
+                        .execute(&db)
+                        .await;
+                }
+
+                emit("install", "Uninstalling PowerDNS", "done", None);
+                emit("complete", "PowerDNS uninstalled", "done", None);
+                activity::log_activity(
+                    &db, user_id, &email, "service.uninstall",
+                    Some("system"), Some("powerdns"), None, ip.as_deref(), key_id,
+                ).await;
+                crate::services::security_hardening::audit_log(
+                    &db, "service.uninstall", Some(&email), ip.as_deref(),
+                    Some("system"), Some("powerdns"), None, None, "warning", key_id,
+                ).await;
+                tracing::info!("Service uninstalled: PowerDNS");
+            }
+            Err(e) => {
+                emit("install", "Uninstalling PowerDNS", "error", Some(format!("{e}")));
+                emit("complete", "Uninstall failed", "error", None);
+                tracing::error!("Service uninstall failed: PowerDNS: {e}");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&install_id);
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({
+        "install_id": install_id,
+        "message": "PowerDNS uninstallation started",
+    }))))
 }
 
 pub async fn uninstall_redis(
@@ -850,6 +1187,7 @@ pub async fn traefik_install(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let acme_email = body.get("acme_email").and_then(|v| v.as_str()).unwrap_or("admin@localhost");
@@ -863,7 +1201,12 @@ pub async fn traefik_install(
     sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('reverse_proxy', 'traefik', NOW()) ON CONFLICT (key) DO UPDATE SET value = 'traefik', updated_at = NOW()")
         .execute(&state.db).await.ok();
 
-    activity::log_activity(&state.db, claims.sub, &claims.email, "traefik.install", Some("system"), None, None, None).await;
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(&state.db, claims.sub, &claims.email, "traefik.install", Some("system"), None, None, ip.as_deref(), claims.key_id).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "traefik.install", Some(&claims.email), ip.as_deref(),
+        Some("system"), None, None, None, "warning", claims.key_id,
+    ).await;
 
     Ok(Json(result))
 }
@@ -873,6 +1216,7 @@ pub async fn traefik_uninstall(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = agent
         .post("/traefik/uninstall", None)
@@ -883,7 +1227,12 @@ pub async fn traefik_uninstall(
     sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('reverse_proxy', 'nginx', NOW()) ON CONFLICT (key) DO UPDATE SET value = 'nginx', updated_at = NOW()")
         .execute(&state.db).await.ok();
 
-    activity::log_activity(&state.db, claims.sub, &claims.email, "traefik.uninstall", Some("system"), None, None, None).await;
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(&state.db, claims.sub, &claims.email, "traefik.uninstall", Some("system"), None, None, ip.as_deref(), claims.key_id).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "traefik.uninstall", Some(&claims.email), ip.as_deref(),
+        Some("system"), None, None, None, "warning", claims.key_id,
+    ).await;
 
     Ok(Json(result))
 }

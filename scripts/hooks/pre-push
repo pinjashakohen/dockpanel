@@ -10,35 +10,81 @@ FOUND=0
 
 echo "=== Pre-push: secrets scan ==="
 
-# Scan the diff being pushed (all commits not yet on remote)
+# THREE WAYS THIS SCAN USED TO WAVE A SECRET THROUGH, all fixed at s336. Read
+# them before editing the loop below, because each was invisible in normal use:
+#
+# 1. The diff was narrowed to nine source extensions, and an empty result hit a
+#    `continue` that abandoned the whole loop body — including the .env/.pem/.key
+#    filename check, which never needed that pathspec and sat below it. A push of
+#    exactly one .pem full of tokens printed "All pre-push checks passed" and
+#    landed on the remote; the same .pem with any .rs file riding along was
+#    blocked. The filename check now runs FIRST, and nothing narrows by extension.
+#
+# 2. The new-branch arm set RANGE to a bare sha, and `git diff <sha>` compares
+#    that commit with the WORKING TREE — empty on a clean tree. So the branch
+#    whose comment read "scan all commits" scanned nothing at all. It now asks
+#    for the commits themselves.
+#
+# 3. git's own stderr was discarded, so a range this repo cannot resolve produced
+#    an empty diff that was indistinguishable from a clean push. It now fails
+#    closed and says so.
+#
+# Patterns use the bracket idiom (a dot as [.], one character of each token in
+# brackets) so this file does not match its own patterns — which is what lets the
+# scan cover every file with no path exemption. Add must-fire AND must-not-fire
+# cases to tests/install-integrity-pin-e2e.sh for any pattern you add.
+
 REMOTE="$1"
 URL="$2"
+ZERO="0000000000000000000000000000000000000000"
+
+IP_PATTERN='95[.]179[.]144[.]140|45[.]32[.]232[.]132|136[.]244[.]102[.]195|78[.]141[.]211[.]78|192[.]168[.]1[.]186'
+TOKEN_PATTERN='PTHEsBzagJBWE8NuJj[A]|dockpanel202[6]|github_pat[_]|ARYXXL[I]'
 
 while read LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
-  if [ "$REMOTE_SHA" = "0000000000000000000000000000000000000000" ]; then
-    # New branch — scan all commits
-    RANGE="$LOCAL_SHA"
-  else
-    RANGE="$REMOTE_SHA..$LOCAL_SHA"
+  # A ref DELETION pushes an all-zero local sha and carries no content.
+  if [ "$LOCAL_SHA" = "$ZERO" ]; then
+    continue
   fi
 
-  # Get the full diff being pushed
-  DIFF=$(git diff "$RANGE" -- '*.rs' '*.ts' '*.tsx' '*.sql' '*.toml' '*.sh' '*.json' '*.yml' '*.yaml' 2>/dev/null)
+  if [ "$REMOTE_SHA" = "$ZERO" ]; then
+    # New branch: the commits that are not already on some remote.
+    RANGE="$LOCAL_SHA (new branch)"
+    PATCH=$(git log -p --no-color "$LOCAL_SHA" --not --remotes 2>/dev/null); RC=$?
+    NAMES=$(git log --name-only --pretty=format: "$LOCAL_SHA" --not --remotes 2>/dev/null)
+  else
+    RANGE="$REMOTE_SHA..$LOCAL_SHA"
+    PATCH=$(git diff --no-color "$RANGE" 2>/dev/null); RC=$?
+    NAMES=$(git diff --name-only "$RANGE" 2>/dev/null)
+  fi
 
-  if [ -z "$DIFF" ]; then
+  if [ "$RC" -ne 0 ]; then
+    echo -e "${RED}BLOCKED: git could not read the commits being pushed (${RANGE}) — refusing to push commits that were never scanned${NC}"
+    FOUND=1
+    continue
+  fi
+
+  # ── Filename check FIRST — it does not depend on the content scan ────────
+  SENSITIVE_FILES=$(echo "$NAMES" | grep -E '\.(env|pem|key)$' | grep -v '.sample' | sort -u)
+  if [ -n "$SENSITIVE_FILES" ]; then
+    echo -e "${RED}BLOCKED: Sensitive file in push: ${SENSITIVE_FILES}${NC}"
+    FOUND=1
+  fi
+
+  if [ -z "$PATCH" ]; then
     continue
   fi
 
   # Secrets patterns
-  if echo "$DIFF" | grep -qiE 'PTHEsBzagJBWE8NuJjA|dockpanel2026|github_pat_|ARYXXLI'; then
+  if echo "$PATCH" | grep -E '^\+' | grep -ciE "$TOKEN_PATTERN" >/dev/null; then
     echo -e "${RED}BLOCKED: Secret/token found in commits being pushed${NC}"
-    echo "$DIFF" | grep -niE 'PTHEsBzagJBWE8NuJjA|dockpanel2026|github_pat_|ARYXXLI' | head -5
+    echo "$PATCH" | grep -E '^\+' | grep -niE "$TOKEN_PATTERN" | head -5
     FOUND=1
   fi
 
   # Password assignments in source code
-  if echo "$DIFF" | grep -E '^\+' | grep -qiE 'password\s*=\s*"[^"]{6,}"'; then
-    HITS=$(echo "$DIFF" | grep -E '^\+' | grep -iE 'password\s*=\s*"[^"]{6,}"' | grep -viE 'wp_password|nc_password|example|placeholder|changeme|default|_password"|PASSWORD_HASH')
+  if echo "$PATCH" | grep -E '^\+' | grep -ciE 'password\s*=\s*"[^"]{6,}"' >/dev/null; then
+    HITS=$(echo "$PATCH" | grep -E '^\+' | grep -iE 'password\s*=\s*"[^"]{6,}"' | grep -viE 'wp_password|nc_password|example|placeholder|changeme|default|_password"|PASSWORD_HASH')
     if [ -n "$HITS" ]; then
       echo -e "${YELLOW}WARNING: Possible hardcoded password in pushed code:${NC}"
       echo "$HITS" | head -3
@@ -47,16 +93,9 @@ while read LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
   fi
 
   # Real IPs
-  if echo "$DIFF" | grep -qE '95\.179\.144\.140|45\.32\.232\.132|136\.244\.102\.195|78\.141\.211\.78|192\.168\.1\.186'; then
+  if echo "$PATCH" | grep -E '^\+' | grep -cE "$IP_PATTERN" >/dev/null; then
     echo -e "${RED}BLOCKED: Real infrastructure IP in commits being pushed${NC}"
-    echo "$DIFF" | grep -nE '95\.179\.144\.140|45\.32\.232\.132|136\.244\.102\.195|78\.141\.211\.78|192\.168\.1\.186' | head -5
-    FOUND=1
-  fi
-
-  # Check for .env/.pem/.key files in the push
-  SENSITIVE_FILES=$(git diff --name-only "$RANGE" 2>/dev/null | grep -E '\.(env|pem|key)$' | grep -v '.sample')
-  if [ -n "$SENSITIVE_FILES" ]; then
-    echo -e "${RED}BLOCKED: Sensitive file in push: ${SENSITIVE_FILES}${NC}"
+    echo "$PATCH" | grep -E '^\+' | grep -nE "$IP_PATTERN" | head -5
     FOUND=1
   fi
 done
@@ -77,24 +116,81 @@ if [ -f "panel/frontend/dist/index.html" ]; then
   fi
 fi
 
+# Marketing-site build check — BLOCKING (s342)
+#
+# `npm run build` in website/client IS the deploy: nginx serves that dist/
+# directly. Live Surfaces fires ON the push and reads the wire, so a rebuild
+# afterwards is a guaranteed red run plus a manual re-run — which is exactly what
+# happened at s280, s281, s326 and again at s342. A reminder printed after the
+# push cannot prevent that; only a block before it can.
+#
+# ⚠ The trigger is anything that changes what the build EMITS, not just `src/`:
+# the bundle hash is a function of the dependency graph too. s326 bumped only a
+# dependency, touched no source file, and shipped a stale bundle.
+if [ -f "website/client/dist/index.html" ]; then
+  STALE_SITE=$(find website/client/src website/client/package.json \
+                    website/client/package-lock.json website/client/vite.config.ts \
+                    -newer website/client/dist/index.html 2>/dev/null | head -1)
+  if [ -n "$STALE_SITE" ]; then
+    echo -e "${RED}BLOCKED: dockpanel.dev source is newer than website/client/dist/.${NC}"
+    echo -e "${RED}  Stale file: ${STALE_SITE}${NC}"
+    echo -e "${RED}  Run: cd website/client && npm run build   (that build IS the deploy)${NC}"
+    FOUND=1
+  fi
+fi
+
 # Version consistency check — BLOCKING
 echo ""
 echo "=== Version consistency check ==="
 V_AGENT=$(grep '^version' panel/agent/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
 V_BACKEND=$(grep '^version' panel/backend/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
 V_CLI=$(grep '^version' panel/cli/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
+V_MCP=$(grep '^version' panel/mcp/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
 V_FRONTEND=$(grep '"version"' panel/frontend/package.json 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)".*/\1/')
 
-if [ -n "$V_AGENT" ] && [ -n "$V_BACKEND" ] && [ -n "$V_CLI" ] && [ -n "$V_FRONTEND" ]; then
-  if [ "$V_AGENT" != "$V_BACKEND" ] || [ "$V_AGENT" != "$V_CLI" ] || [ "$V_AGENT" != "$V_FRONTEND" ]; then
+if [ -n "$V_AGENT" ] && [ -n "$V_BACKEND" ] && [ -n "$V_CLI" ] && [ -n "$V_MCP" ] && [ -n "$V_FRONTEND" ]; then
+  if [ "$V_AGENT" != "$V_BACKEND" ] || [ "$V_AGENT" != "$V_CLI" ] || [ "$V_AGENT" != "$V_MCP" ] || [ "$V_AGENT" != "$V_FRONTEND" ]; then
     echo -e "${RED}BLOCKED: Version mismatch across packages:${NC}"
     echo -e "  agent:    ${V_AGENT}"
     echo -e "  backend:  ${V_BACKEND}"
     echo -e "  cli:      ${V_CLI}"
+    echo -e "  mcp:      ${V_MCP}"
     echo -e "  frontend: ${V_FRONTEND}"
     FOUND=1
   else
     echo -e "${GREEN}Versions consistent: ${V_AGENT}${NC}"
+  fi
+fi
+
+# CHANGELOG section check — BLOCKING
+# The Release workflow writes the release body from CHANGELOG.md and REFUSES a tag
+# with no matching section. When it refuses, `changelog` fails and build/release/
+# smoke-test are SKIPPED — so the tag exists, the workflow "ran", and NO RELEASE
+# PUBLISHES. That is the s232 shape, and it happened again at s276 on v2.46.0.
+#
+# ⚠ s310: this block spent an unknown number of releases in `.git/hooks/pre-push`,
+# which git does not run — `core.hooksPath` is `scripts/hooks`, and
+# `git rev-parse --git-path hooks/pre-push` answers `scripts/hooks/pre-push`. The
+# copy carrying this check was the DEAD one (8 changelog references there, 0 here,
+# against 8 `version` references here proving the grep was pointed correctly), so
+# the guard that exists specifically to stop a tag-with-no-release was itself
+# unreachable, while reference_dockpanel_ops recorded it as blocking. A safety net
+# in a file nothing executes is the same shape as the defect it guards against.
+#
+# Checked on every push, not just tag pushes: the version bump lands one commit
+# before the tag, and catching it there is what leaves the tag clean.
+if [ -n "$V_AGENT" ] && [ -f CHANGELOG.md ]; then
+  echo ""
+  echo "=== CHANGELOG section check ==="
+  # Accept "## [2.46.0]", "## v2.46.0" and "## 2.46.0" — the file uses the first.
+  if grep -qE "^## (\[)?v?${V_AGENT}(\])?([[:space:]]|$)" CHANGELOG.md; then
+    echo -e "${GREEN}CHANGELOG has a section for ${V_AGENT}${NC}"
+  else
+    echo -e "${RED}BLOCKED: CHANGELOG.md has no section for v${V_AGENT}.${NC}"
+    echo -e "${RED}  Add '## [${V_AGENT}] - $(date +%Y-%m-%d)' before tagging — the release${NC}"
+    echo -e "${RED}  body is written from it, and without it the release job fails while${NC}"
+    echo -e "${RED}  build/release/smoke-test SKIP, so the tag exists with no release.${NC}"
+    FOUND=1
   fi
 fi
 
@@ -123,7 +219,7 @@ for DIR in panel/frontend website/client website/server; do
   OUT=$( (cd "$DIR" && node "$AUDIT_GATE") 2>&1 )
   case $? in
     0)
-      if echo "$OUT" | grep -q '^waived'; then
+      if echo "$OUT" | grep -c '^waived' >/dev/null; then
         echo -e "${YELLOW}npm audit: ${DIR} — advisories present, all individually reviewed${NC}"
         echo "$OUT" | grep '^waived'
       else
@@ -144,17 +240,17 @@ done
 # cargo-audit lives in ~/.cargo/bin, which is not on a git hook's PATH.
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 if command -v cargo-audit >/dev/null 2>&1; then
-  # The three crates have separate Cargo.lock files — none is redundant.
+  # The four crates have separate Cargo.lock files — none is redundant.
   # `-n` uses the cached RustSec DB (fast + offline-safe); fall back to a
   # fetching run when the DB has never been cloned.
   NOFETCH="-n"
   [ -d "$HOME/.cargo/advisory-db" ] || NOFETCH=""
-  for CRATE in panel/agent panel/backend panel/cli; do
+  for CRATE in panel/agent panel/backend panel/cli panel/mcp; do
     [ -f "$CRATE/Cargo.lock" ] || continue
     OUT=$( (cd "$CRATE" && cargo audit $NOFETCH) 2>&1 )
     if [ $? -eq 0 ]; then
       echo -e "${GREEN}cargo audit clean: ${CRATE}${NC}"
-    elif echo "$OUT" | grep -qiE "couldn't fetch|failed to fetch|network|could not resolve"; then
+    elif echo "$OUT" | grep -ciE "couldn't fetch|failed to fetch|network|could not resolve" >/dev/null; then
       echo -e "${YELLOW}WARNING: cargo audit could not reach the advisory DB for ${CRATE} — not enforced${NC}"
     else
       echo -e "${RED}BLOCKED: cargo audit found vulnerabilities in ${CRATE}${NC}"
@@ -181,13 +277,15 @@ echo "=== Post-push gate reminders ==="
 
 # Check if website/ or docs/ changed — remind to deploy
 CHANGED_FILES=$(git diff --name-only "$RANGE" 2>/dev/null)
-if echo "$CHANGED_FILES" | grep -qE '^website/|^docs/'; then
-  echo -e "${YELLOW}REMINDER: website/ or docs/ changed — deploy live sites after push${NC}"
-  echo -e "${YELLOW}  → dockpanel.dev and/or docs.dockpanel.dev need rebuild${NC}"
+if echo "$CHANGED_FILES" | grep -cE '^website/|^docs/' >/dev/null; then
+  echo -e "${YELLOW}REMINDER: website/ or docs/ changed — the rebuild belongs BEFORE the push${NC}"
+  echo -e "${YELLOW}  → 'mdbook build docs/' and 'cd website/client && npm run build' ARE the deploys${NC}"
+  echo -e "${YELLOW}  → Live Surfaces fires ON the push and reads the wire, so a rebuild now still${NC}"
+  echo -e "${YELLOW}    leaves a red run to re-run by hand (s280, s281, s326, s342)${NC}"
 fi
 
 # Check if panel/ source changed — remind about release binaries
-if echo "$CHANGED_FILES" | grep -qE '^panel/(agent|backend|cli)/src/'; then
+if echo "$CHANGED_FILES" | grep -cE '^panel/(agent|backend|cli|mcp)/src/' >/dev/null; then
   LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
   if [ -n "$LATEST_TAG" ]; then
     COMMITS_SINCE=$(git rev-list "$LATEST_TAG..HEAD" --count 2>/dev/null)

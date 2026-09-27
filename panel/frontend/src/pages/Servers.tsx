@@ -3,6 +3,7 @@ import { Navigate } from "react-router-dom";
 import { useState, useEffect, useCallback } from "react";
 import { api, ApiError } from "../api";
 import { useServer, type Server } from "../context/ServerContext";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 interface CreateForm {
   name: string;
@@ -24,6 +25,14 @@ export default function Servers() {
   const [pendingDelete, setPendingDelete] = useState<{ id: string; name: string } | null>(null);
   const [pendingRotate, setPendingRotate] = useState<{ id: string; name: string } | null>(null);
   const [rotateResult, setRotateResult] = useState<Record<string, string>>({});
+  // Agent-token rotation is a different control from the TLS-pin rotation beside it:
+  // the pin is a fingerprint the next checkin re-captures, the token is the agent's
+  // own credential. That endpoint has existed and been documented in api-reference.md
+  // since the fleet shipped, with nothing in the panel calling it — so an operator who
+  // suspected a leaked agent token had no in-product way to rotate one.
+  // (The path is spelled ONCE below, in the call. A pin counts raw source, so a second
+  // spelling in this comment would satisfy it on its own — the s346 prose trap.)
+  const [pendingTokenRotate, setPendingTokenRotate] = useState<{ id: string; name: string } | null>(null);
 
   const handleCreate = useCallback(async () => {
     if (!form.name.trim()) return;
@@ -68,6 +77,19 @@ export default function Servers() {
       setRotateResult((prev) => ({ ...prev, [id]: e instanceof ApiError ? e.message : "Rotate failed" }));
     }
   }, [pendingRotate, refreshServers]);
+
+  const executeTokenRotate = useCallback(async () => {
+    if (!pendingTokenRotate) return;
+    const { id } = pendingTokenRotate;
+    setPendingTokenRotate(null);
+    try {
+      await api.post(`/servers/${id}/rotate-token`);
+      setRotateResult((prev) => ({ ...prev, [id]: "Agent token rotated — the panel is already using the new one." }));
+      await refreshServers();
+    } catch (e) {
+      setRotateResult((prev) => ({ ...prev, [id]: e instanceof ApiError ? e.message : "Token rotation failed" }));
+    }
+  }, [pendingTokenRotate, refreshServers]);
 
   const handleTest = useCallback(async (id: string) => {
     setTesting(id);
@@ -143,24 +165,36 @@ export default function Servers() {
         <div className="px-4 py-3 bg-danger-500/10 border border-danger-500/30 rounded-lg text-sm text-danger-400">{error}</div>
       )}
 
+      {/* Issue #120: these three prompts used to render as detached bars up here
+          while their triggers sit on the server cards below, so arming one moved
+          the page instead of asking anything. ConfirmDialog portals them. */}
       {pendingDelete && (
-        <div className="border border-danger-500/30 bg-danger-500/5 rounded-lg px-4 py-3 flex items-center justify-between">
-          <span className="text-xs text-danger-400 font-mono">Delete server "{pendingDelete.name}"? All sites, databases, and apps will be removed.</span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeDelete} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">Confirm</button>
-            <button onClick={() => setPendingDelete(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">Cancel</button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={`Delete server "${pendingDelete.name}"?\nAll sites, databases, and apps will be removed.`}
+          tone="danger"
+          onConfirm={executeDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
       )}
 
       {pendingRotate && (
-        <div className="border border-warn-500/30 bg-warn-500/5 rounded-lg px-4 py-3 flex items-center justify-between">
-          <span className="text-xs text-warn-400 font-mono">Rotate TLS pin for "{pendingRotate.name}"? This clears the stored fingerprint; the next checkin re-captures (TOFU window). Only do this after a legitimate agent cert rotation.</span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeRotate} className="px-3 py-1.5 bg-warn-500 text-dark-950 text-xs font-bold uppercase tracking-wider hover:bg-warn-400 transition-colors">Rotate</button>
-            <button onClick={() => setPendingRotate(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">Cancel</button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={`Rotate TLS pin for "${pendingRotate.name}"?\nThis clears the stored fingerprint; the next checkin re-captures (TOFU window). Only do this after a legitimate agent cert rotation.`}
+          confirmLabel="Rotate"
+          tone="warn"
+          onConfirm={executeRotate}
+          onCancel={() => setPendingRotate(null)}
+        />
+      )}
+
+      {pendingTokenRotate && (
+        <ConfirmDialog
+          label={`Rotate the AGENT TOKEN for "${pendingTokenRotate.name}"?\nThe panel asks the agent to mint a new one and stores it. Do this if the token may have leaked. The old token stops working immediately, so if the agent is unreachable the rotation fails and nothing changes.`}
+          confirmLabel="Rotate token"
+          tone="danger"
+          onConfirm={executeTokenRotate}
+          onCancel={() => setPendingTokenRotate(null)}
+        />
       )}
 
       {creating && (
@@ -187,7 +221,7 @@ export default function Servers() {
             </div>
           </div>
           <div className="flex gap-3">
-            <button onClick={handleCreate} className="px-4 py-2 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors">
+            <button onClick={handleCreate} disabled={!form.name.trim()} className="px-4 py-2 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
               Create Server
             </button>
             <button onClick={() => setCreating(false)} className="px-4 py-2 bg-dark-700 text-dark-200 rounded-lg text-sm hover:bg-dark-600 transition-colors">
@@ -325,6 +359,22 @@ export default function Servers() {
                 </button>
               </div>
             )}
+
+            {/* Agent token — every server has one, local included, so this row is not
+                gated on !is_local the way the TLS pin above is. */}
+            <div className="mt-3 pt-3 border-t border-dark-700 flex items-center justify-between gap-3 text-xs font-mono">
+              <div className="min-w-0 flex-1">
+                <span className="text-dark-300 uppercase tracking-widest text-[10px]">Agent token</span>
+                <span className="ml-2 text-dark-200">stored hashed; rotate if it may have leaked</span>
+              </div>
+              <button
+                onClick={() => setPendingTokenRotate({ id: s.id, name: s.name })}
+                className="px-3 py-1 bg-dark-700 text-dark-200 rounded text-[11px] hover:bg-danger-500/20 hover:text-danger-400 transition-colors whitespace-nowrap"
+                title="Ask the agent to mint a new token and store it. The old token stops working immediately."
+              >
+                Rotate token
+              </button>
+            </div>
             {rotateResult[s.id] && (
               <div className="mt-2 px-3 py-2 rounded text-xs bg-rust-500/10 text-rust-400 font-mono">
                 {rotateResult[s.id]}

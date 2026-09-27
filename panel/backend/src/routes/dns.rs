@@ -6,8 +6,8 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::auth::{AuthUser, ServerScope};
-use crate::error::{ApiError, agent_error, err, internal_error, require_admin, upstream_error};
+use crate::auth::AuthUser;
+use crate::error::{ApiError, err, internal_error, require_admin, upstream_error};
 use crate::services::activity;
 use crate::AppState;
 
@@ -340,7 +340,7 @@ pub async fn create_zone(
             tracing::info!("DNS zone added (cloudflare): {} by {}", zone.domain, claims.email);
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.zone.create",
-                Some("dns"), Some(&zone.domain), None, None,
+                Some("dns"), Some(&zone.domain), None, None, claims.key_id,
             ).await;
 
             Ok((StatusCode::CREATED, Json(serde_json::json!({
@@ -401,7 +401,7 @@ pub async fn create_zone(
             tracing::info!("DNS zone added (powerdns): {} by {}", zone.domain, claims.email);
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.zone.create",
-                Some("dns"), Some(&zone.domain), Some("powerdns"), None,
+                Some("dns"), Some(&zone.domain), Some("powerdns"), None, claims.key_id,
             ).await;
 
             Ok((StatusCode::CREATED, Json(serde_json::json!({
@@ -587,7 +587,7 @@ pub async fn create_record(
 
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.record.create",
-                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None,
+                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None, claims.key_id,
             ).await;
 
             Ok((StatusCode::CREATED, Json(cf_resp.get("result").cloned().unwrap_or_default())))
@@ -673,7 +673,7 @@ pub async fn create_record(
 
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.record.create",
-                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None,
+                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None, claims.key_id,
             ).await;
 
             Ok((StatusCode::CREATED, Json(serde_json::json!({
@@ -704,6 +704,14 @@ pub async fn update_record(
 
     match zone.provider.as_str() {
         "cloudflare" => {
+            // CF record IDs are 32-char lowercase hex, same as cf_zone_id (line ~290).
+            // record_id is interpolated unescaped into the outbound URL below — without
+            // this check a "../../../zones/OTHER/dns_records/RECID"-shaped id (percent-
+            // encoded to survive the reverse proxy) reroutes the request, carrying this
+            // zone's own decrypted token, to an arbitrary Cloudflare API path.
+            if record_id.len() != 32 || !record_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(err(StatusCode::BAD_REQUEST, "Invalid record ID"));
+            }
             let token = zone.cf_api_token.as_deref().unwrap_or("");
             let (client, headers) = cf_client(token, zone.cf_api_email.as_deref())?;
 
@@ -744,7 +752,7 @@ pub async fn update_record(
 
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.record.update",
-                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None,
+                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None, claims.key_id,
             ).await;
 
             Ok(Json(cf_resp.get("result").cloned().unwrap_or_default()))
@@ -895,7 +903,7 @@ pub async fn update_record(
 
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.record.update",
-                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None,
+                Some("dns"), Some(&zone.domain), Some(&format!("{} {}", body.rtype, body.name)), None, claims.key_id,
             ).await;
 
             Ok(Json(serde_json::json!({
@@ -915,9 +923,11 @@ pub async fn delete_record(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path((id, record_id)): Path<(Uuid, String)>,
+    req_headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
     let zone = get_zone(&state, id).await?;
+    let ip = crate::routes::client_ip(&req_headers);
 
     if record_id.is_empty() || record_id.len() > 256 {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid record ID"));
@@ -925,6 +935,11 @@ pub async fn delete_record(
 
     match zone.provider.as_str() {
         "cloudflare" => {
+            // Same discipline as update_record — CF record IDs are 32-char lowercase
+            // hex; record_id is unescaped in the outbound URL below.
+            if record_id.len() != 32 || !record_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(err(StatusCode::BAD_REQUEST, "Invalid record ID"));
+            }
             let token = zone.cf_api_token.as_deref().unwrap_or("");
             let (client, headers) = cf_client(token, zone.cf_api_email.as_deref())?;
 
@@ -950,7 +965,12 @@ pub async fn delete_record(
 
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.record.delete",
-                Some("dns"), Some(&zone.domain), None, None,
+                Some("dns"), Some(&zone.domain), None, ip.as_deref(), claims.key_id,
+            ).await;
+
+            crate::services::security_hardening::audit_log(
+                &state.db, "dns.record.delete", Some(&claims.email), ip.as_deref(),
+                Some("dns"), Some(&zone.domain), None, None, "warning", claims.key_id,
             ).await;
 
             Ok(Json(serde_json::json!({ "ok": true })))
@@ -1019,7 +1039,12 @@ pub async fn delete_record(
 
             activity::log_activity(
                 &state.db, claims.sub, &claims.email, "dns.record.delete",
-                Some("dns"), Some(&zone.domain), None, None,
+                Some("dns"), Some(&zone.domain), None, ip.as_deref(), claims.key_id,
+            ).await;
+
+            crate::services::security_hardening::audit_log(
+                &state.db, "dns.record.delete", Some(&claims.email), ip.as_deref(),
+                Some("dns"), Some(&zone.domain), None, None, "warning", claims.key_id,
             ).await;
 
             Ok(Json(serde_json::json!({ "ok": true })))
@@ -1449,10 +1474,12 @@ pub async fn cf_update_setting(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
+    req_headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
     let zone = get_zone(&state, id).await?;
+    let ip = crate::routes::client_ip(&req_headers);
 
     if zone.provider != "cloudflare" {
         return Err(err(StatusCode::BAD_REQUEST, "Only available for Cloudflare zones"));
@@ -1538,7 +1565,12 @@ pub async fn cf_update_setting(
     activity::log_activity(
         &state.db, claims.sub, &claims.email,
         &format!("dns.cf.setting.{setting}"),
-        Some("dns_zone"), Some(&zone.domain), None, None,
+        Some("dns_zone"), Some(&zone.domain), None, ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db, &format!("dns.cf.setting.{setting}"), Some(&claims.email), ip.as_deref(),
+        Some("dns_zone"), Some(&zone.domain), None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -1607,68 +1639,13 @@ pub async fn cf_purge_cache(
     activity::log_activity(
         &state.db, claims.sub, &claims.email,
         &format!("dns.cf.cache.purge.{purge_type}"),
-        Some("dns_zone"), Some(&zone.domain), None, None,
+        Some("dns_zone"), Some(&zone.domain), None, None, claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "purge_type": purge_type,
     })))
-}
-
-/// POST /api/tunnel/configure — Configure Cloudflare Tunnel with token.
-pub async fn configure_tunnel(
-    State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
-
-    let token = body.get("token").and_then(|v| v.as_str()).unwrap_or("");
-    if token.is_empty() {
-        return Err(err(StatusCode::BAD_REQUEST, "Missing tunnel token"));
-    }
-
-    let result = agent
-        .post("/services/cloudflared/configure", Some(serde_json::json!({ "token": token })))
-        .await
-        .map_err(|e| agent_error("Tunnel configure", e))?;
-
-    // Mark the tunnel as configured — a boolean display flag only. The tunnel token
-    // itself lives exclusively on the agent (in a 0600 EnvironmentFile), never in the DB.
-    if let Err(e) = sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('tunnel_configured', 'true') \
-         ON CONFLICT (key) DO UPDATE SET value = 'true'"
-    )
-    .execute(&state.db)
-    .await
-    {
-        tracing::warn!("failed to persist tunnel_configured flag: {e}");
-    }
-
-    activity::log_activity(
-        &state.db, claims.sub, &claims.email,
-        "tunnel.configured", Some("tunnel"), None, None, None,
-    ).await;
-
-    Ok(Json(result))
-}
-
-/// GET /api/tunnel/status — Get Cloudflare Tunnel status.
-pub async fn tunnel_status(
-    State(_state): State<AppState>,
-    AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
-
-    let result = agent
-        .get("/services/cloudflared/status")
-        .await
-        .map_err(|e| agent_error("Tunnel status", e))?;
-
-    Ok(Json(result))
 }
 
 #[cfg(test)]

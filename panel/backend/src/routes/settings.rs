@@ -34,7 +34,6 @@ struct SettingRow {
 pub const ALLOWED_KEYS: &[&str] = &[
     "panel_name", "smtp_host", "smtp_port", "smtp_username", "smtp_password",
     "smtp_from", "smtp_from_name", "smtp_encryption",
-    "stripe_price_starter", "stripe_price_pro", "stripe_price_agency",
     "agent_auto_update_enabled",
     "pdns_api_url", "pdns_api_key",
     "auto_heal_enabled", "auto_heal_docker_reclaim", "status_page_enabled", "enforce_2fa",
@@ -61,7 +60,60 @@ pub const ALLOWED_KEYS: &[&str] = &[
     // (routes/terminal.rs). Both were documented or relied upon while no API
     // accepted them and no control existed.
     "allowed_panel_ips", "server_terminal_disabled",
+    // The same class again, found in the v2.110.0 door census: the panel's own
+    // public URL, read by services/notifications.rs to build the "Open runbook"
+    // link every alert carries. It was read from this table, absent from this
+    // list, and absent from the settings page — so the lookup fell through to a
+    // BASE_URL env var and then to the empty string, and the payload builder
+    // answers an empty base by omitting the link rather than by failing. Every
+    // alert therefore shipped without its runbook link, on every install that
+    // did not happen to set an environment variable no UI mentions, with no way
+    // for an operator to notice or correct it.
+    "base_url",
+    // Data-retention windows (read by services/auto_healer.rs's run_retention_cleanup
+    // via key LIKE retention_%). Found half-wired by the loose-ends audit: the
+    // reader has existed since GAP 67, but no key was ever added here, so every
+    // install was permanently stuck at the hardcoded defaults with no operator
+    // control to change them.
+    "retention_activity_days", "retention_system_log_days", "retention_alert_days",
+    "retention_scan_days", "retention_webhook_days", "retention_notification_days",
+    "retention_monitor_days",
+    // AI-assisted build/deploy failure diagnosis (BYO API key, default off).
+    // Read by services/ai_diagnosis.rs.
+    "ai_diagnosis_enabled", "ai_diagnosis_provider", "ai_diagnosis_model", "ai_diagnosis_api_key",
+    // MCP server (dockpanel-mcp, panel/mcp). Unlike ai_diagnosis_enabled, nothing
+    // in the backend or the MCP crate reads these yet — the MCP server's actual
+    // on/off state is the systemd unit and its bind address is /etc/dockpanel/
+    // mcp.env's own LISTEN_ADDR, both set by hand on the host, outside this
+    // table entirely. These two keys are a record an operator fills in so the
+    // Settings page can show accurate status instead of nothing — not a live
+    // switch. Settings.tsx's McpServerSettings card says so explicitly.
+    "mcp_server_enabled", "mcp_bind_mode",
 ];
+
+/// Settings keys masked in the GET response and encrypted at rest, alongside
+/// every key ending `_client_secret`. Used to be declared separately, once
+/// inside `update` and once inside `import_config` — the two happened to
+/// still match, but nothing tied them together, the exact severed-pair shape
+/// `services::credential_reencrypt`'s own header warns about. `pub(crate)` so
+/// that module can also assert its `SENSITIVE_SETTINGS_SQL` predicate covers
+/// every key here, rather than hand-duplicating this list a third time.
+// AI diagnosis's BYO API key joins the encrypted-at-rest set alongside
+// smtp_password/pdns_api_key — `credential_reencrypt`'s own
+// `sensitive_settings_sql_covers_settings_keys` test fails to compile a
+// passing case until `SENSITIVE_SETTINGS_SQL` there names it too.
+pub(crate) const SENSITIVE_KEYS: &[&str] = &["smtp_password", "pdns_api_key", "ai_diagnosis_api_key"];
+
+/// Whether a settings key should be masked in the GET response / encrypted at
+/// rest — `SENSITIVE_KEYS` plus every `_client_secret` key. Previously
+/// `list()` hand-duplicated this as five hardcoded key-name comparisons, a
+/// second copy of the same list `update`'s encryption check already
+/// maintained via this predicate — so a key added to `SENSITIVE_KEYS` alone
+/// (as `ai_diagnosis_api_key` was) would encrypt correctly on write but come
+/// back as raw ciphertext, not `********`, on read.
+fn is_sensitive_key(key: &str) -> bool {
+    SENSITIVE_KEYS.contains(&key) || key.ends_with("_client_secret")
+}
 
 /// GET /api/settings — Returns all settings as a key/value map (admin only).
 pub async fn list(
@@ -77,10 +129,7 @@ pub async fn list(
     let map: HashMap<String, String> = rows
         .into_iter()
         .map(|r| {
-            if (r.key == "smtp_password" || r.key == "pdns_api_key"
-                || r.key == "oauth_google_client_secret"
-                || r.key == "oauth_github_client_secret"
-                || r.key == "oauth_gitlab_client_secret") && !r.value.is_empty() {
+            if is_sensitive_key(&r.key) && !r.value.is_empty() {
                 (r.key, "********".to_string())
             } else {
                 (r.key, r.value)
@@ -92,10 +141,18 @@ pub async fn list(
 }
 
 /// PUT /api/settings — Upsert settings from key/value map (admin only).
+///
+/// No `ServerScope`. Every key in `ALLOWED_KEYS` is panel-global — there is one
+/// `settings` table and no per-server variant of any row in it — so the caller's
+/// `X-Server-Id` header never had a bearing on what this handler writes. It did
+/// have two effects, both wrong. It decided which single host received the SMTP
+/// configuration below, including the decrypted password; and because
+/// `ServerScope` resolves the agent eagerly and fails the request when it can't,
+/// saving ANY setting — a panel rename, a security toggle — returned 502 whenever
+/// the member selected in the server picker happened to be down.
 pub async fn update(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
     Json(body): Json<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
 
@@ -129,6 +186,40 @@ pub async fn update(
         }
     }
 
+    // Validate base_url. Unlike `logo_url` a relative value is useless here: the
+    // reader concatenates this with a runbook path to build a link that leaves
+    // the panel, in an email or a chat message, where nothing supplies an origin.
+    // Empty stays legal and is the documented "no link" state, so an operator can
+    // clear it deliberately.
+    if let Some(url) = body.get("base_url") {
+        let trimmed = url.trim();
+        if !trimmed.is_empty()
+            && !(trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+        {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "base_url must be an absolute HTTP(S) URL, e.g. https://panel.example.com",
+            ));
+        }
+    }
+
+    // Validate the retention windows: each must be a positive integer day-count,
+    // else `run_retention_cleanup`'s `key LIKE 'retention_%'` reader would silently
+    // fall back to its default on a bad value — reject it here instead so the
+    // operator finds out immediately.
+    for key in [
+        "retention_activity_days", "retention_system_log_days", "retention_alert_days",
+        "retention_scan_days", "retention_webhook_days", "retention_notification_days",
+        "retention_monitor_days",
+    ] {
+        if let Some(v) = body.get(key) {
+            match v.parse::<i64>() {
+                Ok(n) if (1..=3650).contains(&n) => {}
+                _ => return Err(err(StatusCode::BAD_REQUEST, &format!("{key} must be an integer between 1 and 3650"))),
+            }
+        }
+    }
+
     // Validate accent_color
     if let Some(color) = body.get("accent_color") {
         if !color.is_empty() {
@@ -144,20 +235,16 @@ pub async fn update(
     let mut tx = state.db.begin().await
         .map_err(|e| internal_error("update settings", e))?;
 
-    // Sensitive keys that are masked in the GET response — skip if value is the mask sentinel
-    const SENSITIVE_KEYS: &[&str] = &["smtp_password", "pdns_api_key"];
-
+    // Sensitive keys that are masked in the GET response — skip if value is the mask sentinel.
+    // `is_sensitive_key` is the module-level predicate above, not a local copy.
     for (key, value) in &body {
         // Don't overwrite real secrets with the mask placeholder
-        if SENSITIVE_KEYS.contains(&key.as_str()) && value == "********" {
-            continue;
-        }
-        if key.ends_with("_client_secret") && value == "********" {
+        if is_sensitive_key(key) && value == "********" {
             continue;
         }
 
         // Encrypt sensitive values before storing
-        let store_value = if SENSITIVE_KEYS.contains(&key.as_str()) || key.ends_with("_client_secret") {
+        let store_value = if is_sensitive_key(key) {
             if value.is_empty() {
                 value.clone()
             } else {
@@ -184,7 +271,9 @@ pub async fn update(
 
     tracing::info!("Settings updated by {}: {} keys", claims.email, body.len());
 
-    // If SMTP keys were updated, push config to agent
+    let mut resp = serde_json::json!({ "ok": true });
+
+    // If SMTP keys were updated, push config to every host that sends mail
     let smtp_keys = ["smtp_host", "smtp_port", "smtp_username", "smtp_password", "smtp_from", "smtp_from_name", "smtp_encryption"];
     if body.keys().any(|k| smtp_keys.contains(&k.as_str())) {
         // Fetch all SMTP settings to send complete config
@@ -216,20 +305,157 @@ pub async fn update(
                 "encryption": map.get("smtp_encryption").cloned().unwrap_or_else(|| "starttls".to_string()),
             });
 
-            if let Err(e) = agent.post("/smtp/configure", Some(agent_body)).await {
-                tracing::warn!("Failed to configure SMTP on agent: {e}");
+            let push = push_smtp_to_fleet(&state, agent_body).await;
+            if let Some(w) = push.warning() {
+                tracing::warn!("{w}");
+                resp["warning"] = serde_json::json!(w);
+            }
+            resp["smtp"] = push.to_json();
+        }
+    }
+
+    Ok(Json(resp))
+}
+
+/// Where the SMTP configuration actually landed, host by host.
+///
+/// Three lists rather than a ratio, because the three outcomes are three
+/// different problems and only a NAME is actionable. A host that refused the
+/// config is broken now; a host that was never asked is invisible until its
+/// first unsent mail; and a host that took it is the only one an operator may
+/// assume anything about.
+struct SmtpPush {
+    /// Hosts that took the configuration.
+    configured: Vec<String>,
+    /// Hosts that were asked and refused, with the agent's reason.
+    failed: Vec<(String, String)>,
+    /// Hosts the registry would not resolve an agent for, with their status.
+    not_asked: Vec<(String, String)>,
+}
+
+impl SmtpPush {
+    fn total(&self) -> usize {
+        self.configured.len() + self.failed.len() + self.not_asked.len()
+    }
+
+    /// One sentence for the operator, or `None` when every host took it.
+    ///
+    /// It says how many of how many, then names the rest. "Saved" on its own is
+    /// the claim that has to stop being made: the write to `settings` always
+    /// succeeds, and it is the only part of this operation the old response
+    /// described.
+    fn warning(&self) -> Option<String> {
+        if self.failed.is_empty() && self.not_asked.is_empty() {
+            return None;
+        }
+        let listed = |v: &[(String, String)]| {
+            v.iter()
+                .map(|(name, why)| format!("{name} ({why})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut parts = Vec::new();
+        if !self.failed.is_empty() {
+            parts.push(format!("rejected by {}", listed(&self.failed)));
+        }
+        if !self.not_asked.is_empty() {
+            parts.push(format!("never reached {}", listed(&self.not_asked)));
+        }
+        Some(format!(
+            "SMTP settings saved, but they reached only {} of {} servers — {}. \
+             Mail sent from the others will keep using whatever they were last given; \
+             save SMTP again once they are back online.",
+            self.configured.len(),
+            self.total(),
+            parts.join("; "),
+        ))
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "configured": self.configured,
+            "failed": self.failed.iter()
+                .map(|(server, error)| serde_json::json!({ "server": server, "error": error }))
+                .collect::<Vec<_>>(),
+            "not_asked": self.not_asked.iter()
+                .map(|(server, status)| serde_json::json!({ "server": server, "status": status }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Push SMTP configuration at every member of the fleet.
+///
+/// The setting is panel-global, so its destination is too. This used to post to
+/// the single agent `ServerScope` resolved from the caller's `X-Server-Id`
+/// header, which produced both halves of the same defect: the DECRYPTED password
+/// landed on whichever box the browser happened to have in its picker, and every
+/// other member was never configured at all — so mail from those hosts failed for
+/// ever, reported by nothing but a `tracing::warn!`. Same shape as
+/// `mail::sync_mail_config`, which syncs Postfix maps to one header-chosen host.
+///
+/// ⚠ This is the panel's ONLY caller of the agent's `/smtp/configure`. Nothing
+/// re-pushes on check-in or on server registration, so a member that is offline
+/// at save time stays unconfigured until an operator saves SMTP again. That is
+/// precisely why a host that could not be asked comes back as a named result
+/// instead of being skipped quietly — the report is the only reconciliation there
+/// is.
+async fn push_smtp_to_fleet(state: &AppState, agent_body: serde_json::Value) -> SmtpPush {
+    let fleet = state.agents.online_fleet().await;
+
+    let mut push = SmtpPush {
+        configured: Vec::new(),
+        failed: Vec::new(),
+        not_asked: Vec::new(),
+    };
+
+    for member in &fleet {
+        match member.agent.post("/smtp/configure", Some(agent_body.clone())).await {
+            Ok(_) => push.configured.push(member.name.clone()),
+            Err(e) => {
+                tracing::warn!(
+                    "SMTP configure failed on {} ({}): {e}",
+                    member.name,
+                    member.id
+                );
+                push.failed.push((member.name.clone(), e.to_string()));
             }
         }
     }
 
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // `online_fleet` yields only servers that are online AND resolve to an agent;
+    // it skips the rest rather than substituting, which is right for a background
+    // loop and not enough here. An operator pressing Save is entitled to know that
+    // a registered server was left out, so the ones it skipped are counted by
+    // difference — no second predicate to drift away from the first.
+    let asked: Vec<uuid::Uuid> = fleet.iter().map(|m| m.id).collect();
+    push.not_asked = sqlx::query_as(
+        "SELECT name, status FROM servers WHERE NOT (id = ANY($1)) ORDER BY name",
+    )
+    .bind(asked.as_slice())
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    push
 }
 
 /// POST /api/settings/smtp/test — Send a test email (admin only).
+///
+/// Deliberately single-host, unlike the save above, and that is a difference in
+/// the QUESTION rather than an inconsistency. Saving is a fleet-wide change and
+/// has to reach every host that will send mail; a test asks whether ONE host can
+/// send, and fanning it out would put N copies of the same message in the
+/// operator's inbox and take as long as the slowest box to answer. The caller's
+/// selected server is the right subject for that question.
+///
+/// It is only defensible while the answer says which host it came from, so the
+/// reply names it. An unattributed "Email sent" read as a claim about the panel
+/// is how one box's success came to stand for the fleet's in the first place.
 pub async fn test_email(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
     Json(body): Json<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
 
@@ -258,19 +484,38 @@ pub async fn test_email(
         "from_name": from_name,
     });
 
+    // Resolved before the send so the answer can be attributed even when the row
+    // has since gone; a missing name is left off rather than guessed, because
+    // "sent from <the wrong host>" would be worse than saying nothing.
+    let server_row: Option<(String,)> = sqlx::query_as("SELECT name FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let server_name = server_row.map(|(n,)| n);
+
     let result = agent
         .post("/smtp/test", Some(agent_body))
         .await
         .map_err(|e| agent_error("SMTP test email", e))?;
 
     let message = result.get("message").and_then(|v| v.as_str()).unwrap_or("Email sent");
+    let message = match &server_name {
+        Some(name) => format!("{message} (sent from {name})"),
+        None => message.to_string(),
+    };
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "smtp.test",
-        Some("settings"), None, Some(&to), None,
+        Some("settings"), None, Some(&to), None, claims.key_id,
     ).await;
 
-    Ok(Json(serde_json::json!({ "ok": true, "message": message })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": message,
+        "server": server_name,
+    })))
 }
 
 /// POST /api/settings/test-webhook — Test Slack/Discord webhook
@@ -288,9 +533,13 @@ pub async fn test_webhook(
 
     // SSRF: the destination is user-supplied and blind-followed; block internal
     // addresses (admin-triggered, but defense-in-depth + parity with the send path).
-    if let Err(e) = crate::helpers::validate_url_not_internal(url).await {
-        return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid webhook URL: {e}")));
-    }
+    //
+    // Pinned to the address this check approves, via a fresh client built for
+    // THIS request — a shared client's own resolver would otherwise look
+    // `url`'s host up a second, independent time for the real connection,
+    // reopening the validate/connect gap the check above exists to close.
+    let (host, port) = crate::helpers::url_authority(url)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("Invalid webhook URL: {e}")))?;
 
     let payload = if service == "slack" {
         serde_json::json!({ "text": "DockPanel test notification — your Slack webhook is working!" })
@@ -298,14 +547,17 @@ pub async fn test_webhook(
         serde_json::json!({ "content": "DockPanel test notification — your Discord webhook is working!" })
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        // Refuse redirects: a public destination that 3xx-redirects to an internal
-        // address would otherwise bypass the SSRF allow-check above. Panic on build
-        // failure rather than falling back to a redirect-following default client.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build test-webhook http client");
+    let client = crate::helpers::pinned_client(
+        &host,
+        port,
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            // Refuse redirects: a public destination that 3xx-redirects to an internal
+            // address would otherwise bypass the SSRF allow-check above.
+            .redirect(reqwest::redirect::Policy::none()),
+    )
+    .await
+    .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("Invalid webhook URL: {e}")))?;
     let resp = client.post(url).json(&payload).send().await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Webhook request failed: {e}")))?;
 
@@ -567,6 +819,7 @@ pub async fn export_config(
 pub async fn import_config(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let settings_obj = body.get("settings").and_then(|s| s.as_object())
@@ -576,8 +829,7 @@ pub async fn import_config(
     // the same list now, not a second copy that drifts away from it.
     let allowed_keys = ALLOWED_KEYS;
 
-    const SENSITIVE_KEYS: &[&str] = &["smtp_password", "pdns_api_key"];
-
+    // `SENSITIVE_KEYS` is the module-level const above, not a local copy.
     let mut imported = 0;
     let mut skipped = 0;
     for (key, value) in settings_obj {
@@ -586,8 +838,8 @@ pub async fn import_config(
             continue; // Skip disallowed keys
         }
         if let Some(val) = value.as_str() {
-            // Encrypt sensitive values before storing (same logic as update())
-            let store_value = if SENSITIVE_KEYS.contains(&key.as_str()) || key.ends_with("_client_secret") {
+            // Encrypt sensitive values before storing (same predicate as update())
+            let store_value = if is_sensitive_key(key) {
                 if val.is_empty() {
                     val.to_string()
                 } else {
@@ -613,6 +865,7 @@ pub async fn import_config(
 
     // Import alert rules
     let mut alert_rules_imported = 0i64;
+    let mut muted_types_dropped = 0i64;
     if let Some(rules) = body.get("alert_rules").and_then(|v| v.as_array()) {
         for rule in rules {
             let cpu_threshold = rule.get("cpu_threshold").and_then(|v| v.as_i64()).unwrap_or(90) as i32;
@@ -624,13 +877,38 @@ pub async fn import_config(
             let alert_memory = rule.get("alert_memory").and_then(|v| v.as_bool()).unwrap_or(true);
             let alert_disk = rule.get("alert_disk").and_then(|v| v.as_bool()).unwrap_or(true);
             let alert_offline = rule.get("alert_offline").and_then(|v| v.as_bool()).unwrap_or(true);
-            let alert_backup_failure = rule.get("alert_backup_failure").and_then(|v| v.as_bool()).unwrap_or(false);
-            let alert_ssl_expiry = rule.get("alert_ssl_expiry").and_then(|v| v.as_bool()).unwrap_or(false);
-            let alert_service_health = rule.get("alert_service_health").and_then(|v| v.as_bool()).unwrap_or(false);
+            // ⚠ `true`, matching the schema. `alerting_system.sql` declares all
+            // three `NOT NULL DEFAULT TRUE`, and the four fields above already
+            // default the way the schema does — these three defaulted FALSE, so a
+            // config written by an older version, hand-edited, or produced by
+            // anything but this build's own export silently switched off backup,
+            // SSL-expiry and service-health alerting on import. Nothing said so:
+            // there is no UI widget for these columns, and `alert_ssl_expiry` off
+            // also consumed the expiry warning ladder's rungs (see
+            // `try_fire_alert`), so the effect outlived the import.
+            let alert_backup_failure = rule.get("alert_backup_failure").and_then(|v| v.as_bool()).unwrap_or(true);
+            let alert_ssl_expiry = rule.get("alert_ssl_expiry").and_then(|v| v.as_bool()).unwrap_or(true);
+            let alert_service_health = rule.get("alert_service_health").and_then(|v| v.as_bool()).unwrap_or(true);
             let ssl_warning_days = rule.get("ssl_warning_days").and_then(|v| v.as_str()).unwrap_or("14");
             let notify_email = rule.get("notify_email").and_then(|v| v.as_bool()).unwrap_or(true);
             let cooldown = rule.get("cooldown_minutes").and_then(|v| v.as_i64()).unwrap_or(15) as i32;
-            let muted_types = rule.get("muted_types").and_then(|v| v.as_str()).unwrap_or("");
+            // A restored suppression list can name a type this version no longer
+            // pages about. Kept verbatim it would suppress nothing while reading
+            // back as though it worked, so drop the dead tokens and count them.
+            // The live edit path rejects instead; here the convention this
+            // handler already states for monitors applies — salvage the row
+            // rather than fail the whole restore over one stale token.
+            let muted_raw = rule.get("muted_types").and_then(|v| v.as_str()).unwrap_or("");
+            let dead = crate::services::notifications::unknown_suppressible_types(muted_raw);
+            muted_types_dropped += dead.len() as i64;
+            let muted_owned: String = muted_raw
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .filter(|s| !dead.iter().any(|d| d == s))
+                .collect::<Vec<_>>()
+                .join(",");
+            let muted_types = muted_owned.as_str();
 
             // Upsert: if server_id is null, update the global (server_id IS NULL) rule
             let server_id: Option<uuid::Uuid> = rule
@@ -795,9 +1073,16 @@ pub async fn import_config(
         }
     }
 
+    let ip = crate::routes::client_ip(&headers);
+
     crate::services::activity::log_activity(
         &state.db, claims.sub, &claims.email, "settings.import",
-        Some("settings"), None, None, None,
+        Some("settings"), None, None, ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db, "settings.import", Some(&claims.email), ip.as_deref(),
+        Some("settings"), None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -805,6 +1090,7 @@ pub async fn import_config(
         "imported": imported,
         "skipped": skipped,
         "alert_rules_imported": alert_rules_imported,
+        "muted_types_dropped": muted_types_dropped,
         "monitors_imported": monitors_imported,
         "schedules_imported": schedules_imported,
         "policies_imported": policies_imported,
@@ -917,5 +1203,97 @@ pub async fn health(
         "db": db_status,
         "agent": agent_status,
         "uptime": uptime,
+    })))
+}
+
+/// POST /api/settings/credentials/reencrypt — rewrite every stored credential
+/// under the current primary encryption key.
+///
+/// The operator-facing half of the `SECRETS_ENCRYPTION_KEY` story. Since
+/// v2.112.0 the decrypt chain tries every derivation a value could have been
+/// written under, so changing that variable is survivable — but until the rows
+/// are rewritten the install is leaning on a fallback arm and the old
+/// derivation can never be retired. This endpoint does the rewriting.
+///
+/// Idempotent and safe to re-run: a row already under the primary key is
+/// counted and skipped, and a row no candidate key can open is reported as
+/// `unreadable` and **left exactly as it is** — overwriting the only copy of a
+/// ciphertext we cannot read would turn a recoverable state into a permanent
+/// one, which is the failure this whole change exists to prevent.
+pub async fn reencrypt_credentials(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let reports =
+        crate::services::credential_reencrypt::reencrypt_all(&state.db, &state.config.jwt_secret)
+            .await;
+
+    let rewritten: i64 = reports.iter().map(|r| r.rewritten).sum();
+    let unreadable: i64 = reports.iter().map(|r| r.unreadable).sum();
+    let examined: i64 = reports.iter().map(|r| r.examined).sum();
+    let raced: i64 = reports.iter().map(|r| r.raced).sum();
+
+    let ip = crate::routes::client_ip(&headers);
+
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "settings.credentials.reencrypt",
+        Some("settings"),
+        None,
+        Some(&format!(
+            "examined {examined}, rewritten {rewritten}, unreadable {unreadable}, raced {raced}"
+        )),
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "settings.credentials.reencrypt",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("settings"),
+        None,
+        Some(&format!(
+            "examined {examined}, rewritten {rewritten}, unreadable {unreadable}, raced {raced}"
+        )),
+        None,
+        "warning",
+        claims.key_id,
+    )
+    .await;
+
+    if unreadable > 0 {
+        tracing::error!(
+            "credential re-encryption finished with {unreadable} unreadable value(s) — those rows \
+             were left untouched. They were encrypted with a key this process cannot derive; \
+             restoring the previous {} is the way back.",
+            crate::services::secrets_crypto::ENCRYPTION_KEY_ENV
+        );
+    }
+    if raced > 0 {
+        // Not an error: a normal write beat the sweep to a row and the CAS
+        // guard correctly skipped it rather than clobbering the newer value.
+        // Re-running the sweep re-keys it once nothing races it.
+        tracing::warn!(
+            "credential re-encryption skipped {raced} row(s) that changed concurrently — \
+             run it again to pick them up"
+        );
+    }
+
+    Ok(Json(serde_json::json!({
+        "examined": examined,
+        "rewritten": rewritten,
+        "unreadable": unreadable,
+        "raced": raced,
+        "subjects": reports,
+        // Which surfaces this sweep claims to cover, so the answer to "did it
+        // touch my X?" is in the response rather than in someone's memory.
+        "covered_modules": crate::services::credential_reencrypt::covered_module_names(),
+        "swept_subjects": crate::services::credential_reencrypt::swept_subjects(),
     })))
 }

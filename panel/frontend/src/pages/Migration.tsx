@@ -1,5 +1,5 @@
 import { useAuth } from "../context/AuthContext";
-import { Navigate } from "react-router-dom";
+import { Link, Navigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { api, ApiError } from "../api";
 
@@ -70,12 +70,19 @@ export default function Migration() {
   // below the hooks; the redirect is unchanged.
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [source, setSource] = useState("cpanel");
+  const [inputMode, setInputMode] = useState<"path" | "url">("path");
   const [backupPath, setBackupPath] = useState("");
+  const [backupUrl, setBackupUrl] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState("");
   const [migration, setMigration] = useState<MigrationRecord | null>(null);
   const [selectedSites, setSelectedSites] = useState<Set<string>>(new Set());
   const [selectedDbs, setSelectedDbs] = useState<Set<string>>(new Set());
+  // Which site each selected database belongs to, keyed by database name. A
+  // database row cannot exist without a site, and a control-panel archive does
+  // not record the pairing — so it is the operator's to state. Left empty when
+  // there is exactly one site to choose, because then there is nothing to ask.
+  const [dbSites, setDbSites] = useState<Record<string, string>>({});
   const [progress, setProgress] = useState<ProgressStep[]>([]);
   const [importing, setImporting] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
@@ -121,7 +128,9 @@ export default function Migration() {
   // Cloudflare error page that carried no JSON to read. The work always
   // continued on the server; nothing was ever able to come back and say so.
   const handleAnalyze = async () => {
-    if (!backupPath.trim()) return;
+    const trimmedPath = backupPath.trim();
+    const trimmedUrl = backupUrl.trim();
+    if (inputMode === "path" ? !trimmedPath : !trimmedUrl) return;
     startedHere.current = true;
     setError("");
     setAnalyzing(true);
@@ -130,7 +139,7 @@ export default function Migration() {
     setElapsed(0);
     try {
       const res = await api.post<MigrationRecord>("/migration/analyze", {
-        path: backupPath.trim(),
+        ...(inputMode === "path" ? { path: trimmedPath } : { url: trimmedUrl }),
         source,
       });
       if (res.status === "analyzing") {
@@ -220,6 +229,17 @@ export default function Migration() {
     })();
   }, [isAdmin]);
 
+  // The sites this run will create, which are the only ones a database imported
+  // alongside them can be attached to — plus whatever the operator has already.
+  const selectedSiteDomains = migration?.inventory
+    ? migration.inventory.sites.filter((s) => selectedSites.has(s.domain)).map((s) => s.domain)
+    : [];
+  // One site is not a question. Several is, and an unanswered one is refused by
+  // the server rather than guessed at, so the button below refuses first.
+  const siteForDb = (name: string) =>
+    dbSites[name] || (selectedSiteDomains.length === 1 ? selectedSiteDomains[0] : "");
+  const dbsWithoutSite = Array.from(selectedDbs).filter((n) => !siteForDb(n));
+
   // Step 3: Import
   const handleImport = async () => {
     if (!migration?.inventory) return;
@@ -235,7 +255,12 @@ export default function Migration() {
           .map((s) => ({ domain: s.domain, doc_root: s.doc_root, runtime: s.runtime })),
         databases: migration.inventory.databases
           .filter((d) => selectedDbs.has(d.name))
-          .map((d) => ({ name: d.name, file: d.file, engine: d.engine })),
+          .map((d) => ({
+            name: d.name,
+            file: d.file,
+            engine: d.engine,
+            site_domain: siteForDb(d.name) || undefined,
+          })),
       });
 
       // Connect SSE for progress
@@ -287,7 +312,13 @@ export default function Migration() {
     <div className="p-6 space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-dark-50 font-mono">Migration Wizard</h1>
-        <p className="text-sm text-dark-300 mt-1">Import sites, databases, and email from cPanel, Plesk, or HestiaCP</p>
+        {/* "and email" used to be here. It was never true: there is no mail import
+            route and no mail import function — the request body carries only `sites`
+            and `databases`. cPanel archives are PARSED for mail accounts so the
+            wizard can list them, and Plesk and HestiaCP do not even do that. The
+            screen already said so 160 lines below, under the inventory. A header
+            that promises what its own body retracts is worse than silence. #107. */}
+        <p className="text-sm text-dark-300 mt-1">Import sites and databases from cPanel, Plesk, or HestiaCP — mail accounts are listed for reference, not moved</p>
       </div>
 
       {/* Step indicator */}
@@ -328,22 +359,57 @@ export default function Migration() {
           </div>
 
           <div>
-            <label className="block text-sm text-dark-200 mb-1">Backup File Path</label>
-            <input
-              value={backupPath}
-              onChange={(e) => setBackupPath(e.target.value)}
-              placeholder="/var/backups/backup-1.2.2026_12-00-00_username.tar.gz"
-              className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded-lg text-dark-50 text-sm focus:border-rust-500 focus:outline-none font-mono"
-            />
-            <p className="text-xs text-dark-400 mt-1">
-              Upload the backup to your server via SFTP first, then enter the full path here.
-              It must be under <code className="text-dark-200">/var/backups/</code> or <code className="text-dark-200">/tmp/</code>.
-            </p>
+            <div className="flex gap-2 mb-3">
+              {([
+                { id: "path" as const, label: "Path on server" },
+                { id: "url" as const, label: "Fetch from URL" },
+              ]).map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => setInputMode(m.id)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${inputMode === m.id ? "bg-rust-500 text-dark-950" : "bg-dark-900 text-dark-300 border border-dark-600 hover:border-dark-400"}`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {inputMode === "path" ? (
+              <>
+                <label className="block text-sm text-dark-200 mb-1">Backup File Path</label>
+                <input
+                  value={backupPath}
+                  onChange={(e) => setBackupPath(e.target.value)}
+                  placeholder="/var/backups/backup-1.2.2026_12-00-00_username.tar.gz"
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded-lg text-dark-50 text-sm focus:border-rust-500 focus:outline-none font-mono"
+                />
+                <p className="text-xs text-dark-400 mt-1">
+                  Upload the backup to your server via SFTP first, then enter the full path here.
+                  It must be under <code className="text-dark-200">/var/backups/</code>.{" "}
+                  <code className="text-dark-200">/tmp/</code> will not work: the agent runs with
+                  a private <code className="text-dark-200">/tmp</code> and cannot see the host's.
+                </p>
+              </>
+            ) : (
+              <>
+                <label className="block text-sm text-dark-200 mb-1">Backup URL</label>
+                <input
+                  value={backupUrl}
+                  onChange={(e) => setBackupUrl(e.target.value)}
+                  placeholder="https://example.com/backup-1.2.2026_12-00-00_username.tar.gz"
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded-lg text-dark-50 text-sm focus:border-rust-500 focus:outline-none font-mono"
+                />
+                <p className="text-xs text-dark-400 mt-1">
+                  The server downloads the archive itself — no SFTP step needed. HTTP(S) only, and
+                  the URL must not resolve to an internal or private address.
+                </p>
+              </>
+            )}
           </div>
 
           <button
             onClick={handleAnalyze}
-            disabled={!backupPath.trim() || analyzing}
+            disabled={(inputMode === "path" ? !backupPath.trim() : !backupUrl.trim()) || analyzing}
             className="px-5 py-2.5 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors disabled:opacity-50"
           >
             {analyzing ? "Analyzing..." : "Analyze Backup"}
@@ -438,9 +504,37 @@ export default function Migration() {
                       <span className="text-sm text-dark-50 font-mono">{d.name}</span>
                       <span className="text-xs text-dark-400 ml-2">{d.engine} &middot; {fmtSize(d.size_bytes)}</span>
                     </div>
+                    {/* A database belongs to a site — the archive does not say
+                        which, so this is the only place the answer can come
+                        from. Shown only when there is a choice to make. */}
+                    {selectedDbs.has(d.name) && selectedSiteDomains.length > 1 && (
+                      <select
+                        aria-label={`Site for database ${d.name}`}
+                        value={siteForDb(d.name)}
+                        onClick={(e) => e.preventDefault()}
+                        onChange={(e) => setDbSites({ ...dbSites, [d.name]: e.target.value })}
+                        className="px-2 py-1 bg-dark-900 border border-dark-500 rounded text-xs text-dark-50 font-mono"
+                      >
+                        <option value="">Choose a site…</option>
+                        {selectedSiteDomains.map((dom) => (
+                          <option key={dom} value={dom}>{dom}</option>
+                        ))}
+                      </select>
+                    )}
                   </label>
                 ))}
               </div>
+              {selectedDbs.size > 0 && selectedSiteDomains.length === 0 && (
+                <p className="text-xs text-warn-400 mt-3">
+                  A database has to belong to a site. Select at least one site above, or import the
+                  site first and run this again — otherwise these databases will be refused.
+                </p>
+              )}
+              {selectedSiteDomains.length === 1 && selectedDbs.size > 0 && (
+                <p className="text-xs text-dark-400 mt-3">
+                  Databases will be attached to <span className="font-mono text-dark-200">{selectedSiteDomains[0]}</span>.
+                </p>
+              )}
             </div>
           )}
 
@@ -463,12 +557,18 @@ export default function Migration() {
             </button>
             <button
               onClick={handleImport}
-              disabled={selectedSites.size === 0 && selectedDbs.size === 0}
+              disabled={(selectedSites.size === 0 && selectedDbs.size === 0) || dbsWithoutSite.length > 0}
+              title={dbsWithoutSite.length > 0 ? `Choose a site for: ${dbsWithoutSite.join(", ")}` : undefined}
               className="px-5 py-2.5 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors disabled:opacity-50"
             >
               Import {selectedSites.size + selectedDbs.size} item{selectedSites.size + selectedDbs.size !== 1 ? "s" : ""}
             </button>
           </div>
+          {dbsWithoutSite.length > 0 && (
+            <p className="text-xs text-warn-400">
+              Choose a site for {dbsWithoutSite.join(", ")} before importing.
+            </p>
+          )}
         </div>
       )}
 
@@ -532,12 +632,15 @@ export default function Migration() {
           </div>
 
           <div className="flex gap-3">
-            <a href="/sites" className="px-4 py-2 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors">
+            {/* `Link`, not `<a href>`: an anchor to an in-app route reloads the
+                whole SPA — it discards the router, refetches the bundle and
+                throws away the migration result the operator is looking at. */}
+            <Link to="/sites" className="px-4 py-2 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors">
               View Sites
-            </a>
-            <a href="/databases" className="px-4 py-2 bg-dark-700 text-dark-200 rounded-lg text-sm hover:bg-dark-600 transition-colors">
+            </Link>
+            <Link to="/databases" className="px-4 py-2 bg-dark-700 text-dark-200 rounded-lg text-sm hover:bg-dark-600 transition-colors">
               View Databases
-            </a>
+            </Link>
             <button onClick={() => { setStep(1); setMigration(null); setProgress([]); setError(""); }} className="px-4 py-2 bg-dark-700 text-dark-200 rounded-lg text-sm hover:bg-dark-600 transition-colors">
               Start New Migration
             </button>

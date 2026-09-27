@@ -20,7 +20,7 @@ const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 /// than at a call site because `env_clear()` means a unit-level `Environment=`
 /// would never reach the child, and because ~77 docker invocations share these
 /// helpers — one of them silently missing it is exactly the drift that hid this.
-const DOCKER_CONFIG_DIR: &str = "/var/lib/dockpanel/docker";
+pub const DOCKER_CONFIG_DIR: &str = "/var/lib/dockpanel/docker";
 
 /// Create an async `tokio::process::Command` with a sanitized environment.
 ///
@@ -68,6 +68,32 @@ pub fn safe_command_sync(binary: &str) -> std::process::Command {
 /// can read the result back.
 const CAPTURE_DIR: &str = "/var/lib/dockpanel/run";
 
+/// The filesystem path capture logic actually writes to.
+///
+/// Identical to [`CAPTURE_DIR`] in production. Under `cargo test` it
+/// resolves instead to a scratch directory under the process's own temp
+/// dir: `cargo test` runs unprivileged (concretely: GitHub Actions' runner
+/// user), which cannot `create_dir_all` anything under `/var/lib` — every
+/// `DockerEnvFile` test failed with `PermissionDenied` in CI from the
+/// moment those tests started actually calling `.new()` (v2.201.0) because
+/// nothing distinguished a test run from a production one. `CAPTURE_DIR`
+/// itself stays the literal production path so the RHEL SELinux pin below
+/// keeps measuring what actually ships.
+///
+/// Branches on the `cfg!(test)` macro rather than a `#[cfg(test)]`
+/// attribute deliberately: an attribute would put the literal token
+/// `#[cfg(test)]` ahead of the real `#[cfg(test)] mod tests` block this
+/// file already ends with, and every pin suite that reads this file treats
+/// the FIRST such token as "everything after this is test code, stop
+/// measuring" — see reference_dockpanel_ops_p7's mid-file cfg(test) gate.
+fn capture_dir() -> std::path::PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join("dockpanel-test-capture")
+    } else {
+        std::path::PathBuf::from(CAPTURE_DIR)
+    }
+}
+
 /// Counter making capture filenames unique within a process.
 static CAPTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -108,6 +134,26 @@ static CAPTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Env vars passed via `extra_env` reach the inner binary as `--setenv=K=V`.
 /// The defaults (PATH, HOME, LANG, LC_ALL, DEBIAN_FRONTEND, DOCKER_CONFIG) are
 /// always set so it does not inherit PID1's wider environment.
+/// Escape a literal `$` for the inner command's argv, live-verified necessary
+/// on a fresh VPS: `systemd-run` turns the trailing argv into the transient
+/// unit's own `ExecStart=`, which systemd's unit-file grammar subjects to
+/// `$VAR`/`${VAR}` environment-variable expansion — undocumented for
+/// `systemd-run`'s own command line, but real. An argument like a SHA-crypt
+/// hash (`$6$salt$hash`) silently loses everything from the first unset `$6`
+/// onward, which does not fail loudly: the wrapped command just receives
+/// fewer/garbled arguments and reports its own generic usage error, with
+/// nothing in this codebase pointing at the real cause. systemd's own escape
+/// for a literal `$` is `$$` (confirmed empirically: `$$6$$abc$$def` round-
+/// trips to `$6$abc$def` through this exact systemd-run invocation shape).
+/// Every argument passed through [`UnsandboxedCommand::arg`]/`args` (and the
+/// sync sibling) is escaped here so no future caller has to know this.
+fn escape_dollar_for_systemd_run(a: &std::ffi::OsStr) -> std::ffi::OsString {
+    match a.to_str() {
+        Some(s) if s.contains('$') => std::ffi::OsString::from(s.replace('$', "$$")),
+        _ => a.to_os_string(),
+    }
+}
+
 pub struct UnsandboxedCommand {
     argv: Vec<std::ffi::OsString>,
 }
@@ -121,7 +167,7 @@ impl UnsandboxedCommand {
 
     /// Append one argument to the **inner** binary.
     pub fn arg<S: AsRef<std::ffi::OsStr>>(&mut self, a: S) -> &mut Self {
-        self.argv.push(a.as_ref().to_os_string());
+        self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         self
     }
 
@@ -132,7 +178,7 @@ impl UnsandboxedCommand {
         S: AsRef<std::ffi::OsStr>,
     {
         for a in args {
-            self.argv.push(a.as_ref().to_os_string());
+            self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         }
         self
     }
@@ -145,8 +191,79 @@ impl UnsandboxedCommand {
         cmd.env("PATH", SAFE_PATH);
         cmd.args(cap.properties());
         cmd.args(&self.argv);
+        // Callers building the inner argv have no way to reach this
+        // `Command` themselves, so `kill_on_drop` must be set HERE — the one
+        // place that can. Without it, a caller-side `tokio::time::timeout`
+        // around this future does not kill `systemd-run` on expiry: the
+        // future is dropped, but the child (and whatever it started via
+        // `--wait`) keeps running orphaned. Same class as every
+        // caller-missing-`.kill_on_drop(true)` bug already fixed on the
+        // `safe_command`-built path (s446-s457).
+        cmd.kill_on_drop(true);
         let raw = cmd.output().await?;
         Ok(cap.finish(raw))
+    }
+
+    /// Run to completion within `timeout`, and make sure the PRIVILEGED WORK
+    /// ITSELF stops when the timeout fires — not merely the local process
+    /// that was waiting on it.
+    ///
+    /// # Why [`Self::output`] plus a caller-side `tokio::time::timeout` is not enough
+    ///
+    /// `kill_on_drop(true)` on the local `systemd-run` client (see
+    /// [`Self::output`]) only kills the WAITER. The privileged command itself
+    /// runs inside a *separate* systemd transient unit, started by PID1 in
+    /// its own cgroup and fully decoupled from this process's lifecycle —
+    /// that decoupling is the entire reason `--wait` has to exist at all (it
+    /// is `systemd-run` polling the unit on our behalf, not a parent/child
+    /// relationship the kernel would tear down together). So when a caller
+    /// wraps [`Self::output`] in `tokio::time::timeout(...)` and it fires,
+    /// dropping that future kills the local `systemd-run` client and
+    /// **nothing else**: a hung `apt-get`/`dnf` transaction inside the
+    /// transient unit keeps running, orphaned, with no process left anywhere
+    /// that could ever notice or reap it. Live-proven in a prior session:
+    /// killing the local `systemd-run` PID left the transient unit
+    /// `active (running)` in `systemctl status`, indefinitely.
+    ///
+    /// Stopping the right thing on expiry requires knowing the unit's own
+    /// name, so this method assigns it a caller-known one up front via
+    /// `--unit=NAME` — which composes fine alongside `--collect` (that flag
+    /// only means "discard the unit's state once it exits, whatever the
+    /// outcome"; it says nothing about how the unit is named) — instead of
+    /// leaving naming to `--collect`'s own auto-generated scheme, which no
+    /// caller could predict or act on. On timeout, it then asks systemd to
+    /// stop that exact unit directly.
+    ///
+    /// Cleanup is deliberately best-effort and fire-and-forget
+    /// (`systemctl stop --no-block`, result discarded, run as a detached
+    /// task rather than awaited): this function's contract to its caller is
+    /// already broken the moment the timeout fires, and a cleanup step that
+    /// itself blocks or fails must never delay or mask the timeout error the
+    /// caller is already waiting on.
+    pub async fn output_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<std::process::Output, String> {
+        let (binary, unit) = insert_unit_arg(&mut self.argv);
+
+        match tokio::time::timeout(timeout, self.output()).await {
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(e)) => Err(format!("{binary} could not be run: {e}")),
+            Err(_) => {
+                let stop_unit = unit.clone();
+                tokio::spawn(async move {
+                    let _ = safe_command("systemctl")
+                        .args(["stop", "--no-block", &stop_unit])
+                        .output()
+                        .await;
+                });
+                Err(format!(
+                    "{binary} timed out after {}s (unit {unit}) and was asked to stop in the \
+                     background",
+                    timeout.as_secs()
+                ))
+            }
+        }
     }
 
     /// Spawn and stream the inner command's output line by line as it is
@@ -166,6 +283,7 @@ impl UnsandboxedCommand {
         cmd.args(&self.argv);
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
         let mut child = cmd.spawn()?;
 
         let (tx, lines) = tokio::sync::mpsc::channel::<String>(128);
@@ -290,7 +408,7 @@ impl UnsandboxedCommandSync {
 
     /// Append one argument to the **inner** binary.
     pub fn arg<S: AsRef<std::ffi::OsStr>>(&mut self, a: S) -> &mut Self {
-        self.argv.push(a.as_ref().to_os_string());
+        self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         self
     }
 
@@ -301,7 +419,7 @@ impl UnsandboxedCommandSync {
         S: AsRef<std::ffi::OsStr>,
     {
         for a in args {
-            self.argv.push(a.as_ref().to_os_string());
+            self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         }
         self
     }
@@ -341,6 +459,43 @@ fn unsandboxed_prefix(binary: &str, extra_env: &[(&str, &str)]) -> Vec<std::ffi:
     argv
 }
 
+/// Give the transient unit a caller-known name and return `(inner binary,
+/// unit name)`, so [`UnsandboxedCommand::output_with_timeout`] knows what to
+/// tell systemd to stop if the timeout fires.
+///
+/// Pulled out as its own pure function — rather than living inline in
+/// `output_with_timeout` — so the insertion point and the name generator's
+/// collision safety can be unit-tested directly against a plain `argv`
+/// vector, without spawning a real `systemd-run` child (which the test
+/// environment may not even have installed).
+///
+/// `unsandboxed_prefix` pushes exactly one `--` — immediately before the
+/// inner binary — and does so before any caller `.arg()`/`.args()` call can
+/// add more argv entries, so the FIRST `--` in `argv` is always that
+/// separator, regardless of how many `--setenv=` entries `extra_env`
+/// produced ahead of it. Scanning for it, rather than assuming a fixed
+/// index, is what keeps this correct as `extra_env` varies the offset.
+/// `--unit=NAME` is inserted immediately BEFORE it so systemd-run reads it as
+/// one of its own options rather than passing it through to the inner
+/// binary.
+fn insert_unit_arg(argv: &mut Vec<std::ffi::OsString>) -> (String, String) {
+    let sep = argv
+        .iter()
+        .position(|a| a == "--")
+        .expect("unsandboxed_prefix always pushes a `--` separator");
+    let binary = argv
+        .get(sep + 1)
+        .map(|b| b.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // 32 lowercase hex chars, no hyphens — a shape `--unit=` and later
+    // `systemctl stop` both accept without quoting concerns. Matches the
+    // `.simple()` convention `routes/ssl_registry.rs` already uses for the
+    // same "unique, filesystem/argv-safe token" need.
+    let unit = format!("dockpanel-op-{}", uuid::Uuid::new_v4().simple());
+    argv.insert(sep, std::ffi::OsString::from(format!("--unit={unit}")));
+    (binary, unit)
+}
+
 /// A pair of files PID1 writes the transient unit's stdout/stderr into.
 ///
 /// Created 0600 *before* the run — package output can carry credentials, and
@@ -352,16 +507,16 @@ struct Capture {
 
 impl Capture {
     fn new() -> std::io::Result<Self> {
-        std::fs::create_dir_all(CAPTURE_DIR)?;
+        std::fs::create_dir_all(capture_dir())?;
         let _ = std::fs::set_permissions(
-            CAPTURE_DIR,
+            capture_dir(),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         );
         Self::sweep_stale();
         let n = CAPTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = format!("{}-{}", std::process::id(), n);
-        let out = std::path::Path::new(CAPTURE_DIR).join(format!("{base}.out"));
-        let err = std::path::Path::new(CAPTURE_DIR).join(format!("{base}.err"));
+        let out = capture_dir().join(format!("{base}.out"));
+        let err = capture_dir().join(format!("{base}.err"));
         for p in [&out, &err] {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
@@ -378,7 +533,7 @@ impl Capture {
     /// `tokio::time::timeout`) leaves its pair behind. Drop anything older than
     /// an hour so a box that times out repeatedly does not accumulate them.
     fn sweep_stale() {
-        let Ok(entries) = std::fs::read_dir(CAPTURE_DIR) else {
+        let Ok(entries) = std::fs::read_dir(capture_dir()) else {
             return;
         };
         let cutoff = std::time::Duration::from_secs(3600);
@@ -426,6 +581,77 @@ impl Capture {
             stdout,
             stderr,
         }
+    }
+}
+
+/// A temporary `docker run`/`docker exec` `--env-file` holding secrets (DB
+/// passwords) that must reach a container WITHOUT appearing in the `docker`
+/// CLI's own argv.
+///
+/// `/proc/<pid>/cmdline` is world-readable on every install this agent
+/// targets (no `hidepid=` mount restriction assumed or required elsewhere in
+/// this codebase), so a `-e MYSQL_PWD=secret`/`-e PGPASSWORD=secret` argument
+/// is visible to any local process for the lifetime of the `docker` child —
+/// including, concretely, a site-terminal session running as `www-data`. A
+/// `--env-file <path>` argument leaks only the path; the secret lives in a
+/// 0600 file only this agent's uid can read, and is gone the instant this
+/// guard drops.
+///
+/// Written immediately before use under [`CAPTURE_DIR`] (already proven
+/// writable + `dontaudit`-clean on every hardened distro this agent
+/// supports) and removed on drop — keep the guard bound in scope for as long
+/// as the `docker` child that reads it may still be running.
+pub struct DockerEnvFile {
+    path: std::path::PathBuf,
+}
+
+impl DockerEnvFile {
+    /// Write `vars` as `KEY=VALUE` lines to a fresh 0600 temp file.
+    pub fn new(vars: &[(&str, &str)]) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(capture_dir())?;
+        let _ = std::fs::set_permissions(
+            capture_dir(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        );
+        let n = CAPTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = capture_dir().join(format!("env-{}-{n}", std::process::id()));
+        let mut body = String::new();
+        for (k, v) in vars {
+            // `docker --env-file` reads one `KEY=VALUE` per line — an embedded
+            // newline in a value would silently start a second (bogus)
+            // variable rather than being passed through, so refuse it
+            // outright instead of writing a file docker will misparse.
+            if v.contains('\n') {
+                return Err(std::io::Error::other(format!(
+                    "env value for {k} must not contain a newline"
+                )));
+            }
+            body.push_str(k);
+            body.push('=');
+            body.push_str(v);
+            body.push('\n');
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(body.as_bytes())?;
+        Ok(Self { path })
+    }
+
+    /// The path to hand to `docker run --env-file <path>` / `docker exec --env-file <path>`.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for DockerEnvFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -489,6 +715,110 @@ mod tests {
         assert_eq!(&argv[sep + 1..], ["apt-get", "install", "-y", "redis-server"]);
     }
 
+    /// Live-verified on a fresh VPS: `$6$salt$hash` (a real SHA-crypt shape)
+    /// passed through this escape hatch reached the inner command as just
+    /// the text before the first `$`, everything after silently gone —
+    /// `systemd-run`'s transient-unit ExecStart= is subject to systemd's own
+    /// `$VAR`/`${VAR}` expansion, and none of `$6`/`$salt`/`$hash` are set.
+    /// `$$` is systemd's own escape for a literal `$` and round-trips
+    /// correctly through this exact invocation shape (confirmed on-box) —
+    /// this is why `arg`/`args` must double every `$` rather than merely
+    /// documenting the trap.
+    #[test]
+    fn a_dollar_sign_in_an_argument_is_escaped_for_systemd_run() {
+        let mut cmd = safe_command_unsandboxed("usermod", &[]);
+        cmd.args(["-p", "$6$abcdefgh$somehashvalue", "someuser"]);
+        let argv = argv_of(&cmd);
+        assert!(
+            argv.contains(&"$$6$$abcdefgh$$somehashvalue".to_string()),
+            "argv did not contain the doubled-dollar escaped hash: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "$6$abcdefgh$somehashvalue"),
+            "the raw, unescaped hash reached argv — this is exactly what silently \
+             mangles through systemd-run's own $VAR expansion"
+        );
+    }
+
+    /// An argument with no `$` at all must pass through byte-for-byte — the
+    /// escaping must be a no-op for the overwhelming majority of callers that
+    /// never touch this class of value.
+    #[test]
+    fn an_argument_with_no_dollar_sign_is_unchanged() {
+        let mut cmd = safe_command_unsandboxed("useradd", &[]);
+        cmd.args(["-u", "30001", "-d", "/var/dockpanel-sftp/example.com", "sftp30001"]);
+        assert_eq!(
+            argv_of(&cmd)[argv_of(&cmd).iter().position(|a| a == "--").unwrap() + 1..],
+            ["useradd", "-u", "30001", "-d", "/var/dockpanel-sftp/example.com", "sftp30001"]
+        );
+    }
+
+    /// `insert_unit_arg` must land `--unit=` immediately before the `--`
+    /// separator no matter how many `--setenv=` entries `extra_env` pushed
+    /// ahead of it — a fixed-index insert would have worked for the
+    /// zero-`extra_env` case in testing and then silently corrupted the
+    /// argv (splitting `--unit=` into the inner binary's own arguments) the
+    /// first time a caller passed one.
+    #[test]
+    fn unit_arg_lands_immediately_before_the_separator_regardless_of_extra_env_count() {
+        for extra_env in [
+            vec![],
+            vec![("PGPASSWORD", "s3cret")],
+            vec![("PGPASSWORD", "s3cret"), ("MYSQL_PWD", "x")],
+        ] {
+            let mut cmd = safe_command_unsandboxed("dnf", &extra_env);
+            cmd.args(["install", "-y", "redis"]);
+            let (binary, unit) = insert_unit_arg(&mut cmd.argv);
+            assert_eq!(binary, "dnf");
+
+            let argv = argv_of(&cmd);
+            let unit_pos = argv
+                .iter()
+                .position(|a| *a == format!("--unit={unit}"))
+                .expect("--unit= present in argv");
+            let sep_pos = argv.iter().position(|a| a == "--").expect("separator present");
+            assert_eq!(
+                unit_pos + 1,
+                sep_pos,
+                "--unit= must sit immediately before -- (extra_env len {})",
+                extra_env.len()
+            );
+            // The inner binary's own argv, past the separator, must be
+            // completely untouched by the insertion.
+            assert_eq!(&argv[sep_pos + 1..], ["dnf", "install", "-y", "redis"]);
+        }
+    }
+
+    /// Two operations racing each other must never be assigned the same
+    /// transient unit name — a collision would let one caller's
+    /// timeout-triggered `systemctl stop` kill the OTHER caller's still
+    /// legitimate, still-running transaction.
+    #[test]
+    fn unit_names_do_not_collide() {
+        let mut a = safe_command_unsandboxed("dnf", &[]);
+        let mut b = safe_command_unsandboxed("dnf", &[]);
+        let (_, unit_a) = insert_unit_arg(&mut a.argv);
+        let (_, unit_b) = insert_unit_arg(&mut b.argv);
+        assert_ne!(unit_a, unit_b);
+    }
+
+    /// The generated name must actually be a valid, unquoted systemd unit
+    /// identifier — no hyphens beyond the fixed prefix, no characters that
+    /// would need escaping in `--unit=` or a later `systemctl stop` argv.
+    #[test]
+    fn unit_name_is_a_plain_hex_token() {
+        let mut cmd = safe_command_unsandboxed("dnf", &[]);
+        let (_, unit) = insert_unit_arg(&mut cmd.argv);
+        let suffix = unit
+            .strip_prefix("dockpanel-op-")
+            .expect("unit name keeps the dockpanel-op- prefix");
+        assert_eq!(suffix.len(), 32, "uuid simple form is 32 hex characters");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "unit suffix must be plain hex: {suffix}"
+        );
+    }
+
     /// PID1 runs as `init_t` and may not write `tmp_t`, so a capture directory
     /// under /tmp would silently lose every command's output on RHEL.
     #[test]
@@ -497,6 +827,43 @@ mod tests {
             !CAPTURE_DIR.starts_with("/tmp") && !CAPTURE_DIR.starts_with("/var/tmp"),
             "capture files in {CAPTURE_DIR} would be denied to init_t on the RHEL family"
         );
+    }
+
+    /// THE WHOLE POINT: the secret must be in the FILE, never in the path we'd
+    /// hand to `docker`'s own argv (which `ps`/`/proc/<pid>/cmdline` exposes).
+    #[test]
+    fn docker_env_file_keeps_secret_out_of_its_own_path() {
+        let f = DockerEnvFile::new(&[("MYSQL_PWD", "t0psecret")]).unwrap();
+        let path_str = f.path().to_string_lossy();
+        assert!(!path_str.contains("t0psecret"), "secret leaked into the path: {path_str}");
+        let body = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(body, "MYSQL_PWD=t0psecret\n");
+    }
+
+    #[test]
+    fn docker_env_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = DockerEnvFile::new(&[("PGPASSWORD", "x")]).unwrap();
+        let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "env file must not be group/world readable");
+    }
+
+    #[test]
+    fn docker_env_file_removed_on_drop() {
+        let path = {
+            let f = DockerEnvFile::new(&[("MYSQL_PWD", "x")]).unwrap();
+            f.path().to_path_buf()
+        };
+        assert!(!path.exists(), "env file must not outlive its guard");
+    }
+
+    #[test]
+    fn docker_env_file_multiple_vars_and_rejects_embedded_newline() {
+        let f = DockerEnvFile::new(&[("A", "1"), ("B", "2")]).unwrap();
+        let body = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(body, "A=1\nB=2\n");
+
+        assert!(DockerEnvFile::new(&[("MYSQL_PWD", "line1\nline2")]).is_err());
     }
 
     #[test]

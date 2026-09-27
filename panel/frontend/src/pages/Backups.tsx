@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api } from "../api";
+import { useAuth } from "../context/AuthContext";
 import { formatSize, formatDate } from "../utils/format";
 import ProvisionLog from "../components/ProvisionLog";
 
@@ -51,6 +52,18 @@ function backupContents(b: Backup): { label: string; complete: boolean; title: s
   };
 }
 
+/** The sentence the operator reads BEFORE the restore is spawned.
+ *
+ *  `backupContents(b).title` is deliberately NOT reused here. Its reassuring
+ *  branch keys on `databases_expected` — what the site had *when the backup
+ *  ran* — while the backend decides on a live `SELECT ... FROM databases WHERE
+ *  site_id = $1`. A site that gained a database since would be told "no
+ *  database was attached" over exactly the case the restore then reports as an
+ *  error. `.label` is safe because it states a fact about the archive alone. */
+function restoreWarning(b: Backup): string {
+  return `Unpacks ${backupContents(b).label.toLowerCase()} over the live site. Anything not in it stays as it is now.`;
+}
+
 interface Site {
   id: string;
   domain: string;
@@ -88,6 +101,11 @@ export default function Backups() {
   const [creating, setCreating] = useState(false);
   const [restoring, setRestoring] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  // A restore drops and recreates every database in the archive over the live
+  // one and replaces the site's files, with no automatic safety net — and the
+  // guide documents a "Confirm the restore" step. Its own row already arms the
+  // strictly smaller Delete; this is the same two-step, on the bigger control.
+  const [restoreTarget, setRestoreTarget] = useState<string | null>(null);
   const [message, setMessage] = useState({ text: "", type: "" });
   const [backupSseId, setBackupSseId] = useState<string | null>(null);
   const [restoreSseId, setRestoreSseId] = useState<string | null>(null);
@@ -100,12 +118,20 @@ export default function Backups() {
   const [schedDestId, setSchedDestId] = useState("");
   const [schedRetention, setSchedRetention] = useState("7");
   const [savingSchedule, setSavingSchedule] = useState(false);
+  // Whether the destination list came back at all. An empty picker and a picker
+  // that failed to load render the same way unless something remembers which
+  // happened, and the honest sentence to show is different for each.
+  const [destinationsFailed, setDestinationsFailed] = useState(false);
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
 
   useEffect(() => {
     api.get<Site>(`/sites/${id}`).then(setSite).catch(() => {});
     loadBackups();
     loadSchedule();
-    api.get<BackupDestination[]>("/backup-destinations").then(setDestinations).catch(() => {});
+    api.get<BackupDestination[]>("/backup-destinations/selectable")
+      .then((d) => { setDestinations(d); setDestinationsFailed(false); })
+      .catch(() => setDestinationsFailed(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
@@ -315,12 +341,23 @@ export default function Backups() {
                       <option key={d.id} value={d.id}>{d.name} ({d.dtype})</option>
                     ))}
                   </select>
-                  {destinations.length === 0 && (
+                  {destinationsFailed ? (
+                    <p className="text-xs text-danger-400 mt-1">
+                      Could not load destinations. Reload the page, or contact your
+                      administrator if it keeps happening.
+                    </p>
+                  ) : destinations.length === 0 && (
                     <p className="text-xs text-warn-500 mt-1">
+                      {/* Backup Manager is administrator-only, so a client is told who
+                          can act rather than handed a door that bounces them back. */}
                       No destinations yet —{" "}
-                      <Link to="/backup-orchestrator?tab=destinations" className="underline hover:text-warn-400">
-                        add one in Backup Manager
-                      </Link>
+                      {isAdmin ? (
+                        <Link to="/backup-orchestrator?tab=destinations" className="underline hover:text-warn-400">
+                          add one in Backup Manager
+                        </Link>
+                      ) : (
+                        "ask your administrator to add one"
+                      )}
                     </p>
                   )}
                 </div>
@@ -482,13 +519,37 @@ export default function Backups() {
                   </td>
                   <td className="px-5 py-4 text-right">
                     <div className="flex items-center justify-end gap-2 flex-wrap">
-                      <button
-                        onClick={() => handleRestore(backup.id)}
-                        disabled={restoring === backup.id}
-                        className="px-3 py-1 bg-warn-500/10 text-warn-400 rounded-md text-xs font-medium hover:bg-warn-400/15 disabled:opacity-50 transition-colors"
-                      >
-                        {restoring === backup.id ? "Restoring..." : "Restore"}
-                      </button>
+                      {restoreTarget === backup.id ? (
+                        <div className="inline-flex items-center gap-1.5">
+                          <span className="text-[10px] text-danger-400 font-mono mr-1">
+                            {restoreWarning(backup)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => { setRestoreTarget(null); handleRestore(backup.id); }}
+                            className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-danger-500/10 hover:bg-danger-500/20 text-danger-400 border border-danger-500/40 rounded"
+                          >
+                            Restore
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRestoreTarget(null)}
+                            className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-dark-200 rounded"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setRestoreTarget(backup.id)}
+                          disabled={restoring === backup.id}
+                          title="Unpack this archive over the live site"
+                          className="px-3 py-1 bg-warn-500/10 text-warn-400 rounded-md text-xs font-medium hover:bg-warn-400/15 disabled:opacity-50 transition-colors"
+                        >
+                          {restoring === backup.id ? "Restoring..." : "Restore"}
+                        </button>
+                      )}
                       {deleteTarget === backup.id ? (
                         <div className="flex items-center gap-1">
                           <button

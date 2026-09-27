@@ -1,7 +1,8 @@
 {
   "name": "dockpanel-frontend",
   "private": true,
-  "version": "2.62.1",
+  "version": "2.242.1",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,7 +18,7 @@
     "marked": "^14.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-router-dom": "^7.18.1"
+    "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",

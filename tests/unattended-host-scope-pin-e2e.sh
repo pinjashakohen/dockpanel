@@ -348,7 +348,20 @@ fi
 PPB=$(fnbody "$AH_S" "prune_policy_backup")
 if [ -n "$PPB" ]; then
   # E4 — a failed unlink must KEEP the row: it is the only record of the archive.
-  if has "$PPB" "return false"; then
+  #
+  # ⛔ SCOPED TO THE UNLINK ARM AND COUNTED. Until s389 this was a whole-body
+  # `has "return false"`, and the body holds TWO of them — the remote-server
+  # guard that E5 pins separately, and the failed-unlink guard that E4 NAMES. So
+  # the guard this arm exists to protect could be deleted outright and E4 stayed
+  # green off its sibling. It had never been able to fail. Found by counting the
+  # literal inside its own subject, not by reading the arm.
+  PPB_UNLINK=$(awk '/match std::fs::remove_file\(filepath\)/,/^    \}$/' <<< "$PPB")
+  PPB_RF=$(/usr/bin/grep -oF -- "return false" <<< "$PPB" | wc -l | tr -d ' ')
+  if [ "$(wc -c <<< "$PPB_UNLINK")" -lt 200 ]; then
+    bad "E4 the unlink arm could not be isolated from prune_policy_backup — the arm measured nothing"
+  elif [ "$PPB_RF" != "2" ]; then
+    bad "E4 expected exactly two guards that keep the row (another server, failed unlink); found $PPB_RF"
+  elif has "$PPB_UNLINK" "return false"; then
     ok "E4 a failed unlink keeps the row that names the archive"
   else
     bad "E4 the row is deleted regardless of whether the archive was removed"
@@ -369,6 +382,49 @@ if has "$AH_S" "PARTITION BY database_id" && has "$AH_S" "PARTITION BY container
   ok "E6 policy retention_count is applied per resource, not per policy"
 else
   bad "E6 policy retention still uses a policy-wide OFFSET — most resources keep zero backups"
+fi
+
+# E7–E9 (s370) — THE THIRD SIBLING. §E was written for the two POLICY sweeps and
+# the SITE sweep (backup_schedules → backups) was left with neither guard: it
+# unlinked a local path, discarded the result, and deleted the row anyway. The
+# rule, the helper and this very section all existed; nothing asserted the third
+# caller. On a fleet install every site backup living on a member host had its
+# only record destroyed while the archive stayed on that host — and `total_pruned`
+# counted it, so the log reported archives it had never touched.
+RC_S=$(fnbody "$AH_S" "run_retention_cleanup")
+if [ -n "$RC_S" ]; then
+  # E7 — all THREE sweeps must retire through the one guarded step.
+  PPB_CALLS=$(count "$RC_S" 'prune_policy_backup\(')
+  if [ "$PPB_CALLS" -ge 3 ]; then
+    ok "E7 all three retention sweeps retire through the guarded step ($PPB_CALLS call sites)"
+  else
+    bad "E7 only $PPB_CALLS of 3 retention sweeps are guarded — one deletes rows on its own"
+  fi
+
+  # E8 — the site sweep must NAME THE HOST. `backups` carries no server of its
+  # own, so the owning host is the site's: the join must select it, not just the
+  # domain it needs for the path.
+  if has "$RC_S" 's\.server_id'; then
+    ok "E8 the site retention sweep selects the owning server, not just the domain"
+  else
+    bad "E8 the site sweep joins sites without server_id — it cannot tell whose host the archive is on"
+  fi
+
+  # E9 — ABSENCE arm: no sweep may delete a backups row directly again.
+  # Positive control first: an absence arm with no control cannot tell "clean"
+  # from "the pattern never ran" (#480). `DELETE FROM ` must still match the
+  # several unguarded purges in this function that are legitimately direct
+  # (token_blacklist, notifications, terminal shares).
+  DEL_ANY=$(count "$RC_S" 'DELETE FROM ')
+  if [ "$DEL_ANY" -lt 1 ]; then
+    bad "E9 CONTROL FAILED — 'DELETE FROM ' matched nothing, so the absence arm below proves nothing"
+  elif has "$RC_S" 'DELETE FROM backups WHERE id'; then
+    bad "E9 a backups row is deleted directly again, bypassing the remote-host guard"
+  else
+    ok "E9 no direct DELETE of a backups row ($DEL_ANY other purges still matched — control non-vacuous)"
+  fi
+else
+  skip "E7/E8/E9 — run_retention_cleanup body not extractable"
 fi
 
 echo
@@ -477,8 +533,9 @@ else
   skip "F6/F7 — main.rs not extractable"
 fi
 
-# F8/F9 — preview teardown. git_previews carries no server of its own, but the
-# sweep already JOINs git_deploys, whose server_id is NOT NULL.
+# F8/F9 — preview teardown. git_previews carries its own server_id since
+# 20260818000000, but the sweep still reads the deploy's copy through the JOIN —
+# that is the one the teardown's authority derives from, and this arm pins it.
 if [ -n "$PREV_S" ]; then
   if [ "$(count "$PREV_S" "d\.server_id")" -ge 2 ]; then
     ok "F8 both preview sweeps carry the git deploy's server_id through the JOIN"
@@ -825,13 +882,26 @@ fi
 # that will run the image; reading by image alone let a clean scan on one host
 # wave a vulnerable image onto another.
 if [ -n "$ISR_S" ]; then
-  GATE=$(fnbody "$ISR_S" "preflight_gate")
+  # s369: the gate was split so every door that runs an image can call it, and
+  # the scan lookup moved into `preflight_gate_image`. The arm follows the code
+  # to where the query now lives — and G18b below pairs with it, asserting the
+  # original entry point still REACHES it, which is the half that stops a
+  # follow-the-code repoint from quietly measuring nothing (lesson #150).
+  GATE=$(fnbody "$ISR_S" "preflight_gate_image")
   if [ -z "$GATE" ]; then
-    skip "G18 — preflight_gate not extractable"
+    skip "G18 — preflight_gate_image not extractable"
   elif has "$GATE" 'server_id: uuid::Uuid' && has "$GATE" 'server_id = \$1'; then
     ok "G18 the deploy gate reads a scan of the deploy TARGET"
   else
     bad "G18 the deploy gate still reads whichever host scanned that image last"
+  fi
+  ENTRY=$(fnbody "$ISR_S" "preflight_gate")
+  if [ -z "$ENTRY" ]; then
+    skip "G18b — preflight_gate not extractable"
+  elif has "$ENTRY" 'preflight_gate_image\(pool, server_id'; then
+    ok "G18b the template entry point still reaches the scoped gate"
+  else
+    bad "G18b preflight_gate no longer calls preflight_gate_image — G18 is measuring a function nothing calls"
   fi
 else
   skip "G18 — image_scans.rs not extractable"
@@ -1042,20 +1112,23 @@ else
   skip "H4 — metrics_collector.rs not extractable"
 fi
 
-# H5 — THE CLASS ARM. Exactly one spawn may still hold the legacy single-agent
-# handle, and it must be the healer (whose SSL and auto-sleep legs are a recorded
-# remainder). Any other service on that handle acts on this box no matter which
-# host its rows belong to.
+# H5 — THE CLASS ARM. NO spawn may hold the legacy single-agent handle.
+#
+# This arm used to allow exactly one, and named it: the healer, "whose SSL and
+# auto-sleep legs are a recorded remainder". That remainder was the defect. Held
+# on the panel own handle, `auto_renew_ssl` walked every site in the FLEET and
+# asked this box to renew certificates for domains it does not serve — so on a
+# member the validation could not succeed and the certificate expired on a live
+# site, unattended, every two minutes, needing no attacker. Both legs now take
+# the registry and resolve per row, so the allow-list is retired rather than
+# decremented: an allow-list that outlives its reason is how the next service
+# quietly joins it.
 if [ -n "$MN_S" ]; then
   LEGACY=$(count "$MN_S" 'state\.agent\.clone\(\)')
-  if [ "$LEGACY" -eq 1 ]; then
-    if has "$(flat "$(grep -B 2 -A 2 -E 'state\.agent\.clone\(\)' <<< "$MN_S" || true)")" 'auto_healer'; then
-      ok "H5 exactly one background service still holds the legacy local agent handle, and it is auto_healer"
-    else
-      bad "H5 the one legacy-handle spawn is NOT auto_healer — a different service is acting on this box regardless of host"
-    fi
+  if [ "$LEGACY" -eq 0 ]; then
+    ok "H5 no background service holds the legacy local agent handle — every spawn resolves per row"
   else
-    bad "H5 $LEGACY spawns hold the legacy local agent handle (allow-list is exactly 1: auto_healer)"
+    bad "H5 $LEGACY spawn(s) hold the legacy local agent handle — that service acts on THIS box no matter which host its rows name"
   fi
 else
   skip "H5 — main.rs not extractable"
@@ -1293,6 +1366,53 @@ else
   ok "I9 a missing local server is reported, not laundered into a sentinel uuid"
 fi
 
+# I9b (s311) — the same file, the same shape one level up: an UNATTENDED external
+# caller mutating a column that is also the account's only record of what it was.
+# `role` doubles as the status column, so `SET role = 'suspended'` overwrites it,
+# and the unsuspend arm restores everyone to 'user'. An admin round-tripped
+# through billing therefore comes back as a plain user with nobody left able to
+# promote them — and it is reachable, because the provision arm adopts an
+# EXISTING user by email with no role filter, so the operator's own account maps
+# here the moment their address is also a billing contact. The panel's own twin
+# in users.rs stashes the prior role first; this path has no equivalent.
+#
+# Keyed on the UPDATE's own predicate, not on a comment or a helper name: the
+# guard has to be in the statement or it is not a guard.
+# ⚠ REPOINTED s316 — the subject MOVED, and this arm's own "measuring nothing"
+# guard is what caught it. `role` used to be the stash as well as the status, and
+# the deny-list below was the whole compensation; the stash now has its own
+# column (`users.prior_role`) and both suspenders share one statement in
+# `helpers::suspend_account`. An arm still grepping whmcs.rs for the UPDATE would
+# have been measuring an absent subject — lesson #150, extracting a helper moves
+# the subject of every pin that measured it. So the arm follows the code, and is
+# paired with the check that the caller still REACHES it.
+#
+# The deny-list is KEPT on purpose even though the stash now exists: it guards a
+# different hazard, a lapsed invoice suspending the operator out of their own panel.
+if [ -z "$WH_S" ]; then
+  : # already reported by I9
+elif ! has "$WH_S" 'helpers::suspend_account'; then
+  bad "I9b whmcs no longer reaches the shared suspend statement — this arm is measuring nothing"
+elif has "$WH_S" "role NOT IN \\('admin', 'reseller'\\)"; then
+  ok "I9b the billing webhook cannot overwrite a privileged role"
+else
+  bad "I9b the billing webhook suspends any role — an admin round trip demotes them permanently"
+fi
+
+# I9c (s316) — the OTHER direction, which never had a guard at all. The unsuspend
+# arm restored every account to a hardcoded 'user', so one billing round trip
+# promoted a `client` into the role that may claim new domains and demoted an
+# `admin` in the same statement. It has to give back what was recorded.
+if [ -z "$WH_S" ]; then
+  : # already reported by I9
+elif has "$WH_S" "UPDATE users SET role = 'user'"; then
+  bad "I9c the billing webhook still restores every unsuspended account to 'user'"
+elif ! has "$WH_S" 'helpers::unsuspend_account'; then
+  bad "I9c whmcs does not reach the shared unsuspend statement — this arm is measuring nothing"
+else
+  ok "I9c the billing webhook gives back the role it recorded, not a hardcoded one"
+fi
+
 # I10 — the structural guarantee behind all of the above. `user_id` is an Option
 # in exactly one place, the private writer, so a caller must choose between
 # naming a user and declaring there is none. Re-introducing a nil-defaulting
@@ -1330,7 +1450,10 @@ for f in "$TERM_R" "$LOGS_R" "$ACTR" "$ACTTSX" "$HELP"; do
 done
 
 TERM_S=$(subj "$TERM_R" || true)
-LOGS_S=$(subj "$LOGS_R" || true)
+# No LOGS_S: J5 stopped naming logs.rs when it adopted J4's source-derived
+# enumeration, and each arm now reads its own subject inside the loop. `$LOGS_R`
+# stays in the missing-subject-file check above — logs.rs is still a subject, it
+# is simply no longer one this file names by hand.
 ACTR_S=$(subj "$ACTR" || true)
 ACTTSX_S=$(subj "$ACTTSX" || true)
 HELP_S=$(subj "$HELP" || true)
@@ -1433,15 +1556,44 @@ fi
 # J5 — and it can only do that because it keeps the id. `ServerScope` resolved it
 # and both handlers bound it to `_server_id` and threw it away; the knowledge to
 # answer honestly was already in the handler.
-for pair in "ws_token:$TERM_S" "stream_token:$LOGS_S"; do
-  fn=${pair%%:*}; src=${pair#*:}
-  [ -n "$src" ] || continue
-  if has "$(sig "$src" "$fn")" 'ServerScope\( *_server_id'; then
-    bad "J5 $fn discards the resolved server id again — it cannot tell which host was selected"
-  else
-    ok "J5 $fn keeps the resolved server id rather than discarding it"
-  fi
-done
+#
+# ⚠ s321: THIS ARM USED TO ITERATE A HARDCODED TWO-ELEMENT LIST — three lines
+# below the s305 paragraph above that forbids exactly that, and says so in the
+# imperative. It judged two handlers by name while the token it forbids is spelled
+# at 267 sites across 25 modules, so a THIRD mint of this class would have been
+# invisible to it for ever. That is lesson #267: a warning comment protects the
+# arm it sits in, not the file, and "the lesson is already written here" is
+# evidence the file needs auditing rather than evidence it is safe.
+#
+# It now reuses J4's source-derived `$MINTS`, so both arms judge the same
+# enumeration and a new mint is seen by BOTH the day it is added. Today that
+# resolves to the same two handlers the list named, so this is a HARDENING of an
+# arm that already passed — it cannot satisfy required-red (#172/#180) and is
+# MUTATION-TESTED instead, exactly as J4 was. Per lesson #143 the enumeration is
+# asserted BEFORE anything is judged, and a subject that cannot be read or
+# extracted is reported as measuring nothing rather than skipped in silence —
+# the previous `continue` on an empty source was that silent skip.
+if [ "$MINT_N" -lt 2 ]; then
+  bad "J5 enumerated only $MINT_N scoped ticket mints — the enumeration is broken, not the code (expected at least the terminal and log-stream mints)"
+else
+  ok "J5 judges the same $MINT_N mints J4 enumerated from source, not a list this arm carries"
+  while IFS=: read -r file fn; do
+    [ -n "$fn" ] || continue
+    src=$(subj "$file" || true)
+    if [ -z "$src" ]; then
+      bad "J5 could not read $file"
+      continue
+    fi
+    SIG=$(sig "$src" "$fn")
+    if [ -z "$SIG" ]; then
+      bad "J5 could not extract $fn — the arm measured nothing"
+    elif has "$SIG" 'ServerScope\( *_server_id'; then
+      bad "J5 $fn discards the resolved server id again — it cannot tell which host was selected"
+    else
+      ok "J5 $fn keeps the resolved server id rather than discarding it"
+    fi
+  done <<< "$MINTS"
+fi
 
 # J6 — the audit feed can say which host. `activity_logs.server_id` has been
 # written since v2.58.0 and stamped by the healer's own writers since v2.60.0,

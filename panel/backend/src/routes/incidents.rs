@@ -79,6 +79,12 @@ pub struct PostUpdateRequest {
 const VALID_STATUSES: &[&str] = &["investigating", "identified", "monitoring", "resolved", "postmortem"];
 const VALID_SEVERITIES: &[&str] = &["minor", "major", "critical", "maintenance"];
 
+/// The two statuses that close an incident. Everything else in `VALID_STATUSES`
+/// is open, which is the definition `dashboard.rs`, `deploy.rs` and
+/// `git_deploys.rs` already spell as `status NOT IN ('resolved', 'postmortem')`.
+/// Named here so a count of open incidents cannot quietly mean a third thing.
+const CLOSED_STATUSES: &[&str] = &["resolved", "postmortem"];
+
 // ── Incident CRUD ───────────────────────────────────────────────────────────
 
 /// GET /api/incidents — List incidents.
@@ -105,6 +111,41 @@ pub async fn list(
     .map_err(|e| internal_error("list incidents", e))?;
 
     Ok(Json(incidents))
+}
+
+/// GET /api/incidents/summary — How many incidents are open, and in what state.
+///
+/// The sidebar badge used to derive this itself by fetching `?status=investigating`
+/// and taking the array length. That asked a narrower question than the panel's
+/// own: `investigating` is one of THREE open statuses, and the first thing the
+/// incident screen offers is to move a new incident to `identified` — at which
+/// point it left the badge while the dashboard went on counting it. A count that
+/// disagrees with the page underneath it is worse than no count, so there is now
+/// one place that answers it.
+pub async fn summary(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM managed_incidents WHERE user_id = $1 GROUP BY status",
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("incident summary", e))?;
+
+    let by_status: serde_json::Map<String, serde_json::Value> = counts
+        .iter()
+        .map(|(s, c)| (s.clone(), serde_json::json!(c)))
+        .collect();
+
+    let open: i64 = counts
+        .iter()
+        .filter(|(s, _)| !CLOSED_STATUSES.contains(&s.as_str()))
+        .map(|(_, c)| *c)
+        .sum();
+
+    Ok(Json(serde_json::json!({ "open": open, "by_status": by_status })))
 }
 
 /// POST /api/incidents — Create an incident.
@@ -164,11 +205,11 @@ pub async fn create(
     .await;
 
     // Notify subscribers
-    notify_subscribers(&incident.title, status, req.description.as_deref().unwrap_or(""));
+    notify_subscribers(&incident.title, status, req.description.as_deref().unwrap_or(""), incident.user_id);
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "incident.create",
-        Some("incident"), Some(&req.title), None, None,
+        Some("incident"), Some(&req.title), None, None, claims.key_id,
     ).await;
 
     fire_event(&state.db, "incident.created", serde_json::json!({
@@ -248,10 +289,20 @@ pub async fn update(
     }
 
     // Handle resolved_at
-    let resolved_at_clause = if req.status.as_deref() == Some("resolved") {
-        ", resolved_at = NOW()"
-    } else {
-        ""
+    //
+    // Reopening had to clear it and did not. The stamp survived the transition
+    // back to a live status, so the public status page rendered "Resolved <n>
+    // ago" (PublicStatusPage.tsx) for an incident whose own status said
+    // `investigating` — the page contradicted itself, and the more prominent
+    // half was the reassuring one.
+    //
+    // `postmortem` follows a resolution rather than undoing it, so it keeps the
+    // stamp. `None` and `""` mean the caller is editing something else (a
+    // description, a severity) and must not disturb the timestamp at all.
+    let resolved_at_clause = match req.status.as_deref() {
+        Some("resolved") => ", resolved_at = NOW()",
+        Some("investigating") | Some("identified") | Some("monitoring") => ", resolved_at = NULL",
+        _ => "",
     };
 
     let query = format!(
@@ -330,7 +381,7 @@ pub async fn update(
         .execute(&state.db).await;
 
         // Notify subscribers of update
-        notify_subscribers(&incident.title, update_status, message);
+        notify_subscribers(&incident.title, update_status, message, incident.user_id);
     }
 
     // Re-fetch after postmortem auto-populate to return the complete record
@@ -419,7 +470,16 @@ pub async fn post_update(
             notifications::notify_panel(&state.db, Some(claims.sub), &format!("Resolved: {}", title), "Incident has been resolved", "info", "incident", Some("/incidents")).await;
         }
     } else {
-        let _ = sqlx::query("UPDATE managed_incidents SET status = $2, updated_at = NOW() WHERE id = $1")
+        // Same reopen rule as the PUT path: a move back to a live status clears
+        // the resolution stamp, `postmortem` keeps it. Both entry points write
+        // this column, so fixing one and not the other would leave the defect
+        // reachable through whichever endpoint the UI happens to call.
+        let sql = if matches!(req.status.as_str(), "investigating" | "identified" | "monitoring") {
+            "UPDATE managed_incidents SET status = $2, resolved_at = NULL, updated_at = NOW() WHERE id = $1"
+        } else {
+            "UPDATE managed_incidents SET status = $2, updated_at = NOW() WHERE id = $1"
+        };
+        let _ = sqlx::query(sql)
             .bind(id).bind(&req.status).execute(&state.db).await;
     }
 
@@ -431,11 +491,11 @@ pub async fn post_update(
     .map_err(|e| internal_error("post update", e))?;
 
     // Notify subscribers
-    let title: Option<(String,)> = sqlx::query_as("SELECT title FROM managed_incidents WHERE id = $1")
+    let title: Option<(String, Uuid)> = sqlx::query_as("SELECT title, user_id FROM managed_incidents WHERE id = $1")
         .bind(id).fetch_optional(&state.db).await
         .map_err(|e| internal_error("incident notify title lookup", e))?;
-    if let Some((title,)) = title {
-        notify_subscribers(&title, &req.status, &req.message);
+    if let Some((title, owner_id)) = title {
+        notify_subscribers(&title, &req.status, &req.message, owner_id);
     }
 
     Ok((StatusCode::CREATED, Json(update)))
@@ -528,9 +588,14 @@ pub async fn update_config(
     AdminUser(claims): AdminUser,
     Json(req): Json<UpdateConfigRequest>,
 ) -> Result<Json<StatusPageConfig>, ApiError> {
-    // Ensure config exists
+    // Ensure config exists. The conflict TARGET is load-bearing: without it the
+    // clause can only absorb a primary-key collision, and the primary key
+    // defaults to gen_random_uuid(), so the guard was inert and every PUT
+    // inserted another row. The UPDATE below then matched N rows and
+    // `fetch_one` returned an arbitrary one — an operator could untick
+    // "Enabled", get a 200 and a form showing false, and still be publishing.
     let _ = sqlx::query(
-        "INSERT INTO status_page_config (user_id) VALUES ($1) ON CONFLICT DO NOTHING"
+        "INSERT INTO status_page_config (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING"
     )
     .bind(claims.sub)
     .execute(&state.db).await;
@@ -538,8 +603,8 @@ pub async fn update_config(
     let config: StatusPageConfig = sqlx::query_as(
         "UPDATE status_page_config SET \
          title = COALESCE(NULLIF($2, ''), title), \
-         description = COALESCE(NULLIF($3, ''), description), \
-         logo_url = COALESCE($4, logo_url), \
+         description = CASE WHEN $3 = '' THEN NULL ELSE COALESCE($3, description) END, \
+         logo_url = CASE WHEN $4 = '' THEN NULL ELSE COALESCE($4, logo_url) END, \
          accent_color = COALESCE(NULLIF($5, ''), accent_color), \
          show_subscribe = COALESCE($6, show_subscribe), \
          show_incident_history = COALESCE($7, show_incident_history), \
@@ -551,7 +616,12 @@ pub async fn update_config(
     )
     .bind(claims.sub)
     .bind(req.title.as_deref().unwrap_or(""))
-    .bind(req.description.as_deref().unwrap_or(""))
+    // NOT `unwrap_or("")` any more. The empty string is now the instruction to
+    // clear, so collapsing an absent key onto it would blank the description of
+    // any client that simply did not send the field. `title` and `accent_color`
+    // keep the NULLIF guard deliberately: a status page with no title and no
+    // colour is not a state an operator can want, so blank stays "leave it".
+    .bind(req.description.as_deref())
     .bind(&req.logo_url)
     .bind(req.accent_color.as_deref().unwrap_or(""))
     .bind(req.show_subscribe)
@@ -687,17 +757,31 @@ pub async fn subscribe(
     State(state): State<AppState>,
     Json(req): Json<SubscribeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // A disabled status page has no subscribers to take. Ungated, this wrote
+    // attacker-supplied addresses into `status_page_subscribers` as
+    // `verified = TRUE` on installs that never turned the feature on.
+    crate::services::public_status::require_enabled(&state.db).await?;
+
     if req.email.is_empty() || !req.email.contains('@') || req.email.len() > 255 {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid email address"));
     }
 
+    // s427: which tenant's page this visitor is actually looking at — see
+    // `resolve_current_status_page_owner`'s own doc comment for the tie-break
+    // and the no-config fallback. `None` here means the install has no users
+    // at all, which cannot happen on a reachable running panel.
+    let owner_id = crate::services::public_status::resolve_current_status_page_owner(&state.db)
+        .await
+        .ok_or_else(|| internal_error("subscribe", sqlx::Error::RowNotFound))?;
+
     let token = uuid::Uuid::new_v4().to_string().replace('-', "");
 
     let _ = sqlx::query(
-        "INSERT INTO status_page_subscribers (email, verify_token, verified) \
-         VALUES ($1, $2, TRUE) \
-         ON CONFLICT (email) DO NOTHING"
+        "INSERT INTO status_page_subscribers (owner_id, email, verify_token, verified) \
+         VALUES ($1, $2, $3, TRUE) \
+         ON CONFLICT (owner_id, email) DO NOTHING"
     )
+    .bind(owner_id)
     .bind(&req.email)
     .bind(&token)
     .execute(&state.db)
@@ -707,26 +791,49 @@ pub async fn subscribe(
     Ok(Json(serde_json::json!({ "ok": true, "message": "Subscribed to status updates" })))
 }
 
-/// DELETE /api/status-page/unsubscribe — Unsubscribe (public).
+/// DELETE (or POST) /api/status-page/unsubscribe — Unsubscribe (public).
+///
+/// Registered for both methods. This comment said DELETE while the router
+/// accepted POST only, and the published guide followed the comment — so the
+/// documented call 405'd and the working call was written down nowhere.
 pub async fn unsubscribe(
     State(state): State<AppState>,
     Json(req): Json<SubscribeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _ = sqlx::query("DELETE FROM status_page_subscribers WHERE email = $1")
+    crate::services::public_status::require_enabled(&state.db).await?;
+
+    // s427: scoped to the page the visitor is actually looking at — `IS NOT
+    // DISTINCT FROM` rather than `=` so this still matches a legacy row whose
+    // owner could not be resolved (both sides NULL), instead of `NULL = NULL`
+    // silently matching nothing. Without this scoping, unsubscribing from one
+    // tenant's public page could remove a row that belongs to a DIFFERENT
+    // tenant the visitor never subscribed through.
+    let owner_id = crate::services::public_status::resolve_current_status_page_owner(&state.db).await;
+    let _ = sqlx::query(
+        "DELETE FROM status_page_subscribers WHERE email = $1 AND owner_id IS NOT DISTINCT FROM $2"
+    )
         .bind(&req.email)
+        .bind(owner_id)
         .execute(&state.db).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// GET /api/status-page/subscribers — List subscribers (admin).
+///
+/// s427: scoped to the calling admin's own `owner_id`, matching every sibling
+/// status-page admin endpoint (`get_config`, `list_components`, ...) — before
+/// this, any admin on the install could read every OTHER tenant's subscriber
+/// email list, not just their own.
 pub async fn list_subscribers(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let rows: Vec<(String, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT email, verified, created_at FROM status_page_subscribers ORDER BY created_at DESC LIMIT 1000"
+        "SELECT email, verified, created_at FROM status_page_subscribers \
+         WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 1000"
     )
+    .bind(claims.sub)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("list subscribers", e))?;
 
@@ -743,59 +850,80 @@ pub async fn list_subscribers(
 pub async fn public_status_page(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Get config
-    let config: Option<(String, String, Option<String>, String, bool, bool, i32, bool)> = sqlx::query_as(
-        "SELECT title, description, logo_url, accent_color, show_subscribe, show_incident_history, history_days, enabled \
-         FROM status_page_config LIMIT 1"
+    // The one gate every unauthenticated status-page route passes through. This
+    // endpoint is what `/status` actually fetches, and until v2.70.0 it was
+    // governed by nothing the operator UI writes.
+    crate::services::public_status::require_enabled(&state.db).await?;
+
+    // Get config. ORDER BY is load-bearing, not decoration: `update_config` used
+    // to insert a fresh row on every PUT (see the migration that made
+    // `user_id` unique), so an install can carry duplicates, and an unordered
+    // LIMIT 1 would let two reads of the same table disagree.
+    //
+    // ⚠ SECURITY (s418): every query below this point MUST be scoped to
+    // `owner_id` — the tenant whose config row won this ORDER BY. This handler
+    // is unauthenticated; on any multi-tenant/reseller install, an unscoped
+    // read here serves one tenant's components/incidents to every anonymous
+    // visitor of every OTHER tenant's status page. Confirmed live-reachable on
+    // this box before this fix.
+    let config: Option<(Uuid, String, String, Option<String>, String, bool, bool, i32, bool)> = sqlx::query_as(
+        "SELECT user_id, title, description, logo_url, accent_color, show_subscribe, show_incident_history, history_days, enabled \
+         FROM status_page_config ORDER BY created_at ASC, id ASC LIMIT 1"
     )
     .fetch_optional(&state.db).await
     .map_err(|e| internal_error("public status page", e))?;
 
+    let owner_id: Option<Uuid> = config.as_ref().map(|c| c.0);
     let (title, description, logo_url, accent_color, show_subscribe, show_history, history_days, enabled) =
-        config.unwrap_or(("Service Status".into(), "Current status of our services".into(), None, "#22c55e".into(), true, true, 90, true));
+        config.map(|c| (c.1, c.2, c.3, c.4, c.5, c.6, c.7, c.8))
+            .unwrap_or(("Service Status".into(), "Current status of our services".into(), None, "#22c55e".into(), true, true, 90, true));
 
     if !enabled {
         return Err(err(StatusCode::NOT_FOUND, "Status page is disabled"));
     }
 
-    // Get components with their monitor statuses
-    let components: Vec<(Uuid, String, Option<String>, i32, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, name, description, sort_order, status_override, group_name \
-         FROM status_page_components ORDER BY sort_order ASC, created_at ASC"
-    )
-    .fetch_all(&state.db).await
-    .unwrap_or_default();
-
+    // Get components with their monitor statuses — scoped to the config's owner.
     let mut component_list = Vec::new();
-    for (comp_id, name, desc, _sort, status_override, group) in &components {
-        let monitor_statuses: Vec<(String,)> = sqlx::query_as(
-            "SELECT m.status FROM monitors m \
-             JOIN status_page_component_monitors cm ON cm.monitor_id = m.id \
-             WHERE cm.component_id = $1 AND m.enabled = TRUE"
+    if let Some(uid) = owner_id {
+        let components: Vec<(Uuid, String, Option<String>, i32, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, description, sort_order, status_override, group_name \
+             FROM status_page_components WHERE user_id = $1 ORDER BY sort_order ASC, created_at ASC"
         )
-        .bind(comp_id)
+        .bind(uid)
         .fetch_all(&state.db).await
         .unwrap_or_default();
 
-        let status = if let Some(override_status) = status_override {
-            override_status.clone()
-        } else if monitor_statuses.is_empty() {
-            "operational".to_string()
-        } else if monitor_statuses.iter().all(|(s,)| s == "up") {
-            "operational".to_string()
-        } else if monitor_statuses.iter().any(|(s,)| s == "down") {
-            "major_outage".to_string()
-        } else {
-            "degraded".to_string()
-        };
+        for (comp_id, name, desc, _sort, status_override, group) in &components {
+            let monitor_statuses: Vec<(String,)> = sqlx::query_as(
+                "SELECT m.status FROM monitors m \
+                 JOIN status_page_component_monitors cm ON cm.monitor_id = m.id \
+                 WHERE cm.component_id = $1 AND m.user_id = $2 AND m.enabled = TRUE"
+            )
+            .bind(comp_id)
+            .bind(uid)
+            .fetch_all(&state.db).await
+            .unwrap_or_default();
 
-        component_list.push(serde_json::json!({
-            "id": comp_id,
-            "name": name,
-            "description": desc,
-            "group": group,
-            "status": status,
-        }));
+            let status = if let Some(override_status) = status_override {
+                override_status.clone()
+            } else if monitor_statuses.is_empty() {
+                "operational".to_string()
+            } else if monitor_statuses.iter().all(|(s,)| s == "up") {
+                "operational".to_string()
+            } else if monitor_statuses.iter().any(|(s,)| s == "down") {
+                "major_outage".to_string()
+            } else {
+                "degraded".to_string()
+            };
+
+            component_list.push(serde_json::json!({
+                "id": comp_id,
+                "name": name,
+                "description": desc,
+                "group": group,
+                "status": status,
+            }));
+        }
     }
 
     // Overall status
@@ -807,45 +935,70 @@ pub async fn public_status_page(
         "degraded"
     };
 
-    // Active + recent incidents
-    let incidents: Vec<ManagedIncident> = sqlx::query_as(
-        "SELECT * FROM managed_incidents WHERE visible_on_status_page = TRUE \
-         AND (status != 'resolved' OR resolved_at > NOW() - ($1 || ' days')::interval) \
-         ORDER BY started_at DESC LIMIT 50"
-    )
-    .bind(history_days)
-    .fetch_all(&state.db).await
-    .unwrap_or_default();
-
+    // Active + recent incidents — scoped to the config's owner.
     let mut incident_list = Vec::new();
-    for inc in &incidents {
-        let updates: Vec<IncidentUpdate> = sqlx::query_as(
-            "SELECT * FROM incident_updates WHERE incident_id = $1 ORDER BY created_at ASC LIMIT 500"
+    if let Some(uid) = owner_id {
+        let incidents: Vec<ManagedIncident> = sqlx::query_as(
+            "SELECT * FROM managed_incidents WHERE user_id = $1 AND visible_on_status_page = TRUE \
+             AND (status != 'resolved' OR resolved_at > NOW() - ($2 || ' days')::interval) \
+             ORDER BY started_at DESC LIMIT 50"
         )
-        .bind(inc.id)
+        .bind(uid)
+        .bind(history_days)
         .fetch_all(&state.db).await
         .unwrap_or_default();
 
-        incident_list.push(serde_json::json!({
-            "id": inc.id,
-            "title": inc.title,
-            "status": inc.status,
-            "severity": inc.severity,
-            "started_at": inc.started_at,
-            "resolved_at": inc.resolved_at,
-            "updates": updates,
-        }));
+        for inc in &incidents {
+            let updates: Vec<IncidentUpdate> = sqlx::query_as(
+                "SELECT * FROM incident_updates WHERE incident_id = $1 ORDER BY created_at ASC LIMIT 500"
+            )
+            .bind(inc.id)
+            .fetch_all(&state.db).await
+            .unwrap_or_default();
+
+            // Projected field by field, not serialized whole: `IncidentUpdate`
+            // carries `author_email`, and this endpoint answers with no login. The
+            // four fields below are exactly what `PublicStatusPage.tsx` declares.
+            // `#[serde(skip_serializing)]` on the field is the smaller edit and the
+            // wrong one — three authenticated handlers return the same struct and
+            // the incidents guide publishes attribution as behaviour.
+            let public_updates: Vec<serde_json::Value> = updates
+                .iter()
+                .map(|u| {
+                    serde_json::json!({
+                        "id": u.id,
+                        "status": u.status,
+                        "message": u.message,
+                        "created_at": u.created_at,
+                    })
+                })
+                .collect();
+
+            incident_list.push(serde_json::json!({
+                "id": inc.id,
+                "title": inc.title,
+                "status": inc.status,
+                "severity": inc.severity,
+                "started_at": inc.started_at,
+                "resolved_at": inc.resolved_at,
+                "updates": public_updates,
+            }));
+        }
     }
 
-    // Also include legacy monitor-based incidents (auto-detected downtime)
-    let auto_incidents: Vec<(Uuid, String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>)> = sqlx::query_as(
-        "SELECT i.id, m.name, i.started_at, i.resolved_at, i.cause \
-         FROM incidents i JOIN monitors m ON m.id = i.monitor_id \
-         WHERE i.started_at > NOW() - INTERVAL '7 days' \
-         ORDER BY i.started_at DESC LIMIT 20"
-    )
-    .fetch_all(&state.db).await
-    .unwrap_or_default();
+    // Also include legacy monitor-based incidents (auto-detected downtime) — scoped to the config's owner.
+    let auto_incidents: Vec<(Uuid, String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>)> = match owner_id {
+        Some(uid) => sqlx::query_as(
+            "SELECT i.id, m.name, i.started_at, i.resolved_at, i.cause \
+             FROM incidents i JOIN monitors m ON m.id = i.monitor_id \
+             WHERE m.user_id = $1 AND i.started_at > NOW() - INTERVAL '7 days' \
+             ORDER BY i.started_at DESC LIMIT 20"
+        )
+        .bind(uid)
+        .fetch_all(&state.db).await
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     Ok(Json(serde_json::json!({
         "title": title,
@@ -878,10 +1031,11 @@ pub async fn public_status_page(
 /// subscribe endpoint is unauthenticated and unthrottled, so that list is
 /// attacker-grown. See `services::status_notices` for the ordering and
 /// backpressure guarantees; it also applies the fan-out cap.
-fn notify_subscribers(title: &str, status: &str, message: &str) {
+fn notify_subscribers(title: &str, status: &str, message: &str, owner_id: Uuid) {
     crate::services::status_notices::enqueue(
         title,
         format!("[Status Update] {title} — {status}"),
         format!("{title}\nStatus: {status}\n\n{message}"),
+        owner_id,
     );
 }

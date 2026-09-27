@@ -113,6 +113,7 @@ async fn tick(db: &PgPool, agents: &AgentRegistry, jwt_secret: &str) -> Result<(
                     None,
                     Some(row.site_id),
                     "backup_failure",
+                    "",
                     "critical",
                     &format!("Backup failed: {}", row.domain),
                     &format!(
@@ -188,6 +189,7 @@ async fn run_scheduled_backup(
                     None,
                     Some(row.site_id),
                     "backup_failure",
+                    "",
                     "warning",
                     &format!("Backup skipped (low disk): {}", row.domain),
                     &format!(
@@ -265,7 +267,41 @@ async fn run_scheduled_backup(
         .get("size_bytes")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as i64;
+    // The agent has computed this on every scheduled run since the integrity
+    // chain shipped — `BackupInfo.sha256`, off `sha256sum` — and this path read
+    // the two fields beside it and dropped this one, so a site archived only by
+    // a schedule carried no hash while the report promised one "recorded when
+    // the backup was taken". Reported as #114. `Option` on the SELECT is
+    // deliberate: every row written before this fix has a NULL hash and it is the
+    // newest of those the query hits first.
+    let sha256_hash = backup_result
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let previous_hash: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT sha256_hash FROM backups WHERE site_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(row.site_id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(v) => v.flatten(),
+        Err(e) => {
+            tracing::warn!(
+                "Scheduled backup for {}: could not read the previous hash: {e}",
+                row.domain
+            );
+            None
+        }
+    };
     let filepath = format!("/var/backups/dockpanel/{}/{}", row.domain, filename);
+
+    // Carries an exhausted upload past the INSERT. The archive still gets a row —
+    // that row is what retention enumerates and what the hash chain hangs off —
+    // but the RUN still has to fail, and the caller's failure arm is what writes
+    // last_status 'failed', the system_log entry and the critical alert.
+    let mut upload_failed: Option<String> = None;
 
     // 2. Upload to remote destination (if configured)
     let uploaded_remote = if let (Some(dest_dtype), Some(dest_config)) =
@@ -318,8 +354,18 @@ async fn run_scheduled_backup(
         }
 
         if !uploaded {
-            // All retries exhausted — don't record in DB since the upload failed.
-            // The local file still exists on disk for manual recovery.
+            // All retries exhausted. Record the archive anyway, local-only.
+            //
+            // Returning here used to skip the INSERT, and the sibling executor's
+            // comment has said for two releases why that is wrong: the row is
+            // what the sha256 chain hangs off, and it is also the ONLY thing
+            // retention enumerates. An archive with no row is a full-site tarball
+            // that nothing will ever reap — one per night, for as long as the
+            // destination stays down, on the disk the backups are insuring.
+            //
+            // The run still fails. `upload_failed` carries the reason past the
+            // INSERT so the caller's failure arm keeps writing last_status
+            // 'failed', the system_log entry and the critical alert.
             crate::services::system_log::log_event(
                 db,
                 "error",
@@ -328,39 +374,43 @@ async fn run_scheduled_backup(
                 Some(&last_err),
             ).await;
 
-            return Err(format!("Upload failed after 3 attempts: {last_err}"));
-        }
-
-        // Prune old remote backups.
-        //
-        // The agent answers 200 with an explanatory `message` when it cannot
-        // prune — SFTP has no supported prune path, so it returns pruned:0 and
-        // says so. Discarding the body meant the schedule kept rendering its
-        // retention count as an enforced setting while remote copies accumulated
-        // forever, and the only trace was a warn in a journal that gets vacuumed.
-        let prune_body = serde_json::json!({
-            "destination": dest,
-            "domain": row.domain,
-            "retention": row.retention_count,
-        });
-        match agent.post("/backups/prune", Some(prune_body)).await {
-            Ok(resp) => {
-                if let Some(msg) = resp.get("message").and_then(|v| v.as_str()) {
-                    crate::services::system_log::log_event(
-                        db,
-                        "warn",
-                        "backup_scheduler",
-                        &format!("Remote retention was not enforced for {}", row.domain),
-                        Some(msg),
-                    ).await;
+            upload_failed = Some(last_err.clone());
+            false
+        } else {
+            // Prune old remote backups.
+            //
+            // The agent answers 200 with an explanatory `message` when it cannot
+            // prune — SFTP has no supported prune path, so it returns pruned:0 and
+            // says so. Discarding the body meant the schedule kept rendering its
+            // retention count as an enforced setting while remote copies accumulated
+            // forever, and the only trace was a warn in a journal that gets vacuumed.
+            let prune_body = serde_json::json!({
+                "destination": dest,
+                "domain": row.domain,
+                "retention": row.retention_count,
+            });
+            match agent.post("/backups/prune", Some(prune_body)).await {
+                Ok(resp) => {
+                    if let Some(msg) = resp.get("message").and_then(|v| v.as_str()) {
+                        // "warning", not "warn" — this file's two other warning writers
+                        // (:201, :248) already spell it the long way, and only that
+                        // spelling is filterable and countable.
+                        crate::services::system_log::log_event(
+                            db,
+                            "warning",
+                            "backup_scheduler",
+                            &format!("Remote retention was not enforced for {}", row.domain),
+                            Some(msg),
+                        ).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Remote prune failed for {}: {e}", row.domain);
                 }
             }
-            Err(e) => {
-                tracing::warn!("Remote prune failed for {}: {e}", row.domain);
-            }
-        }
 
-        true
+            true
+        }
     } else {
         false
     };
@@ -379,14 +429,21 @@ async fn run_scheduled_backup(
     // uploaded=f, destination_id=NULL. The sibling policy path had been wired to
     // these columns from the start, which is what made the gap invisible.
     //
+    // `sha256_hash`/`previous_hash` are the SECOND round of the same defect, one
+    // release later and in the other direction: here BOTH unattended site paths
+    // omitted them while every db and volume insert carried them. `chain_valid`
+    // is deliberately still left to its column default — nothing computes it, and
+    // the seven-INSERT accounting in `backup_orchestrator.rs` describes exactly
+    // that split.
+    //
     // The Result is checked because this row IS the backup as far as the product
     // is concerned — every list and restore path reads it. Returning Err here
     // routes into `tick`'s existing failure arm, which writes last_status='failed'
     // plus a system_log entry and a critical backup_failure alert; discarding it
     // left the schedule reading 'success' over an archive with no row.
     if let Err(e) = sqlx::query(
-        "INSERT INTO backups (site_id, filename, size_bytes, databases_included, databases_expected, uploaded, destination_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO backups (site_id, filename, size_bytes, databases_included, databases_expected, uploaded, destination_id, sha256_hash, previous_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(row.site_id)
     .bind(filename)
@@ -394,10 +451,23 @@ async fn run_scheduled_backup(
     .bind(db_included)
     .bind(db_expected)
     .bind(uploaded_remote)
-    .bind(if uploaded_remote { row.dest_id } else { None })
+    // Bound unconditionally. `uploaded = FALSE` alone cannot mean "off-site
+    // failed" — the manual path never binds a destination and a schedule with no
+    // destination writes FALSE too, so the only predicate that distinguishes a
+    // failed upload is the pair (destination_id IS NOT NULL AND NOT uploaded).
+    // That is exactly what the policy executor already writes into this table.
+    .bind(row.dest_id)
+    .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
+    .bind(previous_hash.as_deref())
     .execute(db)
     .await {
         return Err(format!("Backup created but could not be recorded: {e}"));
+    }
+
+    if let Some(why) = upload_failed {
+        return Err(format!(
+            "Backup recorded local-only: upload failed after 3 attempts: {why}"
+        ));
     }
 
     tracing::info!("Scheduled backup complete for {}", row.domain);

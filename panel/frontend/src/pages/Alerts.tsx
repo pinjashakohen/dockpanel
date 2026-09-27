@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { api } from "../api";
+import { useAuth } from "../context/AuthContext";
 import { logger } from "../utils/logger";
 import { renderMarkdown } from "../utils/markdown";
 
@@ -85,7 +86,24 @@ const TYPE_LABELS: Record<string, string> = {
   gpu_temperature: "GPU temperature",
   gpu_vram: "GPU VRAM",
   memory_leak: "Memory leak",
-  flapping: "Flapping",
+  // Fired outside alert_engine, and absent here until v2.155.0 — the badge
+  // printed the raw column value and the filter row, built from these same
+  // keys, offered no way to select them. Certificate renewal failures are the
+  // sharpest: nine producers under six keys, five of them critical.
+  //
+  // `slow_response` was the FIFTH and was still missing at v2.156.0 — the
+  // v2.155.0 pass collected the four raised by services and missed the one
+  // raised by the uptime monitor. Nothing noticed, because `alert-controls` §A
+  // pinned only this map's SIBLING (the Settings mute grid), which had
+  // `slow_response` all along. §A6-A8 now pin THIS map against the same backend
+  // constant, so the next omission in either direction goes red.
+  ssl_renewal_failure: "SSL renewal",
+  cron_failure: "Cron",
+  backup_verification_failed: "Backup verification",
+  security: "Security scan",
+  image_scan: "Image scan",
+  wp_vuln_scan: "WordPress vuln scan",
+  slow_response: "Slow response",
 };
 
 const SEVERITY_STYLES: Record<string, { bg: string; text: string; dot: string }> = {
@@ -97,6 +115,13 @@ const SEVERITY_STYLES: Record<string, { bg: string; text: string; dot: string }>
 type TabId = "alerts" | "runbooks" | "on-call" | "policies";
 
 export default function Alerts() {
+  // Alerts themselves are user-scoped and every action on them is open to the
+  // owner, which is why this whole surface sits on a nav row with no role flag.
+  // The other three tabs are not: their endpoints are administrator-only to the
+  // last handler, so showing their triggers to a client offered three lists that
+  // could only ever come back refused.
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [tab, setTab] = useState<TabId>("alerts");
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [summary, setSummary] = useState<AlertSummary>({ firing: 0, acknowledged: 0, resolved: 0 });
@@ -117,7 +142,11 @@ export default function Alerts() {
       return;
     }
     setExpanded(alert.id);
-    if (runbookCache[alert.alert_type] === undefined) {
+    // Runbooks are administrator-only to read. Asking anyway would spend a
+    // guaranteed 403 and cache `null`, which this component renders exactly like
+    // "no runbook has been written for this alert type" — a refusal a client
+    // could never tell from an ordinary absence, and so could never report.
+    if (isAdmin && runbookCache[alert.alert_type] === undefined) {
       try {
         const rb = await api.get<Runbook>(`/alerts/runbooks/${alert.alert_type}`);
         setRunbookCache((prev) => ({ ...prev, [alert.alert_type]: rb }));
@@ -238,36 +267,42 @@ export default function Alerts() {
         >
           Alerts
         </button>
-        <button
-          onClick={() => setTab("runbooks")}
-          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
-            tab === "runbooks"
-              ? "border-rust-500 text-rust-400"
-              : "border-transparent text-dark-200 hover:text-dark-100"
-          }`}
-        >
-          Runbooks
-        </button>
-        <button
-          onClick={() => setTab("on-call")}
-          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
-            tab === "on-call"
-              ? "border-rust-500 text-rust-400"
-              : "border-transparent text-dark-200 hover:text-dark-100"
-          }`}
-        >
-          On-call
-        </button>
-        <button
-          onClick={() => setTab("policies")}
-          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
-            tab === "policies"
-              ? "border-rust-500 text-rust-400"
-              : "border-transparent text-dark-200 hover:text-dark-100"
-          }`}
-        >
-          Escalation policies
-        </button>
+        {isAdmin && (
+          <button
+            onClick={() => setTab("runbooks")}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              tab === "runbooks"
+                ? "border-rust-500 text-rust-400"
+                : "border-transparent text-dark-200 hover:text-dark-100"
+            }`}
+          >
+            Runbooks
+          </button>
+        )}
+        {isAdmin && (
+          <button
+            onClick={() => setTab("on-call")}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              tab === "on-call"
+                ? "border-rust-500 text-rust-400"
+                : "border-transparent text-dark-200 hover:text-dark-100"
+            }`}
+          >
+            On-call
+          </button>
+        )}
+        {isAdmin && (
+          <button
+            onClick={() => setTab("policies")}
+            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              tab === "policies"
+                ? "border-rust-500 text-rust-400"
+                : "border-transparent text-dark-200 hover:text-dark-100"
+            }`}
+          >
+            Escalation policies
+          </button>
+        )}
       </div>
 
       {message && (
@@ -514,9 +549,13 @@ export default function Alerts() {
         </>
       )}
 
-      {tab === "runbooks" && <RunbooksTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
-      {tab === "on-call" && <OnCallTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
-      {tab === "policies" && <PoliciesTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
+      {/* The `isAdmin` term is repeated on each body deliberately. Hiding a trigger
+          decides what is OFFERED; the mount decides what is REQUESTED, and only the
+          second one stops the refused calls. Whoever adds the next way to set `tab`
+          gets the guard for free. */}
+      {tab === "runbooks" && isAdmin && <RunbooksTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
+      {tab === "on-call" && isAdmin && <OnCallTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
+      {tab === "policies" && isAdmin && <PoliciesTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
 
       </div>
     </div>
@@ -1243,11 +1282,13 @@ function PoliciesTab({ onMessage }: { onMessage: (m: { text: string; type: strin
           <div className="min-w-0 max-w-2xl">
             <h2 className="font-medium text-dark-50 mb-1">Escalation policies</h2>
             <p className="text-sm text-dark-200">
-              Ordered chain of `(after_minutes, route)` steps. Step 0 fires
-              immediately when an alert is created. Subsequent steps fire if
-              the alert isn't acknowledged by their threshold. Attach a policy
-              to an alert rule from the alert-rules editor; without one, the
-              pre-W3 default of 15-min unack → 30-min re-page applies.
+              An ordered chain of steps. The first fires the moment an alert is
+              created; each later step fires if the alert still isn't
+              acknowledged once its threshold passes. After the last step the
+              alert does not go quiet — it keeps re-paging that step's route
+              every 30 minutes until someone acknowledges or resolves it.
+              Attach a policy under Settings → Notifications; without one,
+              alerts re-page every 30 minutes once they are 15 minutes old.
             </p>
           </div>
           <button

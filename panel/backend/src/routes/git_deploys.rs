@@ -15,11 +15,40 @@ use crate::auth::{AuthUser, ServerScope};
 use crate::error::{internal_error, err, agent_error, require_admin, ApiError};
 use crate::routes::{is_valid_name, is_reserved_domain};
 use crate::routes::sites::ProvisionStep;
+use crate::routes::stacks::{effective_tls_mode, requested_tls_mode};
+use crate::routes::tls_certificates::{
+    certificate_id_for_alias, is_valid_cert_alias, require_agent_at_least, PROVIDED_TLS_MIN_AGENT,
+};
 use crate::services::activity;
 use crate::services::agent::AgentHandle;
 use crate::services::domain_claim;
+use crate::services::expected_stops;
 use crate::services::notifications;
 use crate::AppState;
+
+/// An agent older than this still has the vulnerable `/git/pre-build-hook`
+/// host-exec route compiled in (and no `pre_build_cmd` handling in
+/// `/git/auto-detect`), so a pre-build command configured against it would
+/// either silently do nothing or hit a route that no longer exists on the
+/// panel side. Refused up front via `require_agent_at_least`, mirroring
+/// `PROVIDED_TLS_MIN_AGENT` — same reasoning, same failure shape.
+pub(crate) const PRE_BUILD_SPLICE_MIN_AGENT: &str = "2.182.0";
+
+/// The row plus the alias of the certificate it references, if any — mirrors
+/// `stacks::STACK_SELECT`: a LEFT JOIN because most deploys reference none,
+/// and the alias is what the API and the deploy body speak; the id never
+/// leaves the panel. `id`/`user_id`/`server_id` are ambiguous once joined
+/// against `tls_certificates` (which carries all three itself), so every
+/// caller of this constant must qualify its own WHERE clause with `d.`.
+const GIT_DEPLOY_SELECT: &str = "SELECT d.id, d.user_id, d.server_id, d.name, d.repo_url, \
+    d.branch, d.dockerfile, d.container_port, d.host_port, d.domain, d.env_vars, \
+    d.auto_deploy, d.webhook_secret, d.deploy_key_public, d.deploy_key_path, \
+    d.container_id, d.image_tag, d.status, d.memory_mb, d.cpu_percent, d.ssl_email, \
+    d.pre_build_cmd, d.post_deploy_cmd, d.build_args, d.build_context, d.last_deploy, \
+    d.last_commit, d.created_at, d.updated_at, d.github_token, d.deploy_cron, \
+    d.deploy_protected, d.build_method, d.preview_ttl_hours, d.scheduled_deploy_at, \
+    d.tls_mode, d.tls_certificate_id, d.volumes, c.alias AS tls_certificate \
+    FROM git_deploys d LEFT JOIN tls_certificates c ON c.id = d.tls_certificate_id";
 
 /// git_previews.container_name is stored WITH the `dockpanel-git-` prefix that
 /// the agent's `/git/cleanup` handler re-adds (agent `cleanup_container` does
@@ -176,6 +205,21 @@ pub struct GitDeploy {
     pub build_method: String,
     pub preview_ttl_hours: i32,
     pub scheduled_deploy_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How the domain is served, as stored. NULL on a row an older binary
+    /// wrote; read through `effective_tls_mode`, never directly.
+    pub tls_mode: Option<String>,
+    /// The registered certificate a provided-mode deploy serves.
+    pub tls_certificate_id: Option<Uuid>,
+    /// Container paths to bind-mount durably under `GIT_DATA_DIR/{name}` on the
+    /// agent (#118) — a JSON array of strings, e.g. `["/data", "/app/uploads"]`.
+    /// Never sent to a preview deploy; see `handle_preview_deploy`.
+    pub volumes: serde_json::Value,
+    /// That certificate's alias, joined in by `GIT_DEPLOY_SELECT`. Defaulted
+    /// so `create`/`update`'s plain `RETURNING *` (no join in a RETURNING
+    /// clause) still maps onto this struct; both handlers set it by hand
+    /// right after, from the alias they already resolved.
+    #[sqlx(default)]
+    pub tls_certificate: Option<String>,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -204,11 +248,40 @@ pub(crate) struct DeployBody<'a> {
     pub domain: Option<&'a str>,
     pub memory_mb: Option<i32>,
     pub cpu_percent: Option<i32>,
+    /// The address the AGENT is handed. Only sent for `acme` mode — pass
+    /// through [`deploy_tls_email`], never `config.ssl_email` directly, so a
+    /// `provided`- or `none`-mode deploy never orders a certificate the
+    /// operator switched off, mirroring `stacks::TlsPlan::deploy_email`.
     pub ssl_email: Option<&'a str>,
+    /// The effective mode (`stacks::effective_tls_mode`), sent on every
+    /// deploy so the agent's own decision no longer depends on inferring it
+    /// from `ssl_email` presence alone.
+    pub tls_mode: Option<&'a str>,
+    /// The registered-certificate alias, `provided` mode only.
+    pub tls_certificate: Option<&'a str>,
     /// Which of the agent's two name spaces this deploy addresses — `"deploy"`
     /// or `"preview"`. Not defaulted on purpose: an omitted scope is precisely
     /// how a preview came to be able to name a deployment's container.
     pub scope: &'a str,
+    /// Container paths to bind-mount durably (#118). ALWAYS empty for a preview
+    /// — see `handle_preview_deploy`'s own comment on why memory_mb/cpu_percent
+    /// are withheld there too, and the agent's `deploy_container` route refuses
+    /// a non-empty list for any scope but `"deploy"` as the actual boundary.
+    pub volumes: &'a [String],
+}
+
+/// The address the agent is handed for THIS deploy. Only an ACME order needs
+/// one, and the agent still infers the mode from `ssl_email` presence when an
+/// older panel sends no `tls_mode` at all — so a deploy whose effective mode
+/// is `none` or `provided` must never forward the stored address, or an
+/// agent that predates this feature would order a certificate the operator
+/// switched off. Mirrors `stacks::TlsPlan::deploy_email`.
+fn deploy_tls_email<'a>(mode: &str, ssl_email: Option<&'a str>) -> Option<&'a str> {
+    if mode == "acme" {
+        ssl_email
+    } else {
+        None
+    }
 }
 
 /// Build the body for the agent's `POST /git/deploy`.
@@ -265,6 +338,52 @@ fn env_object(env_vars: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(coerced)
 }
 
+/// A persistent-volume path is CONTAINER-path only (#118) — the host side is
+/// always derived by the agent under `GIT_DATA_DIR/{name}`, never taken from
+/// the request. Mirrors the agent's OWN `is_valid_volume_path` exactly:
+/// duplicated rather than shared (different crates, different binaries that
+/// update on their own schedule) the same way `is_valid_name`/domain validity
+/// already are between panel and agent. This is the friendly-case check; the
+/// agent's copy is the actual security floor.
+fn is_valid_volume_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path.len() <= 200
+        && !path.contains("..")
+        && !path.contains("//")
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+}
+
+const MAX_VOLUMES: usize = 10;
+
+fn validate_volumes(volumes: &[String]) -> Result<(), &'static str> {
+    if volumes.len() > MAX_VOLUMES {
+        return Err("Too many volumes declared (max 10)");
+    }
+    if !volumes.iter().all(|v| is_valid_volume_path(v)) {
+        return Err("Invalid volume path: must be an absolute container path with no '..' or '//'");
+    }
+    let mut sorted = volumes.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != volumes.len() {
+        return Err("Duplicate volume path");
+    }
+    Ok(())
+}
+
+/// Coerce the `volumes` JSONB into the `Vec<String>` the agent deserializes,
+/// mirroring `env_object`'s defensive extraction — an unconstrained JSONB
+/// column can hold anything a hand-written row or a future writer puts there,
+/// and a non-string entry should be dropped, not fail the whole deploy.
+fn volumes_vec(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn build_deploy_body(b: DeployBody<'_>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "name": b.name,
@@ -274,7 +393,16 @@ pub(crate) fn build_deploy_body(b: DeployBody<'_>) -> serde_json::Value {
         "env": env_object(b.env_vars),
         "scope": b.scope,
     });
-    if let Some(d) = b.domain {
+    if !b.volumes.is_empty() {
+        body["volumes"] = serde_json::json!(b.volumes);
+    }
+    // An emptied text column arrives here as Some("") rather than None, because
+    // clearing a field is expressed as the empty string on the wire (the shape
+    // v2.120.0 settled on for the alert destinations). Blank is absent for both
+    // of these: a blank domain would have the agent write a vhost named
+    // ".conf", and a blank ssl_email would have it open an ACME order with no
+    // account address. Guard the value, not the Option.
+    if let Some(d) = b.domain.filter(|d| !d.trim().is_empty()) {
         body["domain"] = serde_json::json!(d);
     }
     if let Some(mem) = b.memory_mb {
@@ -283,8 +411,14 @@ pub(crate) fn build_deploy_body(b: DeployBody<'_>) -> serde_json::Value {
     if let Some(cpu) = b.cpu_percent {
         body["cpu_percent"] = serde_json::json!(cpu);
     }
-    if let Some(email) = b.ssl_email {
+    if let Some(email) = b.ssl_email.filter(|e| !e.trim().is_empty()) {
         body["ssl_email"] = serde_json::json!(email);
+    }
+    if let Some(mode) = b.tls_mode {
+        body["tls_mode"] = serde_json::json!(mode);
+    }
+    if let Some(alias) = b.tls_certificate {
+        body["tls_certificate"] = serde_json::json!(alias);
     }
     body
 }
@@ -316,6 +450,11 @@ pub struct CreateRequest {
     pub memory_mb: Option<i32>,
     pub cpu_percent: Option<i32>,
     pub ssl_email: Option<String>,
+    /// `none` / `acme` / `provided` — absent means derive it from `ssl_email`
+    /// presence, exactly as every row before this field existed.
+    pub tls_mode: Option<String>,
+    /// The registered-certificate alias, `provided` mode only.
+    pub tls_certificate: Option<String>,
     pub pre_build_cmd: Option<String>,
     pub post_deploy_cmd: Option<String>,
     pub build_args: Option<HashMap<String, String>>,
@@ -324,6 +463,7 @@ pub struct CreateRequest {
     pub deploy_cron: Option<String>,
     pub deploy_protected: Option<bool>,
     pub preview_ttl_hours: Option<i32>,
+    pub volumes: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -338,6 +478,11 @@ pub struct UpdateRequest {
     pub memory_mb: Option<i32>,
     pub cpu_percent: Option<i32>,
     pub ssl_email: Option<String>,
+    /// Absent means keep the stored mode. `pub` per stacks' own `UpdateStackRequest`.
+    pub tls_mode: Option<String>,
+    /// Absent means keep the stored alias; `""` clears it (only meaningful if
+    /// the resulting mode is not `provided`, since that mode always needs one).
+    pub tls_certificate: Option<String>,
     pub pre_build_cmd: Option<String>,
     pub post_deploy_cmd: Option<String>,
     pub build_args: Option<HashMap<String, String>>,
@@ -346,6 +491,11 @@ pub struct UpdateRequest {
     pub deploy_cron: Option<String>,
     pub deploy_protected: Option<bool>,
     pub preview_ttl_hours: Option<i32>,
+    /// Absent means keep the stored list. The frontend always sends the full
+    /// current list (including `[]` to clear it), so in practice this is only
+    /// ever `None` for a caller that omits the key entirely — matching how
+    /// `env_vars`/`build_args` already behave on this handler.
+    pub volumes: Option<Vec<String>>,
 }
 
 /// GET /api/git-deploys — List all git deploys for the current user.
@@ -357,7 +507,7 @@ pub async fn list(
     require_admin(&claims.role)?;
 
     let mut deploys: Vec<GitDeploy> = sqlx::query_as(
-        "SELECT * FROM git_deploys WHERE user_id = $1 AND server_id = $2 ORDER BY created_at DESC LIMIT 200",
+        &format!("{GIT_DEPLOY_SELECT} WHERE d.user_id = $1 AND d.server_id = $2 ORDER BY d.created_at DESC LIMIT 200"),
     )
     .bind(claims.sub)
     .bind(server_id)
@@ -365,9 +515,14 @@ pub async fn list(
     .await
     .map_err(|e| internal_error("list git_deploys", e))?;
 
-    // Mask github_token in responses
+    // Mask github_token in responses; decrypt webhook_secret — GitDeploys.tsx
+    // builds the webhook URL to paste into the git host from it on every load.
     for d in &mut deploys {
         mask_github_token(d);
+        d.webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+            &d.webhook_secret,
+            &state.config.jwt_secret,
+        );
     }
 
     Ok(Json(deploys))
@@ -377,7 +532,11 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(server_id, agent): ServerScope,
+    // The extractor stays even though the handle is unused: extracting it IS the
+    // check that the caller owns the server they named, and `server_id` is what
+    // the new row records as its host. Only the agent handle became redundant,
+    // when the domain claim moved from asking this one host to asking the fleet.
+    ServerScope(server_id, _agent): ServerScope,
     headers: axum::http::HeaderMap,
     Json(body): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<GitDeploy>), ApiError> {
@@ -389,6 +548,10 @@ pub async fn create(
 
     if body.repo_url.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Repository URL is required"));
+    }
+
+    if let Err(e) = crate::helpers::validate_repo_url_not_internal(&body.repo_url).await {
+        return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid repository URL: {e}")));
     }
 
     // Auto-allocate host_port: find first gap in 7000-7999 (scoped to this server)
@@ -411,6 +574,11 @@ pub async fn create(
         let bytes: Vec<u8> = (0..32).map(|_| rand::rng().random::<u8>()).collect();
         hex::encode(bytes)
     };
+    let encrypted_webhook_secret = crate::services::secrets_crypto::encrypt_credential(
+        &webhook_secret,
+        &state.config.jwt_secret,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
     let branch = body.branch.as_deref().unwrap_or("main");
     let dockerfile = body.dockerfile.as_deref().unwrap_or("Dockerfile");
@@ -458,6 +626,12 @@ pub async fn create(
         }
     }
 
+    let volumes = body.volumes.clone().unwrap_or_default();
+    if let Err(msg) = validate_volumes(&volumes) {
+        return Err(err(StatusCode::BAD_REQUEST, msg));
+    }
+    let volumes_json = serde_json::to_value(&volumes).unwrap_or(serde_json::json!([]));
+
     // Format, reserved and every owner — see services::domain_claim. The two
     // conflict queries that used to be inlined here are the ones `update` never
     // grew, which is how a git deploy could be RENAMED onto an occupied domain
@@ -466,20 +640,83 @@ pub async fn create(
         Some(d) => Some(
             domain_claim::ensure_claimable(
                 &state.db,
-                &agent,
-                server_id,
+                &state.agents,
                 d,
                 &headers,
                 domain_claim::Holder::New,
+                &claims.role,
             )
             .await?,
         ),
-        None => body.domain.clone(),
+        // Was `body.domain.clone()`, which round-tripped a blank box back into the
+        // column as ''. Harmless while the form sent null for an empty field;
+        // load-bearing now that it sends the empty string, because `remove` reads
+        // this column with `unwrap_or(&name)` and '' is not None.
+        None => None,
     };
 
-    let deploy: GitDeploy = sqlx::query_as(
-        "INSERT INTO git_deploys (user_id, server_id, name, repo_url, branch, dockerfile, container_port, host_port, domain, env_vars, auto_deploy, webhook_secret, memory_mb, cpu_percent, ssl_email, pre_build_cmd, post_deploy_cmd, build_args, build_context, github_token, deploy_cron, deploy_protected, preview_ttl_hours) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+    // Encrypted at rest; `set_github_status` decrypts. `encrypt_stored_token`
+    // also refuses the mask sentinel, so a client that echoes back the
+    // ●●●●●●●● it was shown cannot overwrite a real token with it.
+    let github_token_enc =
+        encrypt_stored_token(body.github_token.as_deref(), &state.config.jwt_secret)?;
+
+    // Resolve the TLS mode/certificate before the row is written — the
+    // DB-only half of `stacks::plan_tls` (alias shape + existence for this
+    // user and server). Unlike a stack, a git deploy's create never talks to
+    // the agent: the actual deploy is a separate, later action (manual,
+    // webhook or scheduled), so the SAN-coverage check that needs a live
+    // agent call stays where the domain is actually served — the agent's own
+    // `TlsIntent::Provided` arm re-asks it at every deploy regardless, the
+    // same "defence in depth" reasoning `expose_domain` documents for stacks:
+    // the registry can drift between save and deploy either way, so a
+    // claim-time coverage check would only narrow, never close, that window,
+    // at the cost of an agent round-trip on every create.
+    let mode = requested_tls_mode(body.tls_mode.as_deref())?
+        .unwrap_or_else(|| effective_tls_mode(None, body.ssl_email.as_deref()));
+    let (mode, tls_certificate_id, resolved_alias): (&'static str, Option<Uuid>, Option<String>) =
+        match mode {
+            "acme" => {
+                if body.ssl_email.as_deref().map(str::trim).filter(|e| !e.is_empty()).is_none() {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "Let's Encrypt mode needs an ssl_email for the ACME account",
+                    ));
+                }
+                ("acme", None, None)
+            }
+            "provided" => {
+                if domain.is_none() {
+                    return Err(err(StatusCode::BAD_REQUEST, "a TLS mode needs a domain"));
+                }
+                let alias = body
+                    .tls_certificate
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .ok_or_else(|| {
+                        err(
+                            StatusCode::BAD_REQUEST,
+                            "tls_mode provided needs tls_certificate — the alias of a registered certificate",
+                        )
+                    })?
+                    .to_ascii_lowercase();
+                if !is_valid_cert_alias(&alias) {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "Alias must be 1-64 lowercase letters, digits or hyphens, starting and ending with a letter or digit",
+                    ));
+                }
+                let cert_id =
+                    certificate_id_for_alias(&state.db, &alias, claims.sub, server_id).await?;
+                ("provided", Some(cert_id), Some(alias))
+            }
+            _ => ("none", None, None),
+        };
+
+    let mut deploy: GitDeploy = sqlx::query_as(
+        "INSERT INTO git_deploys (user_id, server_id, name, repo_url, branch, dockerfile, container_port, host_port, domain, env_vars, auto_deploy, webhook_secret, memory_mb, cpu_percent, ssl_email, pre_build_cmd, post_deploy_cmd, build_args, build_context, github_token, deploy_cron, deploy_protected, preview_ttl_hours, tls_mode, tls_certificate_id, volumes) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) \
          RETURNING *",
     )
     .bind(claims.sub)
@@ -493,18 +730,26 @@ pub async fn create(
     .bind(&domain)
     .bind(&env_vars)
     .bind(auto_deploy)
-    .bind(&webhook_secret)
+    .bind(&encrypted_webhook_secret)
     .bind(body.memory_mb)
     .bind(body.cpu_percent)
-    .bind(&body.ssl_email)
-    .bind(&body.pre_build_cmd)
-    .bind(&body.post_deploy_cmd)
+    // The form posts the same object to create and to update, so these arrive
+    // blank rather than absent whenever the operator left the box alone. NULL is
+    // the stored spelling of "not set" on this table — every reader is written
+    // against it — so the blank is normalised away here rather than stored and
+    // guarded against at each of the readers for ever after.
+    .bind(blank_to_none(body.ssl_email.as_deref()))
+    .bind(blank_to_none(body.pre_build_cmd.as_deref()))
+    .bind(blank_to_none(body.post_deploy_cmd.as_deref()))
     .bind(&build_args)
     .bind(build_context)
-    .bind(&body.github_token)
-    .bind(&body.deploy_cron)
+    .bind(&github_token_enc)
+    .bind(blank_to_none(body.deploy_cron.as_deref()))
     .bind(deploy_protected)
     .bind(preview_ttl)
+    .bind(mode)
+    .bind(tls_certificate_id)
+    .bind(&volumes_json)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -514,10 +759,13 @@ pub async fn create(
             internal_error("create git_deploys", e)
         }
     })?;
+    // `RETURNING *` has no join to read the alias through — the handler
+    // already knows it, from the request it just validated.
+    deploy.tls_certificate = resolved_alias;
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "git_deploy.create",
-        Some("git_deploy"), Some(&body.name), None, None,
+        Some("git_deploy"), Some(&body.name), None, None, claims.key_id,
     ).await;
 
     // GAP 13: Auto-create webhook gateway endpoint for this git deploy
@@ -534,6 +782,11 @@ pub async fn create(
         .execute(&state.db).await;
     }
 
+    mask_github_token(&mut deploy);
+    deploy.webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &deploy.webhook_secret,
+        &state.config.jwt_secret,
+    );
     Ok((StatusCode::CREATED, Json(deploy)))
 }
 
@@ -546,7 +799,7 @@ pub async fn get_one(
     require_admin(&claims.role)?;
 
     let mut deploy: GitDeploy = sqlx::query_as(
-        "SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2",
+        &format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"),
     )
     .bind(id)
     .bind(claims.sub)
@@ -556,6 +809,10 @@ pub async fn get_one(
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
 
     mask_github_token(&mut deploy);
+    deploy.webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &deploy.webhook_secret,
+        &state.config.jwt_secret,
+    );
     Ok(Json(deploy))
 }
 
@@ -574,23 +831,39 @@ pub async fn update(
     // deploy already on a reserved zone, or a stored 6-field cron — so an
     // unrelated field edit that re-sends the unchanged value isn't rejected).
     //
-    // `server_id` is fetched too: the conflict check is per-server and this
-    // handler has no ServerScope. Reading it from the ROW rather than from the
-    // caller's X-Server-Id header means the guard consults the server the deploy
-    // actually lives on, which is the one whose nginx it will overwrite.
-    let existing: Option<(Option<String>, Option<String>, Uuid)> = sqlx::query_as(
-        "SELECT domain, deploy_cron, server_id FROM git_deploys WHERE id = $1 AND user_id = $2",
-    )
+    // `server_id` is no longer fetched. It used to be, so the per-server conflict
+    // check consulted the deploy's own host rather than the caller's header — a
+    // real fix at the time. The claim is now fleet-wide on every leg (a domain
+    // may exist once across the whole installation, and a Docker app holding it
+    // is invisible to SQL on any host), so there is no per-server question left
+    // for this handler to answer and nothing here would use the value.
+    // The protection flag is fetched for one reason only: to tell a request that
+    // changed it from one that merely re-sent it. The write below COALESCEs an
+    // absent field onto the stored value, so "still true" and "set to true"
+    // arrive here identically and only the previous value separates them.
+    // `server_id`, `ssl_email`, `tls_mode` and the joined alias come along so
+    // the TLS block below can compute the deploy's CURRENT effective mode —
+    // an edit that says nothing about TLS keeps it, the same "absent means
+    // keep" contract every other field on this handler already gives.
+    let existing: Option<(Option<String>, Option<String>, bool, Uuid, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT d.domain, d.deploy_cron, d.deploy_protected, d.server_id, d.ssl_email, \
+             d.tls_mode, c.alias \
+             FROM git_deploys d LEFT JOIN tls_certificates c ON c.id = d.tls_certificate_id \
+             WHERE d.id = $1 AND d.user_id = $2",
+        )
     .bind(id)
     .bind(claims.sub)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("update git_deploys", e))?;
 
-    let (cur_domain, cur_cron, server_id) = match existing {
-        Some(row) => row,
-        None => return Err(err(StatusCode::NOT_FOUND, "Git deploy not found")),
-    };
+    let (cur_domain, cur_cron, was_protected, deploy_server_id, cur_ssl_email, cur_tls_mode, cur_alias) =
+        match existing {
+            Some(row) => row,
+            None => return Err(err(StatusCode::NOT_FOUND, "Git deploy not found")),
+        };
+    let previous_mode = effective_tls_mode(cur_tls_mode.as_deref(), cur_ssl_email.as_deref());
 
     // Validate domain ONLY when it changes. This used to run `is_valid_domain` +
     // `is_reserved_domain` and stop there, under a comment claiming parity with
@@ -599,22 +872,55 @@ pub async fn update(
     // proxy vhost over the file the victim owned.
     let domain = match body.domain.as_deref() {
         Some(d) if !d.is_empty() && Some(d) != cur_domain.as_deref() => {
-            let agent = state
-                .agents
-                .for_server(server_id)
-                .await
-                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
+            // No agent is resolved here any more. The claim used to need one
+            // because its Docker-app leg asked a single host; it now asks the
+            // registry, which means a rename no longer 502s merely because the
+            // target box is mid-reboot.
             Some(
                 domain_claim::ensure_claimable(
                     &state.db,
-                    &agent,
-                    server_id,
+                    &state.agents,
                     d,
                     &headers,
                     domain_claim::Holder::GitDeploy(id),
+                    &claims.role,
                 )
                 .await?,
             )
+        }
+        // Emptying the box is now a real instruction rather than a no-op, so it
+        // has to be answered rather than folded away. It is REFUSED.
+        //
+        // ⚠ THE REFUSAL'S ORIGINAL REASON IS NO LONGER TRUE and the message
+        // below has been reworded to match. "Nothing in the git path takes a
+        // vhost down" was the reason; `/git/release-domain` now does exactly
+        // that, under the same ownership gate, and the RENAME leg below drives
+        // it. The clear leg is deliberately NOT built in the same change: it
+        // needs the `domain` column to accept the '' sentinel the way
+        // `ssl_email` does, and every Option-shaped reader of that column
+        // re-checked — `remove` alone falls back on
+        // `domain.as_deref().unwrap_or(&name)`, where a stored '' would hand
+        // the agent an empty site identifier. That is a separate, named piece
+        // of work, not an oversight; the refusal stays honest until it lands.
+        // Only fires when a domain is actually stored: a deploy that never had
+        // one submits "" on every ordinary save.
+        Some(d)
+            if d.trim().is_empty()
+                && cur_domain
+                    .as_deref()
+                    .map(|c| !c.trim().is_empty())
+                    .unwrap_or(false) =>
+        {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Removing the domain is not supported yet: the vhost for {} would be left \
+                     without a replacement to put in its place. Entering a DIFFERENT domain now \
+                     moves the deploy cleanly — the old vhost and its certificate are taken down \
+                     for you — or delete the deploy to remove it entirely.",
+                    cur_domain.as_deref().unwrap_or("")
+                ),
+            ));
         }
         other => other.map(|d| d.to_string()),
     };
@@ -640,10 +946,116 @@ pub async fn update(
         }
     }
 
+    // Validate repo_url for SSRF the same way create() does, whenever it's present —
+    // an edit can point an existing deploy at a NEW repo, not just create one.
+    if let Some(ref url) = body.repo_url {
+        if !url.trim().is_empty() {
+            if let Err(e) = crate::helpers::validate_repo_url_not_internal(url).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid repository URL: {e}")));
+            }
+        }
+    }
+
     let env_vars = body.env_vars.as_ref().map(|e| serde_json::to_value(e).unwrap_or_default());
     let build_args = body.build_args.as_ref().map(|e| serde_json::to_value(e).unwrap_or_default());
+    if let Some(ref vols) = body.volumes
+        && let Err(msg) = validate_volumes(vols)
+    {
+        return Err(err(StatusCode::BAD_REQUEST, msg));
+    }
+    let volumes = body.volumes.as_ref().map(|v| serde_json::to_value(v).unwrap_or_default());
 
-    let deploy: GitDeploy = sqlx::query_as(
+    let github_token_enc =
+        encrypt_stored_token(body.github_token.as_deref(), &state.config.jwt_secret)?;
+
+    // Absent means KEEP, for both mode and alias — the fix `stacks::update`
+    // already made for the identical bug: an edit that says nothing about TLS
+    // used to forward whatever `ssl_email` the request happened to carry,
+    // which took the certificate off a deploy that had one. See `create`'s
+    // TLS block for why the SAN-coverage check stays at deploy time rather
+    // than running here too.
+    let requested_mode = requested_tls_mode(body.tls_mode.as_deref())?;
+    let mode = requested_mode.unwrap_or(previous_mode);
+    let effective_ssl_email = match body.ssl_email.as_deref() {
+        Some("") => None,
+        Some(v) => Some(v.to_string()),
+        None => cur_ssl_email.clone(),
+    };
+    let effective_domain_present = domain
+        .as_deref()
+        .or(cur_domain.as_deref())
+        .map(|d| !d.trim().is_empty())
+        .unwrap_or(false);
+    let (mode, tls_certificate_id, resolved_alias): (&'static str, Option<Uuid>, Option<String>) =
+        match mode {
+            "acme" => {
+                if effective_ssl_email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .is_none()
+                {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "Let's Encrypt mode needs an ssl_email for the ACME account",
+                    ));
+                }
+                ("acme", None, None)
+            }
+            "provided" => {
+                if !effective_domain_present {
+                    return Err(err(StatusCode::BAD_REQUEST, "a TLS mode needs a domain"));
+                }
+                let alias = match body
+                    .tls_certificate
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                {
+                    Some(a) => a.to_string(),
+                    None => cur_alias.clone().ok_or_else(|| {
+                        err(
+                            StatusCode::BAD_REQUEST,
+                            "tls_mode provided needs tls_certificate — the alias of a registered certificate",
+                        )
+                    })?,
+                };
+                let alias = alias.to_ascii_lowercase();
+                if !is_valid_cert_alias(&alias) {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "Alias must be 1-64 lowercase letters, digits or hyphens, starting and ending with a letter or digit",
+                    ));
+                }
+                let cert_id =
+                    certificate_id_for_alias(&state.db, &alias, claims.sub, deploy_server_id).await?;
+                ("provided", Some(cert_id), Some(alias))
+            }
+            _ => ("none", None, None),
+        };
+
+    // THREE states on the wire, two of which used to be one. A COALESCE self-guard
+    // folds an absent field onto the stored value, which is right for a key the
+    // client omitted and wrong for a box the operator emptied — both arrive as
+    // NULL, so "leave it alone" and "clear it" were indistinguishable and the
+    // second silently became the first while the save answered 200.
+    //
+    //   key absent      -> NULL -> COALESCE keeps the stored value
+    //   key sent as ""  -> ''   -> CASE writes NULL
+    //   key sent with v -> v    -> CASE writes v
+    //
+    // The empty string is a WIRE sentinel and never a stored value. v2.120.0 fixed
+    // the same defect on the alert destinations by letting '' reach the column, and
+    // that is safe THERE because every reader of those columns guards on non-empty.
+    // It is not safe here: `remove` falls back with `domain.as_deref().unwrap_or(&name)`,
+    // so a stored '' would hand the agent an empty site identifier where a NULL
+    // correctly yields the deploy's name. Normalising at the writer keeps every
+    // existing Option-shaped reader out of the blast radius.
+    //
+    // `domain` is deliberately NOT in this list — see the refusal above; and
+    // `github_token` is not either, because the GET masks it and the box is blank
+    // on every ordinary edit.
+    let mut deploy: GitDeploy = sqlx::query_as(
         "UPDATE git_deploys SET \
          repo_url = COALESCE($1, repo_url), \
          branch = COALESCE($2, branch), \
@@ -654,17 +1066,20 @@ pub async fn update(
          auto_deploy = COALESCE($7, auto_deploy), \
          memory_mb = $8, \
          cpu_percent = $9, \
-         ssl_email = COALESCE($10, ssl_email), \
-         pre_build_cmd = COALESCE($11, pre_build_cmd), \
-         post_deploy_cmd = COALESCE($12, post_deploy_cmd), \
+         ssl_email = CASE WHEN $10 = '' THEN NULL ELSE COALESCE($10, ssl_email) END, \
+         pre_build_cmd = CASE WHEN $11 = '' THEN NULL ELSE COALESCE($11, pre_build_cmd) END, \
+         post_deploy_cmd = CASE WHEN $12 = '' THEN NULL ELSE COALESCE($12, post_deploy_cmd) END, \
          build_args = COALESCE($13, build_args), \
          build_context = COALESCE($14, build_context), \
          github_token = COALESCE($15, github_token), \
-         deploy_cron = COALESCE($16, deploy_cron), \
+         deploy_cron = CASE WHEN $16 = '' THEN NULL ELSE COALESCE($16, deploy_cron) END, \
          deploy_protected = COALESCE($17, deploy_protected), \
          preview_ttl_hours = COALESCE($18, preview_ttl_hours), \
+         tls_mode = $19, \
+         tls_certificate_id = $20, \
+         volumes = COALESCE($21, volumes), \
          updated_at = NOW() \
-         WHERE id = $19 AND user_id = $20 \
+         WHERE id = $22 AND user_id = $23 \
          RETURNING *",
     )
     .bind(body.repo_url.as_deref())
@@ -681,16 +1096,126 @@ pub async fn update(
     .bind(body.post_deploy_cmd.as_deref())
     .bind(build_args)
     .bind(body.build_context.as_deref())
-    .bind(body.github_token.as_deref())
+    .bind(github_token_enc.as_deref())
     .bind(body.deploy_cron.as_deref())
     .bind(body.deploy_protected)
     .bind(body.preview_ttl_hours)
+    .bind(mode)
+    .bind(tls_certificate_id)
+    .bind(volumes)
     .bind(id)
     .bind(claims.sub)
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("update git_deploys", e))?;
+    // `RETURNING *` has no join to read the alias through — the handler
+    // already knows it, from the request (or the previous row) it just
+    // resolved.
+    deploy.tls_certificate = resolved_alias;
 
+    // A RENAME walked away from a vhost that is still serving. Until now the old
+    // config kept proxying to this same container with a certificate that kept
+    // renewing, while the row above released the claim on that name — so another
+    // tenant could claim it and be answered by the previous tenant's app.
+    //
+    // Asked of the agent, not decided here: only the box can see whether the old
+    // vhost still points at THIS container's port. `services::ownership` fails
+    // closed, so a vhost re-claimed by a site since the rename is left alone —
+    // which is the objection `git_build.rs` raised against doing this at all,
+    // and the reason it routes through the same gate the delete path uses.
+    //
+    // Fire-and-forget on purpose: the rename has already been committed and the
+    // operator asked for it. A box that is mid-reboot must not turn their save
+    // into a 502; the leak it leaves is the one that existed before this block.
+    if let (Some(new_domain), Some(old_domain)) = (domain.as_deref(), cur_domain.as_deref()) {
+        if !old_domain.trim().is_empty() && old_domain != new_domain {
+            match crate::helpers::agent_for_site_server(&state, Some(deploy.server_id), old_domain).await {
+                Ok(agent) => {
+                    if let Err(e) = agent
+                        .post(
+                            "/git/release-domain",
+                            Some(serde_json::json!({
+                                "domain": old_domain,
+                                "host_port": deploy.host_port,
+                            })),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Renamed git deploy '{}' to {new_domain} but could not release \
+                             {old_domain} on its host: {e:?}. The old vhost may still be serving.",
+                            deploy.name
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "Renamed git deploy '{}' to {new_domain} but its host was unreachable, \
+                     so {old_domain} was not released: {e:?}",
+                    deploy.name
+                ),
+            }
+        }
+    }
+
+    // Turning the review requirement off is the one edit on this handler that
+    // removes a control, and until now it was the only one that left no trace:
+    // the row simply changed. It goes to the immutable log rather than the
+    // activity feed because that table refuses UPDATE and DELETE, which is the
+    // property an account disarming its own guard would otherwise exploit.
+    //
+    // Both directions are recorded. Only knowing when protection was switched
+    // off tells you it was off; it does not tell you when it came back.
+    if deploy.deploy_protected != was_protected {
+        let (verb, severity) = if deploy.deploy_protected {
+            ("enabled", "info")
+        } else {
+            ("disabled", "warning")
+        };
+        crate::services::security_hardening::audit_log(
+            &state.db,
+            "git_deploy.protection_changed",
+            Some(&claims.email),
+            crate::routes::client_ip(&headers).as_deref(),
+            Some("git_deploy"),
+            Some(&deploy.name),
+            Some(&format!("Deploy approval requirement {verb}")),
+            None,
+            severity,
+            claims.key_id,
+        )
+        .await;
+    }
+
+    // Switching protection OFF must resolve anything still waiting on it.
+    //
+    // Nothing used to read these rows, so a request left behind by a flag that
+    // had since been cleared was inert. It is not inert now: the panel lists
+    // pending requests and offers Approve, and `approve_deploy` takes its target
+    // from the row rather than re-deciding whether the deployment is protected.
+    // A stale row would therefore sit in front of a second administrator, under a
+    // deployment the same screen calls unprotected, one click from a production
+    // deploy of whatever HEAD had become in the meantime.
+    //
+    // Resolved rather than deleted, for the same reason the migration keeps
+    // resolved rows: they are the record of who decided what. 'cancelled' is a
+    // third terminal state, distinct from a colleague's 'rejected'.
+    if !deploy.deploy_protected {
+        if let Err(e) = sqlx::query(
+            "UPDATE deploy_approvals SET status = 'cancelled', resolved_at = NOW() \
+             WHERE deploy_id = $1 AND status = 'pending'"
+        )
+        .bind(id)
+        .execute(&state.db).await
+        {
+            tracing::warn!("Failed to cancel pending approvals for {id}: {e}");
+        }
+    }
+
+    mask_github_token(&mut deploy);
+    deploy.webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &deploy.webhook_secret,
+        &state.config.jwt_secret,
+    );
     Ok(Json(deploy))
 }
 
@@ -698,13 +1223,13 @@ pub async fn update(
 pub async fn remove(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
 
-    let deploy: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT name, domain FROM git_deploys WHERE id = $1 AND user_id = $2",
+    let deploy: Option<(String, Option<String>, Uuid)> = sqlx::query_as(
+        "SELECT name, domain, server_id FROM git_deploys WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(claims.sub)
@@ -712,7 +1237,37 @@ pub async fn remove(
     .await
     .map_err(|e| internal_error("remove git_deploys", e))?;
 
-    let (name, _domain) = deploy.ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+    let (name, domain, server_id) =
+        deploy.ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+
+    // WHICH deployment came from the row, so WHICH HOST has to come from the row
+    // as well. It used to come from `ServerScope`: the caller's `X-Server-Id`
+    // header, falling back to the local agent when there is no header at all. The
+    // two agree on a one-box install and whenever the operator happens to have the
+    // right server selected in the switcher, and disagree silently the rest of the
+    // time.
+    //
+    // `trigger_deploy_task` already documents what that costs from the scheduler
+    // side: `idx_git_deploys_name_server` makes `name` unique only PER SERVER while
+    // the agent's checkout path is `/var/lib/dockpanel/git/{name}`, keyed by name
+    // alone — so addressing the wrong box does not error, it finds the same-named
+    // neighbour and acts on THAT. Removal is the sharpest form of it. `/git/cleanup`
+    // stops the container and deletes its image, vhost, certificate and checkout,
+    // and the calls below used to be fire-and-forget, so a teardown aimed at the
+    // wrong machine destroyed another tenant's deployment and reported success.
+    // They are checked now, and this handler refuses rather than deleting records
+    // for containers the server did not confirm it removed.
+    //
+    // `server_id` is NOT NULL on this table, hence the bare `Some(...)`; the only
+    // arm of the helper that can fire here is the unreachable-host one, and it
+    // REFUSES rather than falling back to this box. Refusing is the correct answer:
+    // the fallback was the defect.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(server_id),
+        domain.as_deref().unwrap_or(&name),
+    )
+    .await?;
 
     // Every preview of this deployment is a container, a bound port, a vhost and
     // a checkout of its own, and the `git_previews` rows are about to be removed
@@ -725,30 +1280,67 @@ pub async fn remove(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
+    let mut standing: Vec<String> = Vec::new();
     for (container_name, domain, host_port) in &previews {
-        agent
+        if let Err(e) = agent
             .post(
                 "/git/cleanup",
                 Some(preview_cleanup_body(container_name, domain.as_deref(), Some(*host_port))),
             )
             .await
-            .ok();
+        {
+            tracing::warn!(
+                "Failed to tear down preview {container_name} of git deploy {name}: {e}"
+            );
+            standing.push(container_name.clone());
+        }
     }
-    if !previews.is_empty() {
+    if !previews.is_empty() && standing.is_empty() {
         tracing::info!(
             "Removed {} preview container(s) alongside git deploy {name}",
             previews.len()
         );
     }
 
-    // Tell agent to stop and remove container + cleanup
-    agent
+    // Tell agent to stop and remove container + cleanup. Discarding THIS result
+    // was the same defect as the loop above — three lines apart, on the larger
+    // subject: the deployment's own container, image, vhost, certificate and
+    // checkout. The comment at the top of this function already said the calls
+    // here were fire-and-forget and reported success; it described a defect
+    // rather than a decision.
+    if let Err(e) = agent
         .post(
             "/git/cleanup",
             Some(serde_json::json!({ "name": name, "scope": "deploy" })),
         )
         .await
-        .ok();
+    {
+        tracing::warn!("Failed to tear down git deploy {name}: {e}");
+        standing.push(name.clone());
+    }
+
+    // REFUSE, and name what is still up. The cascade below is the last moment
+    // anything knows these containers exist: `git_previews` rows go with the
+    // parent, so deleting anyway leaves containers running, holding their ports
+    // and serving their vhosts, with nothing in the panel able to find them
+    // again. Retryable by construction — `/git/cleanup` answers Ok for a
+    // container that is already gone, so pressing Delete again once the server
+    // answers finishes the job rather than double-deleting.
+    //
+    // This cannot become a permanent block: `agent_for_site_server` above
+    // already refuses when the host is unreachable, so a decommissioned server
+    // fails earlier than here and for a different reason.
+    if !standing.is_empty() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            &format!(
+                "The server did not confirm teardown of {}. Nothing was deleted — these \
+                 records are the only thing that can still find those containers, their \
+                 ports and their vhosts. Retry once the server answers.",
+                standing.join(", ")
+            ),
+        ));
+    }
 
     // Delete from DB (CASCADE deletes history)
     sqlx::query("DELETE FROM git_deploys WHERE id = $1")
@@ -757,9 +1349,24 @@ pub async fn remove(
         .await
         .map_err(|e| internal_error("remove git_deploys", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "git_deploy.remove",
-        Some("git_deploy"), Some(&name), None, None,
+        Some("git_deploy"), Some(&name), None, ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "git_deploy.remove",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("git_deploy"),
+        Some(&name),
+        None,
+        None,
+        "warning",
+        claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -769,7 +1376,6 @@ pub async fn remove(
 pub async fn deploy(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     require_admin(&claims.role)?;
@@ -787,7 +1393,7 @@ pub async fn deploy(
     }
 
     let config: GitDeploy = sqlx::query_as(
-        "SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2",
+        &format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"),
     )
     .bind(id)
     .bind(claims.sub)
@@ -798,26 +1404,66 @@ pub async fn deploy(
 
     // Protected deploy: require approval from another admin
     if config.deploy_protected {
-        // Create pending approval instead of deploying immediately
-        sqlx::query(
-            "INSERT INTO deploy_approvals (deploy_id, requested_by) VALUES ($1, $2)"
+        // File one pending request per deployment, not one per click.
+        //
+        // The conflict clause below lands on the partial unique index added with
+        // this change, so the collapse is atomic rather than a read-then-write
+        // that two concurrent clicks could both win. `rows_affected` is therefore
+        // the honest answer to "did I create a request, or was one already
+        // waiting?" — and the requester is told which, because the reason this
+        // mattered is that they could not tell (see the migration).
+        //
+        // The clause is deliberately not spelled in this comment: a pin arm greps
+        // raw source, and a quotation here would satisfy it while the code changed.
+        let filed = sqlx::query(
+            "INSERT INTO deploy_approvals (deploy_id, requested_by) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING"
         )
         .bind(id).bind(claims.sub)
         .execute(&state.db).await
-        .map_err(|e| internal_error("deploy", e))?;
+        .map_err(|e| internal_error("deploy", e))?
+        .rows_affected() > 0;
 
-        notifications::notify_panel(
-            &state.db, None,
-            "Deploy approval needed",
-            &format!("Deploy to {} requires approval", config.name),
-            "warning", "deploy", Some("/git-deploys"),
-        ).await;
+        // Only a NEW request is worth waking every administrator for. Re-announcing
+        // one that is already waiting teaches the approvers to ignore the bell,
+        // which costs more than the missing notification would have.
+        if filed {
+            notifications::notify_panel(
+                &state.db, None,
+                "Deploy approval needed",
+                &format!("Deploy to {} requires approval", config.name),
+                "warning", "deploy", Some("/git-deploys"),
+            ).await;
+        }
 
         return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({
             "status": "pending_approval",
-            "message": "Deploy requires approval from another admin",
+            "message": if filed {
+                "Deploy requires approval from another admin \u{2014} the request is now waiting in Pending Approvals."
+            } else {
+                "This deployment already has a request waiting in Pending Approvals; another admin has not resolved it yet."
+            },
         }))));
     }
+
+    // Resolve the agent for the server this deployment LIVES ON — see `remove()`
+    // for why the caller's `ServerScope` is the wrong authority. Deployed to the
+    // wrong host this is not a stray teardown but a stray BUILD: the neighbour's
+    // checkout of the same name is overwritten with this repository and restarted
+    // under its own port and vhost.
+    //
+    // Resolved HERE, deliberately, and not earlier: an unreachable host must not
+    // stop a protected deploy from being QUEUED for approval (the branch above
+    // talks to no agent at all), and it must not happen after the lock below,
+    // which would strand `status = 'building'` for the 30-minute self-heal window
+    // on a deploy that never started. `trigger_deploy_task` orders itself the same
+    // way and says so.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
 
     // Deploy lock (atomic): flip status to 'building' iff not already building.
     // The old guard queried git_deploy_history for a 'building'/'deploying'
@@ -899,9 +1545,17 @@ pub async fn deploy_log(
         }
     });
 
+    // The underlying channel closes (and this stream ends) once the deploy
+    // finishes and its map entry is dropped — but a deploy in progress at
+    // shutdown time can still run well past the graceful-drain window, so
+    // race it against the panel's own shutdown signal too.
     Ok(
-        Sse::new(snapshot_stream.chain(live_stream))
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping")),
+        Sse::new(
+            snapshot_stream
+                .chain(live_stream)
+                .take_until(crate::helpers::shutdown_signal_fut(&state)),
+        )
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping")),
     )
 }
 
@@ -938,17 +1592,89 @@ pub async fn history(
     Ok(Json(entries))
 }
 
+/// POST /api/git-deploys/{id}/history/{history_id}/explain — BYO-API-key AI
+/// root-cause diagnosis for one failed deploy history entry. Off by default
+/// and per-request: this never fires on its own, only when an operator with a
+/// configured provider clicks the button (`ai_diagnosis::load_config` reads
+/// `ai_diagnosis_enabled`/`_provider`/`_model`/`_api_key` from `settings`).
+pub async fn explain_history(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path((id, history_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
+
+    let deploy: (Uuid, String) = sqlx::query_as(
+        "SELECT id, name FROM git_deploys WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("explain_history: load deploy", e))?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+
+    let entry: GitDeployHistory = sqlx::query_as(
+        "SELECT * FROM git_deploy_history WHERE id = $1 AND git_deploy_id = $2",
+    )
+    .bind(history_id)
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("explain_history: load history entry", e))?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Deploy history entry not found"))?;
+
+    if entry.status != "failed" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Only failed deploys can be explained",
+        ));
+    }
+    let output = entry
+        .output
+        .filter(|o| !o.trim().is_empty())
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "This deploy has no captured output to diagnose"))?;
+
+    let config = crate::services::ai_diagnosis::load_config(&state.db, &state.config.jwt_secret)
+        .await?
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "AI diagnosis is not configured. Set a provider and API key in Settings → Services.",
+            )
+        })?;
+
+    let ctx = crate::services::ai_diagnosis::FailureContext {
+        site_name: deploy.1,
+        commit_hash: entry.commit_hash,
+        commit_message: entry.commit_message.unwrap_or_default(),
+        image_tag: entry.image_tag,
+        output,
+    };
+    let explanation = crate::services::ai_diagnosis::explain_failure(&config, &ctx).await?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "git_deploy.ai_explain",
+        Some("git_deploy"), Some(&ctx.site_name),
+        Some(&format!("history={history_id} provider={}", config.provider)), None, claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({
+        "explanation": explanation,
+        "provider": config.provider,
+    })))
+}
+
 /// POST /api/git-deploys/{id}/rollback/{history_id} — Rollback to a previous image.
 pub async fn rollback(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path((id, history_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     require_admin(&claims.role)?;
 
     let config: GitDeploy = sqlx::query_as(
-        "SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2",
+        &format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"),
     )
     .bind(id)
     .bind(claims.sub)
@@ -967,13 +1693,31 @@ pub async fn rollback(
     .map_err(|e| internal_error("rollback", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "History entry not found"))?;
 
-    // Update status to building
-    if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'building', updated_at = NOW() WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-    {
-        tracing::warn!("Failed to update git deploy status: {e}");
+    // The host comes from the row, not from the caller's server switcher — see
+    // `remove()`. Rollback carries its own edge: `hist.image_tag` names an image
+    // built on THIS deployment's server and present in that daemon's local store,
+    // so pointed at another box `/git/deploy` either fails on a missing image or,
+    // worse, finds a same-tagged image the neighbour built and starts it under the
+    // neighbour's name. Resolved before the status write below so an unreachable
+    // host cannot strand `status = 'building'`.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
+
+    // The same lock the other three build doors take, and for the same reason —
+    // this one wrote the status unconditionally and only warned on failure, so a
+    // rollback could start on top of a running build and each would swap the
+    // container out from under the other. It is the last door that acquired it.
+    match sqlx::query(
+        "UPDATE git_deploys SET status = 'building', updated_at = NOW() \
+         WHERE id = $1 AND (status IS DISTINCT FROM 'building' OR updated_at < NOW() - INTERVAL '30 minutes')"
+    ).bind(id).execute(&state.db).await {
+        Ok(r) if r.rows_affected() == 0 => return Err(err(StatusCode::CONFLICT, "A deploy or rollback is already in progress")),
+        Ok(_) => {}
+        Err(e) => return Err(internal_error("rollback lock", e)),
     }
 
     let deploy_id = Uuid::new_v4();
@@ -990,6 +1734,7 @@ pub async fn rollback(
     let db = state.db.clone();
     let user_id = claims.sub;
     let email = claims.email.clone();
+    let key_id = claims.key_id;
     let deploy_name = config.name.clone();
     let rollback_image = hist.image_tag.clone();
     let rollback_commit = hist.commit_hash.clone();
@@ -1012,6 +1757,53 @@ pub async fn rollback(
         // Skip clone+build — go straight to deploy with the historical image
         emit("deploy", "Rolling back container", "in_progress", None);
 
+        let effective_mode =
+            effective_tls_mode(config.tls_mode.as_deref(), config.ssl_email.as_deref());
+        // An agent too old to honour `tls_mode`/`tls_certificate` silently
+        // drops both (no `deny_unknown_fields` on its `DeployRequest`) and
+        // falls back to inferring the mode from `ssl_email` presence — which
+        // `deploy_tls_email` withholds outright in `provided` mode, so an old
+        // agent would roll this deploy back onto plain HTTP with no warning.
+        // Refused here, before the historical image is even redeployed.
+        if effective_mode == "provided" {
+            if let Err(e) = require_agent_at_least(
+                &agent,
+                PROVIDED_TLS_MIN_AGENT,
+                "Serving a registered certificate",
+            )
+            .await
+            {
+                let msg = api_error_message(e);
+                emit("deploy", "Rolling back container", "error", Some(msg.clone()));
+                emit("complete", "Rollback failed", "error", None);
+                if let Err(db_err) = sqlx::query(
+                    "INSERT INTO git_deploy_history (git_deploy_id, commit_hash, image_tag, status, output, triggered_by, duration_ms) \
+                     VALUES ($1, $2, $3, 'failed', $4, 'rollback', $5)",
+                )
+                .bind(id)
+                .bind(&rollback_commit)
+                .bind(&rollback_image)
+                .bind(&msg)
+                .bind(started.elapsed().as_millis() as i32)
+                .execute(&db)
+                .await
+                {
+                    tracing::warn!("Failed to record git deploy rollback history: {db_err}");
+                }
+                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                    .bind(id)
+                    .execute(&db)
+                    .await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                tracing::error!("Git deploy rollback refused: {deploy_name}: {msg}");
+                notifications::notify_panel(&db, Some(user_id), &format!("Rollback failed: {}", deploy_name), &msg, "critical", "deploy", Some("/git-deploys")).await;
+                logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&deploy_id);
+                return;
+            }
+        }
+
         let deploy_body = build_deploy_body(DeployBody {
             name: &config.name,
             image_tag: &rollback_image,
@@ -1021,8 +1813,11 @@ pub async fn rollback(
             domain: config.domain.as_deref(),
             memory_mb: config.memory_mb,
             cpu_percent: config.cpu_percent,
-            ssl_email: config.ssl_email.as_deref(),
+            ssl_email: deploy_tls_email(effective_mode, config.ssl_email.as_deref()),
+            tls_mode: Some(effective_mode),
+            tls_certificate: config.tls_certificate.as_deref(),
             scope: "deploy",
+            volumes: &volumes_vec(&config.volumes),
         });
 
         match agent.post_long("/git/deploy", Some(deploy_body), 120).await {
@@ -1072,7 +1867,7 @@ pub async fn rollback(
                 tracing::info!("Git deploy rollback success: {deploy_name} → {rollback_image}");
                 activity::log_activity(
                     &db, user_id, &email, "git_deploy.rollback",
-                    Some("git_deploy"), Some(&deploy_name), Some(&rollback_image), None,
+                    Some("git_deploy"), Some(&deploy_name), Some(&rollback_image), None, key_id,
                 ).await;
 
                 // Panel notification
@@ -1128,13 +1923,12 @@ pub async fn rollback(
 pub async fn keygen(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
 
-    let deploy: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM git_deploys WHERE id = $1 AND user_id = $2",
+    let deploy: Option<(String, Option<String>, Uuid)> = sqlx::query_as(
+        "SELECT name, domain, server_id FROM git_deploys WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(claims.sub)
@@ -1142,7 +1936,22 @@ pub async fn keygen(
     .await
     .map_err(|e| internal_error("keygen", e))?;
 
-    let (name,) = deploy.ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+    let (name, domain, server_id) =
+        deploy.ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+
+    // The key has to be minted on the machine that will USE it — see `remove()`
+    // for why the host comes from the row. A keypair generated on the panel host
+    // is written to that box's `key_path`, and the path is then stored against a
+    // deployment whose clones run somewhere else: the public half gets added to
+    // the GitHub repo, the private half never reaches the server that needs it,
+    // and every subsequent clone fails authentication for a key the panel says
+    // exists. Worse on collision — it can overwrite the same-named neighbour's key.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(server_id),
+        domain.as_deref().unwrap_or(&name),
+    )
+    .await?;
 
     let result = agent
         .post("/git/keygen", Some(serde_json::json!({ "name": name })))
@@ -1167,20 +1976,75 @@ pub async fn keygen(
     })))
 }
 
+/// The name the agent's container actually carries, and therefore the key
+/// `container_expected_stops` and the alert engine both use.
+///
+/// The stored `git_deploys.name` is BARE — the agent adds `dockpanel-git-` in
+/// `stop_container`/`start_container` (`agent routes/git_build.rs`) via
+/// `scope_of(..).scoped(..)`, which is the identity for `GitScope::Deploy`, the
+/// scope the lifecycle trio always uses because it sends no `scope` key. So the
+/// prefix belongs HERE and exactly once — see the double-prefix note at the top
+/// of this file for what happens when a caller gets that wrong in either
+/// direction.
+fn expected_stop_key(name: &str) -> String {
+    format!("dockpanel-git-{name}")
+}
+
 /// POST /api/git-deploys/{id}/stop
 pub async fn stop(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let config: GitDeploy = sqlx::query_as("SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2")
+    let config: GitDeploy = sqlx::query_as(&format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"))
         .bind(id).bind(claims.sub).fetch_optional(&state.db).await
         .map_err(|e| internal_error("stop", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+    // Host from the row, not from the switcher — see `remove()`. The lifecycle
+    // trio addresses the container purely by `config.name`, which is unique only
+    // per server, so the caller's scope deciding the host means a stop aimed at a
+    // fleet member takes down the panel host's same-named container instead — and
+    // then writes 'stopped' onto the row of the one still running.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
     agent.post("/git/stop", Some(serde_json::json!({ "name": config.name }))).await
         .map_err(|e| agent_error("Stop container", e))?;
+    // The FIFTH deliberate stop door. The other four record here; this one did
+    // not, and it is the oldest of them.
+    //
+    // ⛔ READ THIS BEFORE BELIEVING THE CHANGELOG FOR v2.150.0. That entry said
+    // the auto-healer restarted the operator's Stop within 120s. **It does not,
+    // and it never did** — measured on a box, both versions, not reasoned:
+    // `list_deployed_apps` (agent `services/docker_apps.rs`) keeps only
+    // containers carrying `dockpanel.app.template`, and a git container carries
+    // no template label at all. So `/apps` never lists one, and BOTH readers of
+    // this table — the healer's container leg and `alert_engine` — walk exactly
+    // that listing. A git deploy is invisible to container healing and to
+    // `container_down` alerting alike. v2.150.1 corrects the claim.
+    //
+    // This recording is therefore INERT today, and `clear_absent` sweeps the row
+    // on the next tick precisely because the container is never observed. It is
+    // kept deliberately: the door genuinely is a deliberate stop, the arms in
+    // `expected-stop-pin-e2e.sh` §E7 hold it, and on the day a git container
+    // enters `/apps` this is the one line that stops the healer from reverting
+    // an operator's Stop. Removing it would re-open the fifth door silently.
+    //
+    // Recorded only AFTER the agent call succeeds, per `expected_stops::record`.
+    let container_name = expected_stop_key(&config.name);
+    expected_stops::record(
+        &state.db,
+        config.server_id,
+        &container_name,
+        expected_stops::REASON_OPERATOR_STOP,
+        Some(&claims.email),
+    )
+    .await;
+    expected_stops::resolve_open_container_down(&state.db, config.server_id, &container_name).await;
     if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'stopped', updated_at = NOW() WHERE id = $1")
         .bind(id).execute(&state.db).await
     {
@@ -1193,16 +2057,27 @@ pub async fn stop(
 pub async fn start(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let config: GitDeploy = sqlx::query_as("SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2")
+    let config: GitDeploy = sqlx::query_as(&format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"))
         .bind(id).bind(claims.sub).fetch_optional(&state.db).await
         .map_err(|e| internal_error("start", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+    // Host from the row — see `stop()`.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
     agent.post("/git/start", Some(serde_json::json!({ "name": config.name }))).await
         .map_err(|e| agent_error("Start container", e))?;
+    // Symmetry with `stop()`. The alert engine also clears from observation on
+    // its next sweep, so this is the fast path rather than the only one — but
+    // without it a start followed by a genuine crash inside one poll window
+    // stays suppressed, which is the failure the table exists to avoid.
+    expected_stops::clear(&state.db, config.server_id, &expected_stop_key(&config.name)).await;
     if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'running', updated_at = NOW() WHERE id = $1")
         .bind(id).execute(&state.db).await
     {
@@ -1215,14 +2090,20 @@ pub async fn start(
 pub async fn restart(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let config: GitDeploy = sqlx::query_as("SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2")
+    let config: GitDeploy = sqlx::query_as(&format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"))
         .bind(id).bind(claims.sub).fetch_optional(&state.db).await
         .map_err(|e| internal_error("restart", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+    // Host from the row — see `stop()`.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
     agent.post("/git/restart", Some(serde_json::json!({ "name": config.name }))).await
         .map_err(|e| agent_error("Restart container", e))?;
     if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'running', updated_at = NOW() WHERE id = $1")
@@ -1237,14 +2118,23 @@ pub async fn restart(
 pub async fn container_logs(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let config: GitDeploy = sqlx::query_as("SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2")
+    let config: GitDeploy = sqlx::query_as(&format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2"))
         .bind(id).bind(claims.sub).fetch_optional(&state.db).await
         .map_err(|e| internal_error("container logs", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+    // Host from the row — see `stop()`. Read-only, but it fails in the direction
+    // nobody checks: asked of the wrong box it returns the same-named neighbour's
+    // stdout as if it were this deployment's, so an operator debugging an incident
+    // reads another tenant's logs and believes them.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
     let result = agent.post("/git/logs", Some(serde_json::json!({ "name": config.name }))).await
         .map_err(|e| agent_error("Container logs", e))?;
     Ok(Json(result))
@@ -1274,20 +2164,25 @@ pub async fn webhook(
         if now.duration_since(entry.1).as_secs() >= 3600 {
             *entry = (0, now);
         }
-        if entry.0 >= 10 {
+        if entry.0 >= crate::routes::WEBHOOK_ATTEMPT_LIMIT {
             return Err(err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded. Try again later."));
         }
     }
 
     // Fetch the git deploy config
     let config: GitDeploy = sqlx::query_as(
-        "SELECT * FROM git_deploys WHERE id = $1",
+        &format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1"),
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("webhook", e))?
     .ok_or_else(|| err(StatusCode::NOT_FOUND, "Invalid webhook"))?;
+
+    let stored_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &config.webhook_secret,
+        &state.config.jwt_secret,
+    );
 
     // Constant-time secret comparison via SHA256 hash
     let provided_hash = {
@@ -1297,7 +2192,7 @@ pub async fn webhook(
     };
     let stored_hash = {
         let mut h = Sha256::new();
-        h.update(config.webhook_secret.as_bytes());
+        h.update(stored_secret.as_bytes());
         h.finalize()
     };
     if provided_hash != stored_hash {
@@ -1378,31 +2273,85 @@ pub async fn webhook(
             Err(e) => { tracing::warn!("Failed to query git preview for cleanup: {e}"); None }
         };
 
+        let mut preview_retained = false;
         if let Some((preview_id, container_name, domain, host_port)) = deleted {
             // Reached with NO authentication — the webhook route has no auth
             // extractor, and a `deleted: true` payload names the branch. Which
             // makes it the sharpest of the four preview-teardown call sites, and
             // the one that most needs to address the preview's own space.
-            let _ = agent
+            match agent
                 .post(
                     "/git/cleanup",
                     Some(preview_cleanup_body(&container_name, domain.as_deref(), Some(host_port))),
                 )
-                .await;
-            let _ = sqlx::query("DELETE FROM git_previews WHERE id = $1").bind(preview_id).execute(&state.db).await;
-            tracing::info!("Cleaned up preview for deleted branch: {push_branch}");
+                .await
+            {
+                Ok(_) => {
+                    if let Err(e) = sqlx::query("DELETE FROM git_previews WHERE id = $1")
+                        .bind(preview_id)
+                        .execute(&state.db)
+                        .await
+                    {
+                        tracing::warn!("Failed to delete preview record for {container_name}: {e}");
+                    }
+                    tracing::info!("Cleaned up preview for deleted branch: {push_branch}");
+                }
+                Err(e) => {
+                    // KEEP THE ROW, for the reason `preview_cleanup` gives at its own
+                    // teardown: the row is the only record that this container, this
+                    // port and this vhost exist. Retiring it while the container is
+                    // still up hands the port to the next preview push, which then
+                    // cannot bind, and takes the container out of the sweep, the
+                    // previews list and the operator's Delete button alike. Nothing
+                    // on the box reaps a preview that has no row.
+                    //
+                    // This door is the one that most needs the row kept, because
+                    // deleting a branch is nobody's retryable action — no operator is
+                    // watching this response. Keeping it is what leaves a way back,
+                    // and the ways back all read this row: Delete Preview always, and
+                    // `preview_cleanup` once the preview is ELIGIBLE, which is not the
+                    // same as its five-minute cadence — an hour for a `deploying` or
+                    // `failed` one, `preview_ttl_hours` for a `running` one, and NEVER
+                    // when that is 0, the documented opt-out from automatic cleanup.
+                    // So on an opted-out install the operator's button is the only
+                    // path, which is precisely why the record has to survive.
+                    preview_retained = true;
+                    tracing::warn!(
+                        "Failed to tear down preview {container_name} for deleted branch \
+                         {push_branch}: {e}. Keeping the git_previews row so the cleanup \
+                         sweep retries rather than orphaning the container."
+                    );
+                }
+            }
         }
 
-        return Ok(Json(serde_json::json!({ "ok": true, "action": "branch_deleted", "branch": push_branch })));
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "action": "branch_deleted",
+            "branch": push_branch,
+            "preview_retained": preview_retained,
+        })));
     }
 
     if !push_branch.is_empty() && push_branch != config.branch {
-        // Preview deployment for non-configured branches
-        handle_preview_deploy(&state, &agent, &config, push_branch, &payload).await;
-        return Ok(Json(serde_json::json!({
-            "ok": true,
-            "message": format!("Preview deploy triggered for branch '{push_branch}'"),
-        })));
+        // Preview deployment for non-configured branches. Report what actually
+        // happened: three paths abandon the push before anything is spawned, and
+        // answering "triggered" for those told the pusher work had started in the
+        // one place they would look for it — GitHub's own delivery log. Still a
+        // 200, deliberately: the delivery itself succeeded and a non-2xx would put
+        // GitHub into retry over a decision that will not change on a retry.
+        return match handle_preview_deploy(&state, &agent, &config, push_branch, &payload).await {
+            Ok(()) => Ok(Json(serde_json::json!({
+                "ok": true,
+                "message": format!("Preview deploy triggered for branch '{push_branch}'"),
+            }))),
+            Err(reason) => Ok(Json(serde_json::json!({
+                "ok": false,
+                "message": format!(
+                    "No preview deploy for branch '{push_branch}': {reason}"
+                ),
+            }))),
+        };
     }
 
     // Deploy lock (atomic — see deploy(); the old git_deploy_history guard was inert)
@@ -1478,6 +2427,8 @@ fn spawn_deploy_task(
 
     tokio::spawn(async move {
         let started = Instant::now();
+        let effective_mode =
+            effective_tls_mode(config.tls_mode.as_deref(), config.ssl_email.as_deref());
 
         let emit = |step: &str, label: &str, status: &str, msg: Option<String>| {
             let ev = ProvisionStep {
@@ -1499,7 +2450,7 @@ fn spawn_deploy_task(
                 let target = config
                     .domain
                     .as_deref()
-                    .map(|d| deploy_url(d, config.ssl_email.as_deref()));
+                    .map(|d| deploy_url(d, effective_mode));
                 tokio::spawn(async move {
                     set_github_status(&token, &repo, "HEAD", "pending", target).await;
                 });
@@ -1589,11 +2540,48 @@ fn spawn_deploy_task(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            if let Some(reason) =
+                compose_deploy_refusal(&db, &agent, config.server_id, config.user_id, yaml).await
+            {
+                emit(
+                    "compose",
+                    "Docker Compose refused",
+                    "error",
+                    Some(reason.clone()),
+                );
+                tracing::warn!("Git deploy {deploy_name}: compose refused: {reason}");
+                record_failed_history(
+                    &db,
+                    git_deploy_id,
+                    &commit_hash,
+                    commit_message.as_deref().unwrap_or(""),
+                    &reason,
+                    &triggered,
+                )
+                .await;
+                if let Err(db_err) = sqlx::query(
+                    "UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1",
+                )
+                .bind(git_deploy_id)
+                .execute(&db)
+                .await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                logs.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&deploy_id);
+                return;
+            }
+
             match agent.post_long("/apps/compose/deploy", Some(serde_json::json!({
                 "yaml": yaml,
                 "stack_id": config.id.to_string(),
-            })), 660).await {
-                Ok(_) => {
+            })), 660).await
+                .map_err(|e| format!("{e}"))
+                .and_then(compose_outcome)
+            {
+                Ok(()) => {
                     emit("compose", "Docker Compose deployed", "done", None);
                     emit("complete", "Deploy complete (Compose)", "done", None);
 
@@ -1612,7 +2600,7 @@ fn spawn_deploy_task(
                     }
 
                     tracing::info!("Git deploy (compose) success: {deploy_name} ({commit_hash})");
-                    crate::services::activity::log_activity(&db, user_id, &email, "git_deploy.compose", Some("git_deploy"), Some(&deploy_name), Some(&commit_hash), Some("success")).await;
+                    crate::services::activity::log_activity(&db, user_id, &email, "git_deploy.compose", Some("git_deploy"), Some(&deploy_name), Some(&commit_hash), Some("success"), None).await;
                 }
                 Err(e) => {
                     emit("compose", "Docker Compose deploy failed", "error", Some(format!("{e}")));
@@ -1637,16 +2625,57 @@ fn spawn_deploy_task(
             return; // Skip single-container deployment path
         }
 
-        // Try Nixpacks first, then fall back to auto-detect
+        // A pre-build command skips Nixpacks entirely and goes straight to
+        // auto-detect, so the command always gets spliced into the Dockerfile
+        // DockPanel controls — never silently discarded on a Nixpacks-success
+        // path the way the old host-exec pre-build-hook was (it used to fire
+        // unconditionally after this block, with no check on whether
+        // Nixpacks had already built the image and made its filesystem
+        // mutation moot).
+        let pre_build_cmd = config.pre_build_cmd.as_deref().filter(|c| !c.trim().is_empty());
+
+        if pre_build_cmd.is_some() {
+            if let Err(e) = require_agent_at_least(
+                &agent,
+                PRE_BUILD_SPLICE_MIN_AGENT,
+                "Pre-build commands (now built into the Docker image, not run on the host)",
+            )
+            .await
+            {
+                let msg = api_error_message(e);
+                emit("detect", "Detecting build method", "error", Some(msg.clone()));
+                emit("complete", "Deploy failed", "error", None);
+                record_failed_history(&db, git_deploy_id, &commit_hash, commit_message.as_deref().unwrap_or(""), &msg, &triggered).await;
+                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                    .bind(git_deploy_id)
+                    .execute(&db)
+                    .await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                tracing::error!("Git deploy refused: {deploy_name}: {msg}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&deploy_id);
+                return;
+            }
+        }
+
+        // Try Nixpacks first (skipped when a pre-build command is configured
+        // — see above), then fall back to auto-detect.
         let mut nixpacks_image: Option<String> = None;
         emit("detect", "Detecting build method", "in_progress", None);
-        match agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
-            "name": config.name,
-            "commit_hash": commit_hash,
-            "build_context": &config.build_context,
-            "env_vars": config.env_vars,
-        })), 660).await {
-            Ok(result) => {
+        let nixpacks_result = if pre_build_cmd.is_some() {
+            None
+        } else {
+            agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
+                "name": config.name,
+                "commit_hash": commit_hash,
+                "build_context": &config.build_context,
+                "env_vars": config.env_vars,
+            })), 660).await.ok()
+        };
+        match nixpacks_result {
+            Some(result) => {
                 nixpacks_image = result.get("image_tag").and_then(|v| v.as_str()).map(|s| s.to_string());
                 emit("detect", "Built with Nixpacks", "done", None);
                 if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'nixpacks', updated_at = NOW() WHERE id = $1")
@@ -1655,10 +2684,12 @@ fn spawn_deploy_task(
                     tracing::warn!("Failed to update git deploy build method: {db_err}");
                 }
             }
-            Err(_) => {
-                // Nixpacks failed or not available — fall back to auto-detect
+            None => {
+                // Nixpacks failed/unavailable, or was skipped for a pre-build
+                // command — either way, fall through to auto-detect.
                 match agent.post("/git/auto-detect", Some(serde_json::json!({
                     "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
+                    "pre_build_cmd": pre_build_cmd,
                 }))).await {
                     Ok(result) => {
                         let auto = result.get("auto_generated").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1675,6 +2706,15 @@ fn spawn_deploy_task(
                                 .bind(git_deploy_id).execute(&db).await
                             {
                                 tracing::warn!("Failed to update git deploy build method: {db_err}");
+                            }
+                        }
+                        if pre_build_cmd.is_some() {
+                            let applied = result.get("pre_build_applied").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let note = result.get("pre_build_note").and_then(|v| v.as_str());
+                            if applied {
+                                emit("pre_build", "Pre-build command folded into Docker build", "done", None);
+                            } else {
+                                emit("pre_build", "Pre-build command not applied", "error", note.map(String::from));
                             }
                         }
                     }
@@ -1697,27 +2737,6 @@ fn spawn_deploy_task(
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&deploy_id);
                         return;
-                    }
-                }
-            }
-        }
-
-        // Pre-build hook (runs in git dir on host, before docker build)
-        if let Some(ref cmd) = config.pre_build_cmd {
-            if !cmd.trim().is_empty() {
-                emit("pre_build", "Running pre-build hook", "in_progress", None);
-                match agent.post_long("/git/pre-build-hook", Some(serde_json::json!({ "name": config.name, "command": cmd })), 330).await {
-                    Ok(result) => {
-                        let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if success {
-                            emit("pre_build", "Running pre-build hook", "done", None);
-                        } else {
-                            let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-                            emit("pre_build", "Pre-build hook failed", "error", Some(output.to_string()));
-                        }
-                    }
-                    Err(e) => {
-                        emit("pre_build", "Pre-build hook failed", "error", Some(format!("{e}")));
                     }
                 }
             }
@@ -1784,6 +2803,37 @@ fn spawn_deploy_task(
         // Step 3: Deploy
         emit("deploy", "Deploying container", "in_progress", None);
 
+        // An agent too old to honour `tls_mode`/`tls_certificate` silently
+        // drops both and falls back to inferring the mode from `ssl_email`
+        // presence — which `deploy_tls_email` withholds outright in
+        // `provided` mode, so an old agent would deploy this domain over
+        // plain HTTP with no warning. Refused here, before the deploy call.
+        if effective_mode == "provided" {
+            if let Err(e) = require_agent_at_least(
+                &agent,
+                PROVIDED_TLS_MIN_AGENT,
+                "Serving a registered certificate",
+            )
+            .await
+            {
+                let msg = api_error_message(e);
+                emit("deploy", "Deploying container", "error", Some(msg.clone()));
+                emit("complete", "Deploy failed", "error", None);
+                record_failed_history(&db, git_deploy_id, &commit_hash, commit_message.as_deref().unwrap_or(""), &msg, &triggered).await;
+                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                    .bind(git_deploy_id)
+                    .execute(&db)
+                    .await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                tracing::error!("Git deploy refused: {deploy_name}: {msg}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&deploy_id);
+                return;
+            }
+        }
+
         let deploy_body = build_deploy_body(DeployBody {
             name: &config.name,
             image_tag: &image_tag,
@@ -1793,8 +2843,11 @@ fn spawn_deploy_task(
             domain: config.domain.as_deref(),
             memory_mb: config.memory_mb,
             cpu_percent: config.cpu_percent,
-            ssl_email: config.ssl_email.as_deref(),
+            ssl_email: deploy_tls_email(effective_mode, config.ssl_email.as_deref()),
+            tls_mode: Some(effective_mode),
+            tls_certificate: config.tls_certificate.as_deref(),
             scope: "deploy",
+            volumes: &volumes_vec(&config.volumes),
         });
 
         match agent.post_long("/git/deploy", Some(deploy_body), 120).await {
@@ -1809,6 +2862,35 @@ fn spawn_deploy_task(
 
                 let container_id = result.get("container_id").and_then(|v| v.as_str()).unwrap_or("");
                 let duration_ms = started.elapsed().as_millis() as i32;
+
+                // A refused registered certificate is not a failed deploy — the
+                // container is running — but it IS the outage this feature
+                // exists to prevent if nobody notices: the domain would be
+                // live over plain HTTP instead of the certificate the
+                // operator asked for. Surfaced as its own warning; every
+                // https-vs-http decision below this point resolves through
+                // `deploy_url`, fed the SCHEME THE AGENT ACTUALLY SERVED
+                // (`result["ssl"]`) rather than the mode that was merely
+                // requested, so a refusal never reads as a spurious
+                // health-check 5xx or a broken GitHub deploy link — still
+                // ONE function deciding every URL in this file, never a
+                // second hardcoded `https://`.
+                let actual_mode = if result.get("tls_refused").and_then(|v| v.as_bool()) == Some(true) {
+                    let reason = result.get("proxy_warning").and_then(|v| v.as_str())
+                        .unwrap_or("the agent did not report an HTTPS vhost for the domain");
+                    tracing::warn!("Git deploy {deploy_name}: registered certificate not applied: {reason}");
+                    notifications::notify_panel(&db, Some(user_id),
+                        &format!("Deploy warning: {} certificate not applied", deploy_name),
+                        reason,
+                        "warning", "deploy", Some("/git-deploys")).await;
+                    "none"
+                } else {
+                    match result.get("ssl").and_then(|v| v.as_bool()) {
+                        Some(true) => effective_mode,
+                        Some(false) => "none",
+                        None => effective_mode,
+                    }
+                };
 
                 // Record success history
                 if let Err(db_err) = sqlx::query(
@@ -1845,7 +2927,7 @@ fn spawn_deploy_task(
                 tracing::info!("Git deploy success: {deploy_name} ({commit_hash})");
                 activity::log_activity(
                     &db, user_id, &email, "git_deploy.deploy",
-                    Some("git_deploy"), Some(&deploy_name), Some(&commit_hash), Some("success"),
+                    Some("git_deploy"), Some(&deploy_name), Some(&commit_hash), Some("success"), None,
                 ).await;
 
                 // Panel notification
@@ -1903,7 +2985,7 @@ fn spawn_deploy_task(
                         let target = config
                             .domain
                             .as_deref()
-                            .map(|d| deploy_url(d, config.ssl_email.as_deref()));
+                            .map(|d| deploy_url(d, actual_mode));
                         tokio::spawn(async move {
                             set_github_status(&token, &repo_url, &sha, "success", target).await;
                         });
@@ -1913,7 +2995,7 @@ fn spawn_deploy_task(
                 // Post-deploy health check: verify site is responding
                 if let Some(ref domain) = config.domain {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let check_url = deploy_url(domain, config.ssl_email.as_deref());
+                    let check_url = deploy_url(domain, actual_mode);
                     if let Ok(client) = reqwest::Client::builder()
                         .danger_accept_invalid_certs(true)
                         .timeout(std::time::Duration::from_secs(10))
@@ -1966,6 +3048,10 @@ fn spawn_deploy_task(
                     let monitor_config_memory = config.memory_mb;
                     let monitor_config_cpu = config.cpu_percent;
                     let monitor_config_ssl_email = config.ssl_email.clone();
+                    // `&'static str`, so a plain copy — no clone needed.
+                    let monitor_effective_mode = effective_mode;
+                    let monitor_config_tls_certificate = config.tls_certificate.clone();
+                    let monitor_config_volumes = volumes_vec(&config.volumes);
 
                     tokio::spawn(async move {
                         // Check container health every 15s for 2 minutes
@@ -2005,8 +3091,11 @@ fn spawn_deploy_task(
                                             domain: monitor_config_domain.as_deref(),
                                             memory_mb: monitor_config_memory,
                                             cpu_percent: monitor_config_cpu,
-                                            ssl_email: monitor_config_ssl_email.as_deref(),
+                                            ssl_email: deploy_tls_email(monitor_effective_mode, monitor_config_ssl_email.as_deref()),
+                                            tls_mode: Some(monitor_effective_mode),
+                                            tls_certificate: monitor_config_tls_certificate.as_deref(),
                                             scope: "deploy",
+                                            volumes: &monitor_config_volumes,
                                         });
 
                                         if monitor_agent.post_long("/git/deploy", Some(rollback_body), 120).await.is_ok() {
@@ -2049,7 +3138,7 @@ fn spawn_deploy_task(
 
                                             activity::log_activity(
                                                 &monitor_db, monitor_user, &monitor_email_str, "git_deploy.auto_rollback",
-                                                Some("git_deploy"), Some(&monitor_name), Some(&prev_commit), None,
+                                                Some("git_deploy"), Some(&monitor_name), Some(&prev_commit), None, None,
                                             ).await;
 
                                             // Panel notification
@@ -2100,7 +3189,7 @@ fn spawn_deploy_task(
                 tracing::error!("Git deploy failed: {deploy_name}: {e}");
                 activity::log_activity(
                     &db, user_id, &email, "git_deploy.deploy",
-                    Some("git_deploy"), Some(&deploy_name), Some(&commit_hash), Some("failed"),
+                    Some("git_deploy"), Some(&deploy_name), Some(&commit_hash), Some("failed"), None,
                 ).await;
 
                 // Panel notification
@@ -2115,7 +3204,7 @@ fn spawn_deploy_task(
                         let target = config
                             .domain
                             .as_deref()
-                            .map(|d| deploy_url(d, config.ssl_email.as_deref()));
+                            .map(|d| deploy_url(d, effective_mode));
                         tokio::spawn(async move {
                             set_github_status(&token, &repo_url, &sha, "failure", target).await;
                         });
@@ -2154,25 +3243,219 @@ fn spawn_deploy_task(
 }
 
 /// Mask github_token in API responses — show "●●●●●●●●" if set.
+/// Everything a Compose document must satisfy before a git deploy hands it to
+/// an agent, in one place because there are two callers and they had neither.
+///
+/// A repository's own `docker-compose.yml` reaches `/apps/compose/deploy` on
+/// this path, so it is a deploy door like any other: it names registry images
+/// an operator's CVE threshold applies to, and images their container policy
+/// may restrict. It also skipped `validate_compose_yaml`, which the three
+/// front-door compose paths run — not an escape, because the agent refuses any
+/// bind outside `/var/lib/dockpanel/compose/` and blocks the Docker socket by
+/// name, but it meant the same document was judged by different rules
+/// depending on which door it arrived through.
+///
+/// Returns the sentence to report when the deploy must not proceed. Callers are
+/// background tasks with no `?` to propagate through, which is why this hands
+/// back a message rather than an `ApiError`.
+/// Read the agent's per-service compose report and answer the only question the
+/// caller actually asked: did this deploy happen?
+///
+/// `deploy_compose` reports each service's outcome INSIDE a 200 and never
+/// returns an `Err` for a service that failed to start, so both callers here
+/// used to take the HTTP status as the answer and write `status = 'running'`
+/// over a deploy in which nothing came up. That is not a rare shape: the compose
+/// engine has no teardown, so the SECOND compose deploy of the same deployment
+/// collides with its own container names and every service fails — while the row
+/// said the new commit was running. `stacks::deployed_service_states` is the
+/// reader written for exactly this, and it is shared rather than copied so the
+/// two paths cannot drift apart again.
+///
+/// ⚠ `total == 0` is deliberately NOT a failure. An agent that reports no
+/// services at all is indistinguishable from one too old to report them, and an
+/// empty observation is the one reading that cannot tell "nothing came up" from
+/// "I cannot see". Only `total > 0 && running == 0` is a fact.
+fn compose_outcome(deploy_result: serde_json::Value) -> Result<(), String> {
+    let (running, total, errors) = crate::routes::stacks::deployed_service_states(&deploy_result);
+    if total > 0 && running == 0 {
+        let detail = if errors.is_empty() {
+            "the agent reported no reason".to_string()
+        } else {
+            errors.join(" | ")
+        };
+        return Err(format!(
+            "no service in the compose file stayed running — {detail}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a compose file whose services name no image, rather than deploying
+/// the rest of it and calling that a success.
+///
+/// A repository that has a Dockerfile is exactly the one whose compose file
+/// builds from source, and the compose engine drops every service it cannot
+/// resolve to a registry image. The deploy then comes up without the
+/// application — the one service the author cared about — while the row says
+/// `running`. Naming them is better than dropping them, and the alternative
+/// offered is better than the thing refused: without a compose file this
+/// deployment builds the Dockerfile and also gets the domain, the certificate,
+/// zero-downtime swaps, preview environments and rollback.
+///
+/// ⚠ Kept OUT of `compose_deploy_refusal`'s body on purpose. The gate census in
+/// `deploy-gate-coverage-pin-e2e.sh` attributes a `preflight_gate_image` call to
+/// the nearest `fn` declared within the 40 lines above it, so prose added inside
+/// that span pushes the declaration out of the window and the door reads as
+/// ungated. Writing this arm inline cost exactly that — the census dropped from
+/// 7 gated doors to 6 and named `trigger_deploy_task`, a door that does reach
+/// the gate. Add explanation here, not there.
+fn dropped_service_refusal(yaml: &str) -> Option<String> {
+    let dropped = crate::routes::compose_services_without_image(yaml);
+    if dropped.is_empty() {
+        return None;
+    }
+    let (it, them) = if dropped.len() == 1 {
+        ("it", "it")
+    } else {
+        ("they", "them")
+    };
+    Some(format!(
+        "this repository's compose file gives no image for {}, and DockPanel's Compose support \
+         runs registry images rather than building them — {it} would be skipped and the deploy \
+         would come up without {them}. Either name an already-built image for each of them, or \
+         remove the compose file: without it this deployment builds your Dockerfile and also \
+         gets the domain, the certificate, zero-downtime swaps, preview environments and \
+         rollback.",
+        dropped.join(", "),
+    ))
+}
+
+async fn compose_deploy_refusal(
+    db: &sqlx::PgPool,
+    agent: &crate::services::agent::AgentHandle,
+    server_id: Uuid,
+    user_id: Uuid,
+    yaml: &str,
+) -> Option<String> {
+    fn sentence(e: crate::error::ApiError) -> String {
+        e.1.0
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("refused")
+            .to_string()
+    }
+
+    if let Err(e) = crate::routes::validate_compose_yaml(yaml) {
+        return Some(e.to_string());
+    }
+
+    if let Some(reason) = dropped_service_refusal(yaml) {
+        return Some(reason);
+    }
+
+    let images = crate::routes::compose_images(yaml);
+    if let Err(e) = crate::routes::docker_apps::enforce_allowed_images(db, user_id, &images).await {
+        return Some(sentence(e));
+    }
+    for image in &images {
+        if let Err(e) =
+            crate::routes::image_scans::preflight_gate_image(db, server_id, agent, image).await
+        {
+            return Some(sentence(e));
+        }
+    }
+    None
+}
+
+/// The eight filled circles `mask_github_token` substitutes for a stored token.
+/// Named once so the mask and the guard against re-storing it cannot drift apart.
+const GITHUB_TOKEN_MASK: &str = "\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}";
+
+/// Encrypt a submitted GitHub token for storage.
+///
+/// `None` is passed through so `update`'s `COALESCE` keeps whatever is stored —
+/// that is how the SPA leaves an unchanged token alone. The mask sentinel is
+/// ALSO mapped to `None`: every handler now returns the masked row, so a client
+/// that submits the form it was served sends the mask back, and storing it would
+/// replace a working token with eight circles. Encrypting it would be worse
+/// still — the value would look like a legitimate credential to every later
+/// read. v2.48.3 shipped this class of bug once (an Edit button that re-encrypted
+/// an already-encrypted destination password); it is closed here by construction
+/// rather than by the caller remembering.
+/// Replace any credentials embedded in a repository URL's authority with a
+/// placeholder, leaving the rest of the URL readable.
+///
+/// The agent's `is_valid_repo_url` accepts `https://TOKEN@github.com/me/app.git`
+/// and nothing strips it, so a token pasted into the Repository field is stored
+/// verbatim. This does not un-store it — it stops the panel handing it to a
+/// reader who is not its owner. Used on the deploy-approval list, whose reader
+/// is an administrator of the machine rather than the deploy's operator.
+pub fn mask_repo_credentials(url: &str) -> String {
+    // Split on the authority, not on the first '@': a path may contain one.
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}://•••{}{}", &authority[at..], tail),
+        None => url.to_string(),
+    }
+}
+
+/// The wire spells "not set" as an empty string; this table spells it NULL.
+/// Translating at the writer is what keeps `Some("")` out of storage, and with it
+/// out of every `if let Some(..)` and `unwrap_or` that reads these columns.
+fn blank_to_none(v: Option<&str>) -> Option<&str> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
+/// The human sentence out of an [`ApiError`], for use inside a fire-and-forget
+/// spawned deploy task — those return `()` and cannot propagate `?`, so
+/// `require_agent_at_least`'s `Result<(), ApiError>` has to be unpacked by hand.
+fn api_error_message(e: ApiError) -> String {
+    e.1
+        .0
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("request refused")
+        .to_string()
+}
+
+fn encrypt_stored_token(
+    submitted: Option<&str>,
+    jwt_secret: &str,
+) -> Result<Option<String>, ApiError> {
+    match submitted {
+        None => Ok(None),
+        Some(t) if t.is_empty() || t == GITHUB_TOKEN_MASK => Ok(None),
+        Some(t) => Ok(Some(
+            crate::services::secrets_crypto::encrypt_credential(t, jwt_secret)
+                .map_err(|e| internal_error("encrypt github token", e))?,
+        )),
+    }
+}
+
 fn mask_github_token(deploy: &mut GitDeploy) {
     if let Some(ref t) = deploy.github_token {
         if !t.is_empty() {
-            deploy.github_token = Some("\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}\u{25CF}".to_string());
+            deploy.github_token = Some(GITHUB_TOKEN_MASK.to_string());
         }
     }
 }
 
 /// The URL a git deploy's domain is actually reachable on.
 ///
-/// A deploy only gets a certificate when an SSL email is configured — that is
-/// the same condition `deploy_body` uses to ask the agent for one — so it is
-/// also the condition that decides the scheme. This used to be assumed to be
-/// https everywhere, under a comment reading "Git deploys with domain typically
-/// have SSL"; on a deploy without one, the post-deploy health check then
-/// connected to a port serving no TLS and reported a perfectly good deploy as
-/// unreachable.
-fn deploy_url(domain: &str, ssl_email: Option<&str>) -> String {
-    let scheme = if ssl_email.is_some() { "https" } else { "http" };
+/// Takes the EFFECTIVE mode (`stacks::effective_tls_mode`), not raw
+/// `ssl_email` — `provided` mode withholds `ssl_email` from the agent
+/// entirely (see `deploy_tls_email`), so a scheme decision still keyed on its
+/// presence would report a `provided`-mode deploy as plain HTTP. This used to
+/// be assumed to be https everywhere, under a comment reading "Git deploys
+/// with domain typically have SSL"; on a deploy without one, the post-deploy
+/// health check then connected to a port serving no TLS and reported a
+/// perfectly good deploy as unreachable.
+fn deploy_url(domain: &str, tls_mode: &str) -> String {
+    let scheme = if tls_mode == "acme" || tls_mode == "provided" { "https" } else { "http" };
     format!("{scheme}://{domain}")
 }
 
@@ -2182,6 +3465,16 @@ fn deploy_url(domain: &str, ssl_email: Option<&str>) -> String {
 /// through `deploy_url` and none can reintroduce a hardcoded scheme in the link
 /// third parties see on the commit.
 async fn set_github_status(token: &str, repo_url: &str, sha: &str, state: &str, target_url: Option<String>) {
+    // `git_deploys.github_token` is encrypted at rest by `create` and `update`.
+    // Every one of the seven read sites in this module funnels here — either
+    // directly or through a spawned task that clones the value first — and the
+    // token never leaves the backend (the agent tree has zero references to it),
+    // so this is the single place that has to open it, the same shape as
+    // `helpers::cf_headers` and `cdn::bunny_headers`. The legacy fallback
+    // returns a pre-encryption plaintext token unchanged, so existing rows keep
+    // reporting commit status without a migration.
+    let token = crate::services::secrets_crypto::decrypt_credential_from_env(token);
+    let token = token.as_str();
     let (owner, repo) = match parse_github_repo(repo_url) {
         Some(r) => r,
         None => return, // Not a GitHub URL
@@ -2255,11 +3548,12 @@ pub async fn trigger_deploy_task(
     // Fetch config FIRST — before acquiring the lock — so a config-fetch error
     // (or a row deleted between the scheduler's list and now) returns WITHOUT
     // having flipped status to 'building' and stranding it for the self-heal window.
-    let config: GitDeploy = match sqlx::query_as("SELECT * FROM git_deploys WHERE id = $1")
+    let config: GitDeploy = match sqlx::query_as(&format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1"))
         .bind(git_deploy_id).fetch_optional(&db).await {
         Ok(Some(c)) => c,
         _ => return,
     };
+    let effective_mode = effective_tls_mode(config.tls_mode.as_deref(), config.ssl_email.as_deref());
 
     // Resolve the agent for the server this deployment LIVES ON, not for
     // whichever box happens to be running the panel.
@@ -2322,7 +3616,7 @@ pub async fn trigger_deploy_task(
     if let Some(ref gh_token) = config.github_token {
         if !gh_token.is_empty() {
             set_github_status(gh_token, &config.repo_url, "HEAD", "pending",
-                config.domain.as_deref().map(|d| deploy_url(d, config.ssl_email.as_deref()))).await;
+                config.domain.as_deref().map(|d| deploy_url(d, effective_mode))).await;
         }
     }
 
@@ -2369,10 +3663,37 @@ pub async fn trigger_deploy_task(
         let is_compose = compose_result.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
         if is_compose {
             let yaml = compose_result.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(reason) =
+                compose_deploy_refusal(&db, &agent, config.server_id, config.user_id, yaml).await
+            {
+                tracing::warn!("Git deploy {git_deploy_id}: compose refused: {reason}");
+                record_failed_history(
+                    &db,
+                    git_deploy_id,
+                    &commit_hash,
+                    &commit_message,
+                    &reason,
+                    &triggered_by,
+                )
+                .await;
+                if let Err(db_err) = sqlx::query(
+                    "UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1",
+                )
+                .bind(git_deploy_id)
+                .execute(&db)
+                .await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                return;
+            }
             match agent.post_long("/apps/compose/deploy", Some(serde_json::json!({
                 "yaml": yaml, "stack_id": config.id.to_string(),
-            })), 660).await {
-                Ok(_) => {
+            })), 660).await
+                .map_err(|e| format!("{e}"))
+                .and_then(compose_outcome)
+            {
+                Ok(()) => {
                     let duration_ms = started.elapsed().as_millis() as i32;
                     if let Err(db_err) = sqlx::query("INSERT INTO git_deploy_history (git_deploy_id, commit_hash, commit_message, image_tag, status, output, triggered_by, duration_ms) VALUES ($1, $2, $3, 'compose', 'success', 'Deployed via Docker Compose', $4, $5)")
                         .bind(git_deploy_id).bind(&commit_hash).bind(&commit_message).bind(&triggered_by).bind(duration_ms)
@@ -2386,7 +3707,7 @@ pub async fn trigger_deploy_task(
                         tracing::warn!("Failed to update git deploy status: {db_err}");
                     }
                     tracing::info!("Deploy success (compose/{}): {} ({commit_hash})", triggered_by, config.name);
-                    crate::services::activity::log_activity(&db, user_id, &email, "git_deploy.compose", Some("git_deploy"), Some(&config.name), Some(&commit_hash), Some(&triggered_by)).await;
+                    crate::services::activity::log_activity(&db, user_id, &email, "git_deploy.compose", Some("git_deploy"), Some(&config.name), Some(&commit_hash), Some(&triggered_by), None).await;
                 }
                 Err(e) => {
                     tracing::error!("Compose deploy failed ({}): {}: {e}", triggered_by, config.name);
@@ -2402,14 +3723,43 @@ pub async fn trigger_deploy_task(
         }
     }
 
-    // Try Nixpacks first, then fall back to auto-detect + docker build
+    // A pre-build command skips Nixpacks entirely and goes straight to
+    // auto-detect, so the command always gets spliced into the Dockerfile
+    // DockPanel controls — mirrors spawn_deploy_task's twin block.
+    let pre_build_cmd = config.pre_build_cmd.as_deref().filter(|c| !c.trim().is_empty());
+
+    if pre_build_cmd.is_some() {
+        if let Err(e) = require_agent_at_least(
+            &agent,
+            PRE_BUILD_SPLICE_MIN_AGENT,
+            "Pre-build commands (now built into the Docker image, not run on the host)",
+        ).await {
+            let msg = api_error_message(e);
+            record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &msg, &triggered_by).await;
+            if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                .bind(git_deploy_id).execute(&db).await
+            {
+                tracing::warn!("Failed to update git deploy status: {db_err}");
+            }
+            tracing::error!("Scheduled deploy refused ({}): {}: {msg}", triggered_by, config.name);
+            return;
+        }
+    }
+
+    // Try Nixpacks first (skipped when a pre-build command is configured —
+    // see above), then fall back to auto-detect + docker build.
     let mut nixpacks_image: Option<String> = None;
-    if let Ok(result) = agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
-        "name": config.name,
-        "commit_hash": commit_hash,
-        "build_context": &config.build_context,
-        "env_vars": config.env_vars,
-    })), 660).await {
+    let nixpacks_result = if pre_build_cmd.is_some() {
+        None
+    } else {
+        agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
+            "name": config.name,
+            "commit_hash": commit_hash,
+            "build_context": &config.build_context,
+            "env_vars": config.env_vars,
+        })), 660).await.ok()
+    };
+    if let Some(result) = nixpacks_result {
         nixpacks_image = result.get("image_tag").and_then(|v| v.as_str()).map(|s| s.to_string());
         tracing::info!("Nixpacks build succeeded for {}", config.name);
         if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'nixpacks', updated_at = NOW() WHERE id = $1")
@@ -2418,20 +3768,34 @@ pub async fn trigger_deploy_task(
             tracing::warn!("Failed to update git deploy build method: {db_err}");
         }
     } else {
-        // Nixpacks unavailable — try auto-detect
-        if let Err(e) = agent.post("/git/auto-detect", Some(serde_json::json!({
+        // Nixpacks unavailable, or skipped for a pre-build command — try auto-detect.
+        let auto_detect_result = agent.post("/git/auto-detect", Some(serde_json::json!({
             "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
-        }))).await {
-            tracing::error!("Auto-detect failed ({}): {}: {e}", triggered_by, config.name);
-            record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Auto-detect failed: {e}"), &triggered_by).await;
-            if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
-                .bind(git_deploy_id).execute(&db).await
-            {
-                tracing::warn!("Failed to update git deploy status: {db_err}");
+            "pre_build_cmd": pre_build_cmd,
+        }))).await;
+        let result = match auto_detect_result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Auto-detect failed ({}): {}: {e}", triggered_by, config.name);
+                record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Auto-detect failed: {e}"), &triggered_by).await;
+                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                    .bind(git_deploy_id).execute(&db).await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                return;
             }
-            return;
+        };
+        if pre_build_cmd.is_some() {
+            let applied = result.get("pre_build_applied").and_then(|v| v.as_bool()).unwrap_or(false);
+            let note = result.get("pre_build_note").and_then(|v| v.as_str()).unwrap_or("");
+            if applied {
+                tracing::info!("Pre-build command folded into Docker build for {}", config.name);
+            } else {
+                tracing::warn!("Pre-build command not applied for {}: {note}", config.name);
+            }
         }
-        // Refresh the lock's self-heal clock before the (up to ~16 min) pre-build+build:
+        // Refresh the lock's self-heal clock before the (up to 900s) install+build:
         // this fallthrough path has no updated_at bump since lock acquisition, so a
         // legitimately long Dockerfile build could otherwise cross the 30-min window and
         // let a concurrent trigger self-release the lock (mirrors spawn_deploy_task 1466/1473).
@@ -2439,15 +3803,6 @@ pub async fn trigger_deploy_task(
             .bind(git_deploy_id).execute(&db).await
         {
             tracing::warn!("Failed to update git deploy build method: {db_err}");
-        }
-    }
-
-    // Pre-build hook
-    if let Some(ref cmd) = config.pre_build_cmd {
-        if !cmd.trim().is_empty() {
-            let _ = agent.post_long("/git/pre-build-hook", Some(serde_json::json!({
-                "name": config.name, "command": cmd,
-            })), 330).await;
         }
     }
 
@@ -2471,13 +3826,32 @@ pub async fn trigger_deploy_task(
                 if let Some(ref gh_token) = config.github_token {
                     if !gh_token.is_empty() && commit_hash != "unknown" {
                         set_github_status(gh_token, &config.repo_url, &commit_hash, "failure",
-                            config.domain.as_deref().map(|d| deploy_url(d, config.ssl_email.as_deref()))).await;
+                            config.domain.as_deref().map(|d| deploy_url(d, effective_mode))).await;
                     }
                 }
                 return;
             }
         }
     };
+
+    // An agent too old to honour `tls_mode`/`tls_certificate` silently drops
+    // both and falls back to inferring the mode from `ssl_email` presence —
+    // which `deploy_tls_email` withholds outright in `provided` mode, so an
+    // old agent would deploy this domain over plain HTTP with no warning.
+    // Refused here, before the deploy call.
+    if effective_mode == "provided" {
+        if let Err(e) = require_agent_at_least(&agent, PROVIDED_TLS_MIN_AGENT, "Serving a registered certificate").await {
+            let msg = api_error_message(e);
+            record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &msg, &triggered_by).await;
+            if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                .bind(git_deploy_id).execute(&db).await
+            {
+                tracing::warn!("Failed to update git deploy status: {db_err}");
+            }
+            tracing::error!("Scheduled deploy refused ({}): {}: {msg}", triggered_by, config.name);
+            return;
+        }
+    }
 
     // Deploy
     let deploy_body = build_deploy_body(DeployBody {
@@ -2489,14 +3863,39 @@ pub async fn trigger_deploy_task(
         domain: config.domain.as_deref(),
         memory_mb: config.memory_mb,
         cpu_percent: config.cpu_percent,
-        ssl_email: config.ssl_email.as_deref(),
+        ssl_email: deploy_tls_email(effective_mode, config.ssl_email.as_deref()),
+        tls_mode: Some(effective_mode),
+        tls_certificate: config.tls_certificate.as_deref(),
         scope: "deploy",
+        volumes: &volumes_vec(&config.volumes),
     });
 
     match agent.post_long("/git/deploy", Some(deploy_body), 120).await {
         Ok(result) => {
             let container_id = result.get("container_id").and_then(|v| v.as_str()).unwrap_or("");
             let duration_ms = started.elapsed().as_millis() as i32;
+
+            // Same reasoning as `spawn_deploy_task`: prefer what the agent
+            // actually served over what was merely requested, and surface a
+            // refused registered certificate as its own warning. Still
+            // resolves through `deploy_url` below, never a second
+            // hardcoded `https://`.
+            let actual_mode = if result.get("tls_refused").and_then(|v| v.as_bool()) == Some(true) {
+                let reason = result.get("proxy_warning").and_then(|v| v.as_str())
+                    .unwrap_or("the agent did not report an HTTPS vhost for the domain");
+                tracing::warn!("Scheduled deploy {}: registered certificate not applied: {reason}", config.name);
+                notifications::notify_panel(&db, Some(user_id),
+                    &format!("Deploy warning: {} certificate not applied", config.name),
+                    reason,
+                    "warning", "deploy", Some("/git-deploys")).await;
+                "none"
+            } else {
+                match result.get("ssl").and_then(|v| v.as_bool()) {
+                    Some(true) => effective_mode,
+                    Some(false) => "none",
+                    None => effective_mode,
+                }
+            };
 
             if let Err(db_err) = sqlx::query(
                 "INSERT INTO git_deploy_history (git_deploy_id, commit_hash, commit_message, image_tag, status, triggered_by, duration_ms) VALUES ($1, $2, $3, $4, 'success', $5, $6)"
@@ -2523,7 +3922,7 @@ pub async fn trigger_deploy_task(
             if let Some(ref gh_token) = config.github_token {
                 if !gh_token.is_empty() && commit_hash != "unknown" {
                     set_github_status(gh_token, &config.repo_url, &commit_hash, "success",
-                            config.domain.as_deref().map(|d| deploy_url(d, config.ssl_email.as_deref()))).await;
+                            config.domain.as_deref().map(|d| deploy_url(d, actual_mode))).await;
                 }
             }
 
@@ -2535,12 +3934,12 @@ pub async fn trigger_deploy_task(
             }
 
             tracing::info!("Deploy success ({}): {} ({commit_hash})", triggered_by, config.name);
-            crate::services::activity::log_activity(&db, user_id, &email, "git_deploy.deploy", Some("git_deploy"), Some(&config.name), Some(&commit_hash), Some(&triggered_by)).await;
+            crate::services::activity::log_activity(&db, user_id, &email, "git_deploy.deploy", Some("git_deploy"), Some(&config.name), Some(&commit_hash), Some(&triggered_by), None).await;
 
             // Post-deploy health check: verify site is responding
             if let Some(ref domain) = config.domain {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                let check_url = deploy_url(domain, config.ssl_email.as_deref());
+                let check_url = deploy_url(domain, actual_mode);
                 if let Ok(client) = reqwest::Client::builder()
                     .danger_accept_invalid_certs(true)
                     .timeout(std::time::Duration::from_secs(10))
@@ -2580,7 +3979,7 @@ pub async fn trigger_deploy_task(
             if let Some(ref gh_token) = config.github_token {
                 if !gh_token.is_empty() && commit_hash != "unknown" {
                     set_github_status(gh_token, &config.repo_url, &commit_hash, "failure",
-                            config.domain.as_deref().map(|d| deploy_url(d, config.ssl_email.as_deref()))).await;
+                            config.domain.as_deref().map(|d| deploy_url(d, effective_mode))).await;
                 }
             }
 
@@ -2598,9 +3997,34 @@ async fn record_failed_history(db: &sqlx::PgPool, git_deploy_id: Uuid, commit_ha
 }
 
 /// Handle preview deployment for non-configured branches.
-async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &GitDeploy, branch: &str, _payload: &serde_json::Value) {
+///
+/// Returns the reason the push was NOT taken up, when it was not. Four things
+/// abandon a preview BEFORE the build task is spawned, and the webhook answered
+/// `Preview deploy triggered` for all of them — a claim about work that never
+/// started, delivered to the one place a pusher would look for it. Past the spawn
+/// the answer is honest: a clone or build failure after that point is recorded on
+/// the row as `status = 'failed'` and shown in the previews list.
+///
+/// The fourth was added last and is the reason that last sentence is true at all.
+/// A failed `git_previews` upsert used to be logged and stepped over, and every
+/// status write below is `WHERE git_deploy_id = $1 AND branch = $2` — so with no
+/// row they all match zero rows and return `Ok`, and a preview that built, bound
+/// a port, took a vhost and obtained a certificate was recorded nowhere and
+/// reported as running. Nothing on the box reaps a preview that has no row.
+async fn handle_preview_deploy(
+    state: &AppState,
+    agent: &AgentHandle,
+    config: &GitDeploy,
+    branch: &str,
+    _payload: &serde_json::Value,
+) -> Result<(), String> {
     let branch_slug = dns_label(branch);
-    if branch_slug.len() > 50 { return; } // Safety limit
+    if branch_slug.len() > 50 {
+        // Safety limit
+        return Err(format!(
+            "branch name '{branch}' is too long to form a preview host name"
+        ));
+    }
 
     // Allocate preview port (scoped to this server via git_deploys)
     let used_ports: Vec<(i32,)> = sqlx::query_as(
@@ -2613,7 +4037,10 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
     let used: std::collections::HashSet<i32> = used_ports.into_iter().map(|(p,)| p).collect();
     let port = match (8000..=8999).find(|p| !used.contains(p)) {
         Some(p) => p,
-        None => { tracing::warn!("No preview ports available"); return; }
+        None => {
+            tracing::warn!("No preview ports available");
+            return Err("no preview port is free — 8000-8999 are all in use".to_string());
+        }
     };
 
     // The preview's own name space. Before v2.55.0 this was
@@ -2645,7 +4072,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 "Preview {prev_name} predates the preview name space; tearing it down before \
                  deploying {container_name}"
             );
-            agent
+            if let Err(e) = agent
                 .post(
                     "/git/cleanup",
                     Some(preview_cleanup_body(
@@ -2655,7 +4082,25 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                     )),
                 )
                 .await
-                .ok();
+            {
+                // ABANDON THIS PUSH. The comment above the query says what the
+                // upsert below costs if this teardown did not happen: it
+                // overwrites `container_name`, and from that moment the
+                // predecessor's container, port, vhost and checkout are orphaned
+                // with nothing in the database naming them. Leaving the row
+                // pointing at the container that still exists keeps it findable
+                // by the sweep, by the previews list and by Delete Preview, and
+                // the next push retries this teardown from the same state.
+                tracing::warn!(
+                    "Failed to tear down predecessor preview {prev_name}: {e}. Leaving the \
+                     git_previews row pointing at it and skipping this preview deploy — \
+                     overwriting the row here is what orphans the container."
+                );
+                return Err(format!(
+                    "the previous preview container {prev_name} could not be torn down, so \
+                     this push was not taken up — retry once the server answers"
+                ));
+            }
         }
     }
 
@@ -2678,8 +4123,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
         } else {
             crate::services::domain_claim::find_occupant(
                 &state.db,
-                agent,
-                config.server_id,
+                &state.agents,
                 candidate,
                 crate::services::domain_claim::Holder::GitDeploy(config.id),
             )
@@ -2695,16 +4139,32 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
         }
     }
 
-    // Upsert preview record
+    // Upsert preview record.
+    //
+    // This is a refusal, not a warning, and the difference is the whole reason
+    // the doc comment above can promise an honest answer. The row is the only
+    // record that the container, the port, the vhost and the certificate created
+    // below exist: every consumer reads `git_previews` (the previews list, Delete
+    // Preview, both cleanup sweeps, the parent delete) and nothing reconciles
+    // running containers against rows. Deploying past a failed write is how a
+    // preview becomes unreapable — the same state :3081 already refuses to
+    // create, for the same reason, forty lines up.
     if let Err(e) = sqlx::query(
-        "INSERT INTO git_previews (git_deploy_id, branch, container_name, host_port, domain, status) \
-         VALUES ($1, $2, $3, $4, $5, 'deploying') \
-         ON CONFLICT (git_deploy_id, branch) DO UPDATE SET status = 'deploying', container_name = $3, host_port = $4, updated_at = NOW()"
+        "INSERT INTO git_previews (git_deploy_id, server_id, branch, container_name, host_port, domain, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'deploying') \
+         ON CONFLICT (git_deploy_id, branch) DO UPDATE SET status = 'deploying', server_id = $2, container_name = $4, host_port = $5, updated_at = NOW()"
     )
-    .bind(config.id).bind(branch).bind(&container_name).bind(port).bind(&preview_domain)
+    .bind(config.id).bind(config.server_id).bind(branch).bind(&container_name).bind(port).bind(&preview_domain)
     .execute(&state.db).await
     {
-        tracing::warn!("Failed to upsert git preview record: {e}");
+        // The returned reason is echoed verbatim into the webhook's HTTP body at
+        // :1684 and from there into GitHub's delivery log, and that door has no
+        // auth extractor — so it carries no database detail. The detail goes to
+        // the operator's journal instead.
+        tracing::warn!("Failed to upsert git preview record for branch '{branch}': {e}");
+        return Err(
+            "the preview could not be recorded, so it was not deployed — retry the push".to_string(),
+        );
     }
 
     // Spawn deploy task
@@ -2720,10 +4180,33 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
     let deploy_id = config.id;
     let key_path = config.deploy_key_path.clone();
     let ssl_email = config.ssl_email.clone();
+    // A `provided`-mode certificate names the PARENT domain, almost
+    // certainly not `{branch}.{parent}` — passed through regardless and left
+    // to the agent's own `cert_covers_domain` SAN re-check (the same
+    // defence-in-depth `TlsIntent::Provided` always runs) to decide: a
+    // wildcard or a SAN naming the preview host covers it and serves HTTPS,
+    // anything narrower is refused gracefully and the preview falls back to
+    // plain HTTP — never a hard failure over a preview's own TLS story.
+    let effective_mode =
+        effective_tls_mode(config.tls_mode.as_deref(), config.ssl_email.as_deref());
+    let tls_certificate = config.tls_certificate.clone();
     let branch = branch.to_string();
+    // Same GitHub-status wiring the regular/scheduled deploy paths already use
+    // (`set_github_status`, 9 existing call sites) — a preview builds, deploys
+    // and gets a subdomain today, but nothing tells GitHub a commit or PR where
+    // to find it, so the pusher has to go look in the DockPanel UI instead of
+    // seeing a status check / link on the commit.
+    let github_token = config.github_token.clone();
+    let github_target = preview_domain.as_deref().map(|d| deploy_url(d, effective_mode));
 
     tokio::spawn(async move {
         let branch_slug = dns_label(&branch);
+
+        if let Some(ref gh_token) = github_token {
+            if !gh_token.is_empty() {
+                set_github_status(gh_token, &repo_url, "HEAD", "pending", github_target.clone()).await;
+            }
+        }
 
         // Clone at preview branch
         let mut clone_body = serde_json::json!({
@@ -2747,6 +4230,11 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 {
                     tracing::warn!("Failed to update git preview status: {db_err}");
                 }
+                if let Some(ref gh_token) = github_token {
+                    if !gh_token.is_empty() {
+                        set_github_status(gh_token, &repo_url, "HEAD", "failure", github_target.clone()).await;
+                    }
+                }
                 return;
             }
         };
@@ -2768,6 +4256,11 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 {
                     tracing::warn!("Failed to update git preview status: {db_err}");
                 }
+                if let Some(ref gh_token) = github_token {
+                    if !gh_token.is_empty() {
+                        set_github_status(gh_token, &repo_url, &commit_hash, "failure", github_target.clone()).await;
+                    }
+                }
                 return;
             }
         };
@@ -2776,6 +4269,15 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
         // parent app: preview containers have always run unbounded, and quietly
         // starting to cap them would be a behaviour change this fix did not set out
         // to make. Recorded rather than silently kept — see the s288 ledger.
+        //
+        // volumes is likewise ALWAYS empty here, and for a sharper reason than
+        // "unreviewed behaviour change": a throwaway PR container must never gain
+        // durable local storage (#118) — TTL teardown would then be destroying
+        // real data rather than a re-clonable checkout, and the point of a
+        // preview is that it IS throwaway. The agent's `deploy_container` route
+        // refuses a non-empty list for any scope but `"deploy"` as the actual
+        // boundary; this is not the only thing standing between a preview and
+        // persistent storage, but it should never even try.
         let deploy_body = build_deploy_body(DeployBody {
             name: &format!("{name}-pr-{branch_slug}"),
             image_tag: &image_tag,
@@ -2786,9 +4288,32 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
             memory_mb: None,
             cpu_percent: None,
             // Pass SSL email so preview environments get HTTPS
-            ssl_email: ssl_email.as_deref(),
+            ssl_email: deploy_tls_email(effective_mode, ssl_email.as_deref()),
+            tls_mode: Some(effective_mode),
+            tls_certificate: tls_certificate.as_deref(),
             scope: "preview",
+            volumes: &[],
         });
+
+        // Same refusal `spawn_deploy_task`/`trigger_deploy_task` apply: an
+        // old agent silently drops `tls_mode`/`tls_certificate` and would
+        // infer plain HTTP from the withheld `ssl_email`.
+        if effective_mode == "provided" {
+            if let Err(e) = require_agent_at_least(&agent, PROVIDED_TLS_MIN_AGENT, "Serving a registered certificate").await {
+                tracing::error!("Preview deploy refused: {name}/{branch}: {}", api_error_message(e));
+                if let Err(db_err) = sqlx::query("UPDATE git_previews SET status = 'failed' WHERE git_deploy_id = $1 AND branch = $2")
+                    .bind(deploy_id).bind(&branch).execute(&db).await
+                {
+                    tracing::warn!("Failed to update git preview status: {db_err}");
+                }
+                if let Some(ref gh_token) = github_token {
+                    if !gh_token.is_empty() {
+                        set_github_status(gh_token, &repo_url, &commit_hash, "failure", github_target.clone()).await;
+                    }
+                }
+                return;
+            }
+        }
 
         match agent.post_long("/git/deploy", Some(deploy_body), 120).await {
             Ok(result) => {
@@ -2810,6 +4335,11 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                     tracing::warn!("Failed to update git preview status: {db_err}");
                 }
                 tracing::info!("Preview deployed: {name}/{branch} -> port {port}");
+                if let Some(ref gh_token) = github_token {
+                    if !gh_token.is_empty() {
+                        set_github_status(gh_token, &repo_url, &commit_hash, "success", github_target.clone()).await;
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!("Preview deploy failed: {name}/{branch}: {e}");
@@ -2818,9 +4348,16 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 {
                     tracing::warn!("Failed to update git preview status: {db_err}");
                 }
+                if let Some(ref gh_token) = github_token {
+                    if !gh_token.is_empty() {
+                        set_github_status(gh_token, &repo_url, &commit_hash, "failure", github_target.clone()).await;
+                    }
+                }
             }
         }
     });
+
+    Ok(())
 }
 
 /// GET /api/git-deploys/{id}/previews — List preview deployments.
@@ -2841,30 +4378,68 @@ pub async fn list_previews(
 pub async fn delete_preview(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path((id, preview_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let preview: GitPreview = sqlx::query_as(
-        "SELECT p.* FROM git_previews p JOIN git_deploys g ON p.git_deploy_id = g.id WHERE p.id = $1 AND g.id = $2 AND g.user_id = $3"
+    // `g.server_id` is joined in for the same reason `remove()` selects it: the
+    // preview runs on the server its PARENT deployment lives on — that is the box
+    // `handle_preview_deploy` built it on — and the caller's `ServerScope` was
+    // deciding which agent got the teardown. A preview's container name is derived
+    // from deploy name + branch, so two servers running the same repository produce
+    // byte-identical preview names: aimed at the wrong host, `/git/cleanup` finds
+    // the neighbour's live preview and destroys it, then deletes the row for the
+    // one still running. The cleanup is fire-and-forget, so nothing reports it.
+    let row: Option<(String, Option<String>, i32, Uuid)> = sqlx::query_as(
+        "SELECT p.container_name, p.domain, p.host_port, g.server_id FROM git_previews p JOIN git_deploys g ON p.git_deploy_id = g.id WHERE p.id = $1 AND g.id = $2 AND g.user_id = $3"
     ).bind(preview_id).bind(id).bind(claims.sub).fetch_optional(&state.db).await
-        .map_err(|e| internal_error("delete preview", e))?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Preview not found"))?;
+        .map_err(|e| internal_error("delete preview", e))?;
+
+    let (container_name, preview_domain, host_port, server_id) =
+        row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Preview not found"))?;
+
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(server_id),
+        preview_domain.as_deref().unwrap_or(&container_name),
+    )
+    .await?;
 
     // Clean up container — the stored name carries both the `dockpanel-git-`
     // prefix the agent re-adds and, for rows written from v2.55.0 on, the
     // preview scope. `preview_cleanup_target` resolves both.
-    agent
+    if let Err(e) = agent
         .post(
             "/git/cleanup",
             Some(preview_cleanup_body(
-                &preview.container_name,
-                preview.domain.as_deref(),
-                Some(preview.host_port),
+                &container_name,
+                preview_domain.as_deref(),
+                Some(host_port),
             )),
         )
         .await
-        .ok();
+    {
+        // KEEP THE ROW and SAY SO. This door answered `{"ok": true}` over a
+        // teardown that had failed, which is the worst of the four: the operator
+        // is told it worked, so they never look again, and the row they would
+        // have needed to try again with is already gone.
+        //
+        // The agent's own sentence travels only on a 4xx (`error.rs`), so take
+        // it where there is one and name the transport failure where there is
+        // not — and in both cases state that the preview was kept, because that
+        // is what makes this retryable rather than just failed.
+        tracing::warn!("Failed to tear down preview {container_name}: {e}");
+        let unanswered = "the server did not answer".to_string();
+        let (status, detail) =
+            crate::error::agent_actionable(&e).unwrap_or((StatusCode::BAD_GATEWAY, unanswered));
+        return Err(err(
+            status,
+            &format!(
+                "Could not tear down preview {container_name}: {detail}. The preview was \
+                 kept — its record is the only thing that can still find that container, \
+                 its port and its vhost. Retry once the server answers."
+            ),
+        ));
+    }
 
     if let Err(e) = sqlx::query("DELETE FROM git_previews WHERE id = $1").bind(preview_id).execute(&state.db).await {
         tracing::warn!("Failed to delete git preview record: {e}");
@@ -2919,7 +4494,7 @@ pub async fn schedule_deploy(
     tracing::info!("Scheduled one-time deploy for git deploy {id} at {scheduled_at}");
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "git_deploy.schedule",
-        Some("git_deploy"), Some(&id.to_string()), Some(deploy_at), None,
+        Some("git_deploy"), Some(&id.to_string()), Some(deploy_at), None, claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({
@@ -2969,26 +4544,76 @@ pub async fn list_approvals(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&claims.role)?;
 
-    let rows: Vec<(Uuid, Uuid, Uuid, String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT da.id, da.deploy_id, da.requested_by, da.status, g.name, da.created_at \
+    // Scoped to the machines this administrator operates. `require_admin` alone is
+    // not a boundary — every sibling read in this file also carries `user_id =
+    // $claims.sub`, and this list carried nothing, so every pending approval in the
+    // installation was legible to any admin account regardless of whose fleet the
+    // deployment ran on. It leaks the deploy name and the requester's id, and it
+    // feeds `approve_deploy` the ids to act on.
+    //
+    // The predicate cannot be the sibling one. `deploy()` is the only writer of
+    // these rows and it fetches its config with `user_id = $2`, so `requested_by`
+    // is ALWAYS the deployment's owner — and approving your own request is refused
+    // two lines into `approve_deploy`. `g.user_id = $claims.sub` would therefore
+    // make every approval unapprovable by construction: it would read as a tighter
+    // guard while quietly deleting the feature.
+    //
+    // So the boundary is the one `SITE_CALLER_PREDICATE`'s admin arm already draws
+    // for sites: an operator may act on the box in front of them — this machine, or
+    // a server they registered themselves — and does not reach a machine somebody
+    // else added. That keeps the two-person rule intact and still stops a second
+    // tenant's admin from signing off on a deploy to hardware they do not run.
+    // `u.role` is read from the DATABASE, not from `claims.role`, for the reason
+    // stated there: a JWT keeps asserting the role it was minted with until it
+    // expires, so a demoted account would otherwise keep approving all session.
+    // `g.deploy_protected` is part of the predicate, not just of the write path.
+    // A request survives its flag being switched off — `update()` now resolves
+    // those, but an install that flipped the flag before this release still holds
+    // them, and a row whose deployment is no longer protected must not be offered
+    // for approval by a screen that shows the same deployment as unprotected.
+    //
+    // The requester's EMAIL and the deployment's repo/branch travel with the row
+    // because a signature without them is not a review: `list()` scopes the deploy
+    // table to its owner, so the approving administrator has usually never seen
+    // this deployment anywhere else in the panel and would be authorising a
+    // production build of a repository the screen never named. The email also
+    // replaces nothing — the raw requester id was already on the wire — and it is
+    // the less identifying of the two for an operator reading it.
+    let rows: Vec<(Uuid, Uuid, Uuid, String, String, String, String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT da.id, da.deploy_id, da.requested_by, da.status, g.name, \
+                u2.email, g.repo_url, g.branch, da.created_at \
          FROM deploy_approvals da \
          JOIN git_deploys g ON g.id = da.deploy_id \
-         WHERE da.status = 'pending' \
+         JOIN users u2 ON u2.id = da.requested_by \
+         WHERE da.status = 'pending' AND g.deploy_protected AND EXISTS (\
+             SELECT 1 FROM users u, servers sv WHERE u.id = $1 AND u.role = 'admin' \
+             AND sv.id = g.server_id AND (sv.is_local OR sv.user_id = u.id)) \
          ORDER BY da.created_at DESC"
     )
+    .bind(claims.sub)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("list approvals", e))?;
 
-    let result: Vec<serde_json::Value> = rows.into_iter().map(|(id, deploy_id, requested_by, status, name, created_at)| {
-        serde_json::json!({
-            "id": id,
-            "deploy_id": deploy_id,
-            "requested_by": requested_by,
-            "status": status,
-            "deploy_name": name,
-            "created_at": created_at,
-        })
-    }).collect();
+    let result: Vec<serde_json::Value> = rows.into_iter()
+        .map(|(id, deploy_id, requested_by, status, name, requested_by_email, repo_url, branch, created_at)| {
+            serde_json::json!({
+                "id": id,
+                "deploy_id": deploy_id,
+                "requested_by": requested_by,
+                "requested_by_email": requested_by_email,
+                "status": status,
+                "deploy_name": name,
+                // This list is the ONE place a git deploy's URL crosses an
+                // ownership boundary: the reader is an administrator of the
+                // machine, not the operator who configured the deploy. Masking
+                // it in the SPA would not be enough, because the token would
+                // still be in this response body. Nothing edits a repo URL from
+                // the approval queue, so the masked form is all it ever needed.
+                "repo_url": mask_repo_credentials(&repo_url),
+                "branch": branch,
+                "created_at": created_at,
+            })
+        }).collect();
 
     Ok(Json(result))
 }
@@ -2997,17 +4622,26 @@ pub async fn list_approvals(
 pub async fn approve_deploy(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Path(approval_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     require_admin(&claims.role)?;
 
-    // Fetch the pending approval
+    // Fetch the pending approval, scoped to the machines this administrator
+    // operates — the same predicate `list_approvals` now applies, and the reason it
+    // cannot simply be `g.user_id = $claims.sub` is written out in full there.
+    // Unscoped, this handler let any admin account sign off on a protected deploy
+    // belonging to a different tenant on hardware they do not run, which is exactly
+    // the review the `deploy_protected` flag exists to force.
     let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
         "SELECT da.deploy_id, da.requested_by, da.status \
-         FROM deploy_approvals da WHERE da.id = $1"
+         FROM deploy_approvals da \
+         JOIN git_deploys g ON g.id = da.deploy_id \
+         WHERE da.id = $1 AND EXISTS (\
+             SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+             AND sv.id = g.server_id AND (sv.is_local OR sv.user_id = u.id))"
     )
     .bind(approval_id)
+    .bind(claims.sub)
     .fetch_optional(&state.db).await
     .map_err(|e| internal_error("approve deploy", e))?;
 
@@ -3023,30 +4657,80 @@ pub async fn approve_deploy(
         return Err(err(StatusCode::FORBIDDEN, "Cannot approve your own deploy request"));
     }
 
-    // Mark as approved
+    // Load config and resolve the host BEFORE consuming the approval.
+    //
+    // The order matters and it changed with this fix. The agent used to arrive as
+    // an extractor, so an unreachable host was answered by `ServerScope` with a 502
+    // before the handler body ran and the approval stayed pending, retryable.
+    // Resolving it here — correctly, from the row — moves that failure INSIDE the
+    // body, and marking the approval first would burn it: `status` is no longer
+    // 'pending', so the retry is refused with 409 and a protected deploy needs a
+    // fresh request and a second admin all over again because a box was rebooting.
+    //
+    // The config load is pinned to `requested_by`, which is the owner `deploy()`
+    // verified when it wrote the approval row. If the deployment changed hands in
+    // between, this fails closed rather than deploying on the strength of a request
+    // its current owner never made.
+    let config: GitDeploy = sqlx::query_as(
+        &format!("{GIT_DEPLOY_SELECT} WHERE d.id = $1 AND d.user_id = $2")
+    )
+    .bind(deploy_id)
+    .bind(requested_by)
+    .fetch_optional(&state.db).await
+    .map_err(|e| internal_error("approve deploy", e))?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
+
+    // The flag is re-read here, not assumed from the row's existence. `deploy()`
+    // checked it when the request was filed, and an owner may have cleared it
+    // since; `update()` now cancels those requests, but an install that flipped
+    // the flag before this release still holds them. Approving one would deploy a
+    // deployment nobody currently requires review for, on the strength of a review
+    // requirement that no longer exists.
+    if !config.deploy_protected {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Deploy protection is no longer enabled on this deployment; the request is obsolete",
+        ));
+    }
+
+    // The build runs on the server the deployment lives on — see `deploy()`, of
+    // which this is the deferred half. It carried the sharper version of the bug:
+    // the requester and the approver are different people, so the approver's server
+    // switcher decided where somebody else's deploy landed.
+    let agent = crate::helpers::agent_for_site_server(
+        &state,
+        Some(config.server_id),
+        config.domain.as_deref().unwrap_or(&config.name),
+    )
+    .await?;
+
+    // The SAME atomic deploy lock `deploy()` takes, and taken BEFORE the approval
+    // is consumed, for the reason the comment above already gives for the agent:
+    // a losing caller must leave the request retryable rather than burn it.
+    //
+    // This path used to flip the status unconditionally and merely warn on error,
+    // so two administrators resolving the queue at the same moment — or an
+    // approval landing while an unprotected sibling deploy was mid-build — each
+    // spawned a full production build against one working tree. The condition is
+    // copied from `deploy()` verbatim, including the 30-minute self-heal for a
+    // crashed build, so the two doors cannot drift into disagreeing about what
+    // "already in progress" means.
+    match sqlx::query(
+        "UPDATE git_deploys SET status = 'building', updated_at = NOW() \
+         WHERE id = $1 AND (status IS DISTINCT FROM 'building' OR updated_at < NOW() - INTERVAL '30 minutes')"
+    ).bind(deploy_id).execute(&state.db).await {
+        Ok(r) if r.rows_affected() == 0 => return Err(err(StatusCode::CONFLICT, "Deploy already in progress")),
+        Ok(_) => {}
+        Err(e) => return Err(internal_error("deploy lock", e)),
+    }
+
+    // Mark as approved. After the lock, so a refused approval stays pending.
     sqlx::query(
         "UPDATE deploy_approvals SET status = 'approved', approved_by = $1, resolved_at = NOW() WHERE id = $2"
     )
     .bind(claims.sub).bind(approval_id)
     .execute(&state.db).await
     .map_err(|e| internal_error("approve deploy", e))?;
-
-    // Load config and trigger the actual deploy
-    let config: GitDeploy = sqlx::query_as(
-        "SELECT * FROM git_deploys WHERE id = $1"
-    )
-    .bind(deploy_id)
-    .fetch_optional(&state.db).await
-    .map_err(|e| internal_error("approve deploy", e))?
-    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
-
-    // Update status to building
-    if let Err(e) = sqlx::query("UPDATE git_deploys SET status = 'building', updated_at = NOW() WHERE id = $1")
-        .bind(deploy_id)
-        .execute(&state.db).await
-    {
-        tracing::warn!("Failed to update git deploy status: {e}");
-    }
 
     let new_deploy_id = Uuid::new_v4();
     // The approver, not the requester — and deliberately so. `new_deploy_id`
@@ -3088,10 +4772,21 @@ pub async fn reject_deploy(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
 
+    // Same boundary as `list_approvals` and `approve_deploy`, for the same reason:
+    // an approval this administrator cannot see must not be one they can resolve.
+    // Rejection has no agent and so no wrong-host half, but unscoped it is the
+    // denial-of-service twin of approve — a second tenant's admin could kill any
+    // protected deploy in the installation, and rejection is terminal (the check
+    // below refuses anything not 'pending', so the requester must start over).
     let row: Option<(String,)> = sqlx::query_as(
-        "SELECT status FROM deploy_approvals WHERE id = $1"
+        "SELECT da.status FROM deploy_approvals da \
+         JOIN git_deploys g ON g.id = da.deploy_id \
+         WHERE da.id = $1 AND EXISTS (\
+             SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+             AND sv.id = g.server_id AND (sv.is_local OR sv.user_id = u.id))"
     )
     .bind(approval_id)
+    .bind(claims.sub)
     .fetch_optional(&state.db).await
     .map_err(|e| internal_error("reject deploy", e))?;
 
@@ -3117,9 +4812,64 @@ pub async fn reject_deploy(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_deploy_body, env_object, is_valid_cron, preview_cleanup_target,
-        strip_container_prefix, DeployBody,
+        DeployBody, blank_to_none, build_deploy_body, env_object, is_valid_cron,
+        mask_repo_credentials, preview_cleanup_target, strip_container_prefix,
     };
+
+    #[test]
+    fn an_embedded_credential_never_reaches_a_reader_who_does_not_own_it() {
+        // The workaround operators reach for when a private HTTPS clone fails,
+        // and the reason #119 was filed. Both spellings git accepts.
+        assert_eq!(
+            mask_repo_credentials("https://ghp_secret123@github.com/me/app.git"),
+            "https://•••@github.com/me/app.git"
+        );
+        assert_eq!(
+            mask_repo_credentials("https://user:ghp_secret123@github.com/me/app.git"),
+            "https://•••@github.com/me/app.git"
+        );
+        // TWO '@' inside the authority. A username may legitimately contain one
+        // (Azure DevOps and some LDAP-backed hosts issue them), and the
+        // authority boundary is the LAST one — splitting on the first leaves
+        // ":tok@" on screen, i.e. the secret this function exists to hide. This
+        // is the case that distinguishes rfind from find; without it the test
+        // passes under both and certifies a leak.
+        assert_eq!(
+            mask_repo_credentials("https://me@corp.com:ghp_secret123@github.com/me/app.git"),
+            "https://•••@github.com/me/app.git"
+        );
+        // A URL with nothing to hide is returned untouched — the operator still
+        // has to be able to tell which repository a row is for.
+        assert_eq!(
+            mask_repo_credentials("https://github.com/me/app.git"),
+            "https://github.com/me/app.git"
+        );
+        // An '@' in the PATH is not userinfo. Splitting on the first '@' instead
+        // of the authority would have masked the host out of this one.
+        assert_eq!(
+            mask_repo_credentials("https://git.example.com/~user@host/app.git"),
+            "https://git.example.com/~user@host/app.git"
+        );
+        // scp-style SSH remotes carry no scheme and no secret; leave them alone.
+        assert_eq!(
+            mask_repo_credentials("git@github.com:me/app.git"),
+            "git@github.com:me/app.git"
+        );
+    }
+
+    #[test]
+    fn a_blank_field_is_stored_as_null_not_as_an_empty_string() {
+        // NULL is this table's spelling of "not set", and `remove` reads the
+        // domain column with `unwrap_or(&name)` — a stored "" would hand the
+        // agent an empty site identifier where NULL correctly yields the name.
+        assert_eq!(blank_to_none(Some("")), None);
+        assert_eq!(blank_to_none(Some("   ")), None);
+        assert_eq!(blank_to_none(None), None);
+        assert_eq!(
+            blank_to_none(Some("prisma-migrate")),
+            Some("prisma-migrate")
+        );
+    }
 
     #[test]
     fn a_preview_is_torn_down_in_the_space_it_was_created_in() {
@@ -3161,7 +4911,10 @@ mod tests {
             memory_mb: None,
             cpu_percent: None,
             ssl_email: None,
+            tls_mode: None,
+            tls_certificate: None,
             scope: "deploy",
+            volumes: &[],
         })
     }
 
@@ -3180,9 +4933,89 @@ mod tests {
     #[test]
     fn optional_fields_are_omitted_not_nulled() {
         let body = body_with(serde_json::json!({}));
-        for k in ["domain", "memory_mb", "cpu_percent", "ssl_email"] {
+        for k in ["domain", "memory_mb", "cpu_percent", "ssl_email", "tls_mode", "tls_certificate", "volumes"] {
             assert!(body.get(k).is_none(), "{k} should be absent, not null");
         }
+    }
+
+    #[test]
+    fn declared_volumes_are_sent() {
+        // Positive control for the mutation this guards against: a `DeployBody`
+        // with a non-empty `volumes` that never reaches the wire would deploy
+        // every declared path silently unmounted (#118's exact original defect).
+        let body = build_deploy_body(DeployBody {
+            name: "app",
+            image_tag: "dockpanel-git-app:abc",
+            container_port: 3000,
+            host_port: 30001,
+            env_vars: &serde_json::json!({}),
+            domain: None,
+            memory_mb: None,
+            cpu_percent: None,
+            ssl_email: None,
+            tls_mode: None,
+            tls_certificate: None,
+            scope: "deploy",
+            volumes: &["/data".to_string(), "/app/uploads".to_string()],
+        });
+        assert_eq!(body["volumes"], serde_json::json!(["/data", "/app/uploads"]));
+    }
+
+    #[test]
+    fn provided_mode_sends_the_alias_and_withholds_the_acme_address() {
+        // A `provided`-mode config is never sent an `ssl_email` — an agent
+        // that still infers the mode from its presence must not be told to
+        // order a certificate the operator switched off. Positive control for
+        // the mutation this guards against: delete the `deploy_tls_email`
+        // call at either `spawn_deploy_task` or `trigger_deploy_task` and this
+        // goes from `None` to `Some("ops@example.com")`.
+        let body = build_deploy_body(DeployBody {
+            name: "app",
+            image_tag: "dockpanel-git-app:abc",
+            container_port: 3000,
+            host_port: 30001,
+            env_vars: &serde_json::json!({}),
+            domain: Some("app.example.com"),
+            memory_mb: None,
+            cpu_percent: None,
+            ssl_email: super::deploy_tls_email("provided", Some("ops@example.com")),
+            tls_mode: Some("provided"),
+            tls_certificate: Some("wildcard-2026"),
+            scope: "deploy",
+            volumes: &[],
+        });
+        assert_eq!(body["tls_mode"], "provided");
+        assert_eq!(body["tls_certificate"], "wildcard-2026");
+        assert!(body.get("ssl_email").is_none(), "provided mode must not also send an ACME address");
+    }
+
+    #[test]
+    fn acme_mode_still_sends_the_address() {
+        let body = build_deploy_body(DeployBody {
+            name: "app",
+            image_tag: "dockpanel-git-app:abc",
+            container_port: 3000,
+            host_port: 30001,
+            env_vars: &serde_json::json!({}),
+            domain: Some("app.example.com"),
+            memory_mb: None,
+            cpu_percent: None,
+            ssl_email: super::deploy_tls_email("acme", Some("ops@example.com")),
+            tls_mode: Some("acme"),
+            tls_certificate: None,
+            scope: "deploy",
+            volumes: &[],
+        });
+        assert_eq!(body["tls_mode"], "acme");
+        assert_eq!(body["ssl_email"], "ops@example.com");
+        assert!(body.get("tls_certificate").is_none());
+    }
+
+    #[test]
+    fn deploy_url_reports_https_for_acme_and_provided_only() {
+        assert_eq!(super::deploy_url("app.example.com", "acme"), "https://app.example.com");
+        assert_eq!(super::deploy_url("app.example.com", "provided"), "https://app.example.com");
+        assert_eq!(super::deploy_url("app.example.com", "none"), "http://app.example.com");
     }
 
     #[test]

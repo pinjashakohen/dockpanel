@@ -2,18 +2,52 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useServer } from "../context/ServerContext";
+import { useAuth } from "../context/AuthContext";
+import { isNavVisible, navFlagsFor } from "../data/navItems";
 import { formatSize, formatRate, formatUptime, timeAgo } from "../utils/format";
 
 interface SiteDetail {
   id: string;
   domain?: string;
   status: string;
+  // A site the operator disabled is serving a maintenance response, not the
+  // site. Counting it as active is the same mistake the vhost writers made.
+  enabled?: boolean;
 }
 
 interface ActivityItem {
   action: string;
   target_name?: string;
   created_at: string;
+}
+
+interface TimelineEvent {
+  type: string;
+  detail: string;
+  target?: string;
+  created_at: string;
+}
+
+interface FleetServer {
+  id: string;
+  name: string;
+  ip_address?: string;
+  firing_alerts: number;
+  active_incidents: number;
+  sites: number;
+  databases: number;
+  cpu_pct?: number;
+  mem_pct?: number;
+  disk_pct?: number;
+  status: string;
+}
+
+interface FleetOverview {
+  servers: FleetServer[];
+  total_servers: number;
+  total_firing: number;
+  total_incidents: number;
+  total_sites: number;
 }
 
 interface DockerImage {
@@ -126,6 +160,9 @@ interface SslCountdown {
   domain: string;
   days_left: number;
   severity: string;
+  // Present (non-null) when this row is a Docker Compose stack's certificate
+  // rather than a site's — same convention as the certificates page.
+  stack_id?: string | null;
 }
 
 interface TopIssue {
@@ -228,6 +265,18 @@ export default function Dashboard() {
   // live socket cannot carry it at all, which is why the socket is gated on
   // `isLocal` further down.
   const { isLocal, loading: serversLoading, activeServer, activeServerId } = useServer();
+
+  // Almost everything this page reads is admin-only, and this page is where
+  // every account lands after signing in. Without the role it asked the
+  // whole system surface as anybody, and a non-admin's first screen was the
+  // refusal: `/system/info` is admin-gated, its catch below surfaced the API's
+  // own words, and the poll re-issued it every 5s — so a client saw a red
+  // "Admin access required" over a heading stuck on "Loading...", which is
+  // indistinguishable from having no access to their own site. Reported that
+  // way on #51, twice, by an operator who was testing a client account.
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [sites, setSites] = useState<SiteSummary>({ total: 0, active: 0 });
   const [dbCount, setDbCount] = useState(0);
@@ -245,6 +294,7 @@ export default function Dashboard() {
   const [backupSetup, setBackupSetup] = useState<{ has_schedule: boolean; has_backup: boolean }>({ has_schedule: false, has_backup: false });
   const [sitesList, setSitesList] = useState<SiteDetail[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
+  const [onCallSchedules, setOnCallSchedules] = useState<{ schedule_id: string; schedule_name: string }[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -252,6 +302,11 @@ export default function Dashboard() {
   const [dockerInfo, setDockerInfo] = useState<{ total: number; running: number; stopped: number } | null>(null);
   // Feature #2: Recent activity feed
   const [recentActivity, setRecentActivity] = useState<ActivityItem[]>([]);
+  // GET /api/dashboard/timeline — unified deploy/backup/incident/alert/security
+  // feed, tenant-scoped server-side; had zero frontend caller until now.
+  const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  // GET /api/dashboard/fleet — admin-only cross-server health; same gap.
+  const [fleetOverview, setFleetOverview] = useState<FleetOverview | null>(null);
   // Feature #6: Bandwidth usage summary
   const [bandwidthTotal, setBandwidthTotal] = useState({ rx: 0, tx: 0 });
   // Feature #8: Docker image disk usage
@@ -298,7 +353,7 @@ export default function Dashboard() {
         setSitesList(list);
         setSites({
           total: list.length,
-          active: list.filter((s) => s.status === "active").length,
+          active: list.filter((s) => s.status === "active" && s.enabled !== false).length,
         });
       })
       .catch(() => setError("Failed to load sites. Please try again."));
@@ -310,14 +365,30 @@ export default function Dashboard() {
       .get<Intelligence>("/dashboard/intelligence")
       .then(setIntel)
       .catch(() => setError("Failed to load dashboard intelligence"));
+    // Any authenticated user — this is the one on-call surface that isn't
+    // admin-gated, built specifically so a non-admin operator can self-check
+    // without seeing the schedule layout.
     api
-      .get<{ container_id: string }[]>("/apps")
-      .then((list) => setAppCount(list.length))
+      .get<{ schedule_id: string; schedule_name: string }[]>("/on-call/whoami")
+      .then(setOnCallSchedules)
       .catch(() => {});
-    api
-      .get<{ count: number; security: number; reboot_required: boolean }>("/system/updates/count")
-      .then((d) => { setUpdateCount(d.count); setRebootRequired(d.reboot_required); })
-      .catch(() => setError("Failed to load system update status"));
+    // Every handler in `routes/docker_apps.rs` calls `require_admin`, this one
+    // included — containers on the box belong to nobody in particular, so there is
+    // no tenant view of them to ask for. Same reasoning as the reads below.
+    if (isAdmin) {
+      api
+        .get<{ container_id: string }[]>("/apps")
+        .then((list) => setAppCount(list.length))
+        .catch(() => {});
+    }
+    // Admin-gated in `routes/system.rs`. Asking as anybody else produced the
+    // page's second error banner, beside the one from `/system/info`.
+    if (isAdmin) {
+      api
+        .get<{ count: number; security: number; reboot_required: boolean }>("/system/updates/count")
+        .then((d) => { setUpdateCount(d.count); setRebootRequired(d.reboot_required); })
+        .catch(() => setError("Failed to load system update status"));
+    }
     api
       .get<{ points: MetricPoint[] }>("/dashboard/metrics-history")
       .then((d) => setMetricsHistory(d.points || []))
@@ -330,50 +401,79 @@ export default function Dashboard() {
       .get<{ has_schedule: boolean; has_backup: boolean }>("/backup-setup-status")
       .then(setBackupSetup)
       .catch(() => {});
-    // Feature #1: Docker container overview
-    api
-      .get<{ total: number; running: number; stopped: number }>("/dashboard/docker")
-      .then(setDockerInfo)
-      .catch(() => {});
+    // Feature #1: Docker container overview. Admin-gated in the backend since
+    // v2.77.0 — it asks the agent for the same `/apps` the list above does.
+    if (isAdmin) {
+      api
+        .get<{ total: number; running: number; stopped: number }>("/dashboard/docker")
+        .then(setDockerInfo)
+        .catch(() => {});
+    }
     // Feature #2: Recent activity feed
+    // Admin-gated in the backend; asking as anybody else is a refusal
+    // every 5s that this page then swallows (activity feed).
+    if (isAdmin) {
+      api
+        .get<ActivityItem[]>("/activity?limit=5")
+        .then(setRecentActivity)
+        .catch(() => {});
+    }
+    // Unified timeline — scoped to the caller's own resources server-side
+    // (AuthUser, not AdminUser), so safe to fetch for every role.
     api
-      .get<ActivityItem[]>("/activity?limit=5")
-      .then(setRecentActivity)
+      .get<TimelineEvent[]>("/dashboard/timeline")
+      .then(setTimeline)
       .catch(() => {});
-    // Feature #8: Docker image disk usage
-    api
-      .get<DockerImage[] | DockerImagesResponse>("/apps/images")
-      .then((d) => {
-        const images: DockerImage[] = Array.isArray(d) ? d : ((d as DockerImagesResponse).images || []);
-        const totalMb = images.reduce((sum: number, img: DockerImage) => {
-          const size = img.size || img.Size || "0";
-          if (typeof size === "number") return sum + size / (1024 * 1024);
-          const match = String(size).match(/([\d.]+)\s*(GB|MB|KB)/i);
-          if (match) {
-            const val = parseFloat(match[1]);
-            if (match[2].toUpperCase() === "GB") return sum + val * 1024;
-            if (match[2].toUpperCase() === "MB") return sum + val;
-            return sum + val / 1024;
-          }
-          return sum;
-        }, 0);
-        setDockerDiskUsage(totalMb > 1024 ? `${(totalMb / 1024).toFixed(1)} GB` : `${totalMb.toFixed(0)} MB`);
-      })
-      .catch(() => {});
+    // Fleet-wide health overview — admin only in the backend (AdminUser).
+    if (isAdmin) {
+      api
+        .get<FleetOverview>("/dashboard/fleet")
+        .then(setFleetOverview)
+        .catch(() => {});
+    }
+    // Feature #8: Docker image disk usage — `docker_apps` again, so admin only.
+    if (isAdmin) {
+      api
+        .get<DockerImage[] | DockerImagesResponse>("/apps/images")
+        .then((d) => {
+          const images: DockerImage[] = Array.isArray(d) ? d : ((d as DockerImagesResponse).images || []);
+          const totalMb = images.reduce((sum: number, img: DockerImage) => {
+            const size = img.size || img.Size || "0";
+            if (typeof size === "number") return sum + size / (1024 * 1024);
+            const match = String(size).match(/([\d.]+)\s*(GB|MB|KB)/i);
+            if (match) {
+              const val = parseFloat(match[1]);
+              if (match[2].toUpperCase() === "GB") return sum + val * 1024;
+              if (match[2].toUpperCase() === "MB") return sum + val;
+              return sum + val / 1024;
+            }
+            return sum;
+          }, 0);
+          setDockerDiskUsage(totalMb > 1024 ? `${(totalMb / 1024).toFixed(1)} GB` : `${totalMb.toFixed(0)} MB`);
+        })
+        .catch(() => {});
+    }
     // Feature #3: Disk I/O metrics (endpoint takes ~1s due to sampling)
-    api
-      .get<DiskIoResponse>("/system/disk-io")
-      .then(setDiskIo)
-      .catch(() => {});
+    // Admin-gated in `routes/system.rs` like the rest of that module.
+    if (isAdmin) {
+      api
+        .get<DiskIoResponse>("/system/disk-io")
+        .then(setDiskIo)
+        .catch(() => {});
+    }
     // Feature #9: Mail queue count
-    api
-      .get<MailQueueResponse>("/mail/queue")
-      .then((d) => {
-        const count = d.count ?? (Array.isArray(d.queue) ? d.queue.length : 0);
-        setMailQueue(count);
-      })
-      .catch(() => {});
-  }, []);
+    // Admin-gated in the backend; asking as anybody else is a refusal
+    // every 5s that this page then swallows (mail queue).
+    if (isAdmin) {
+      api
+        .get<MailQueueResponse>("/mail/queue")
+        .then((d) => {
+          const count = d.count ?? (Array.isArray(d.queue) ? d.queue.length : 0);
+          setMailQueue(count);
+        })
+        .catch(() => {});
+    }
+  }, [isAdmin]);
 
   // Update check. Refetched every time the tab regains focus, because the row
   // behind this banner is cleared server-side — on the first boot after an
@@ -384,10 +484,14 @@ export default function Dashboard() {
   // person who is looking at it.
   useEffect(() => {
     const loadUpdateInfo = () => {
-      api
-        .get<UpdateInfo>("/telemetry/update-status")
-        .then(setUpdateInfo)
-        .catch(() => {});
+      // Admin-gated in the backend; asking as anybody else is a refusal this
+      // page then swallows (update status).
+      if (isAdmin) {
+        api
+          .get<UpdateInfo>("/telemetry/update-status")
+          .then(setUpdateInfo)
+          .catch(() => {});
+      }
     };
     loadUpdateInfo();
     window.addEventListener("focus", loadUpdateInfo);
@@ -396,10 +500,18 @@ export default function Dashboard() {
 
   // Fetch real-time system endpoints (only needed when WS is disconnected)
   const fetchRealtimeData = useCallback(() => {
+    // Every read here is admin-gated in `routes/system.rs`, so for anybody else
+    // this whole block is three refusals per tick and nothing to show. Not
+    // asking is the fix; swallowing the error would leave the tiles pretending
+    // to load for ever.
+    if (!isAdmin) return;
     api
       .get<SystemInfo>("/system/info")
       .then(setSystem)
-      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load system info"));
+      // Deliberately NOT the API's own message. This is the only catch on the
+      // page that forwarded it, and what it forwarded was an authorization
+      // refusal aimed at the operator rather than the reader.
+      .catch(() => setError("Failed to load system info"));
     api
       .get<Process[]>("/system/processes")
       .then(setProcesses)
@@ -408,7 +520,7 @@ export default function Dashboard() {
       .get<NetworkIface[]>("/system/network")
       .then(setNetwork)
       .catch(() => {});
-  }, []);
+  }, [isAdmin]);
 
   // WebSocket connection for live metrics — PANEL HOST ONLY, deliberately.
   //
@@ -549,15 +661,53 @@ export default function Dashboard() {
     return daysLeft > 365 ? null : daysLeft; // Only show if meaningful
   }, [metricsHistory]);
 
-  // Feature #10: Visual health indicator
+  // Feature #10: Visual health indicator.
+  //
+  // The destination follows the REASON the pill is showing, which it did not
+  // used to: every state linked to a bare `/monitoring`, and that resolves to the
+  // Monitors tab. So "System Issues Detected" — which is raised by firing alerts —
+  // took you to a list of uptime monitors, and on an install with no monitors
+  // configured that is an empty screen while alerts are firing. This page already
+  // knew the right answer: `REC_ACTION_ROUTES.alerts` is `/monitoring?tab=alerts`
+  // and three other links on this same screen use it. Monitoring.tsx's own
+  // comment names `/monitoring?tab=alerts from the dashboard` as the contract.
   const overallStatus = useMemo(() => {
     const alertCount = intel?.firing_alerts ?? 0;
     const healthScore = intel?.health_score ?? 100;
-    if (alertCount > 0 || healthScore < 50)
-      return { label: "System Issues Detected", color: "bg-danger-500/10 border-danger-500/20 text-danger-400", dot: "bg-danger-400" };
+    if (alertCount > 0)
+      return {
+        label: "System Issues Detected",
+        to: REC_ACTION_ROUTES.alerts,
+        title: `${alertCount} firing alert${alertCount === 1 ? "" : "s"} — open the Alerts tab`,
+        color: "bg-danger-500/10 border-danger-500/20 text-danger-400",
+        dot: "bg-danger-400",
+      };
+    // No alert is firing, so the score is what is low. That is a property of the
+    // server rather than of a monitor, and the Monitors tab is where the server's
+    // own checks live — the default destination is right for this branch only.
+    if (healthScore < 50)
+      return {
+        label: "System Issues Detected",
+        to: "/monitoring",
+        title: `Health score ${healthScore} — open monitoring`,
+        color: "bg-danger-500/10 border-danger-500/20 text-danger-400",
+        dot: "bg-danger-400",
+      };
     if (healthScore < 80)
-      return { label: "Degraded Performance", color: "bg-warn-500/10 border-warn-500/20 text-warn-400", dot: "bg-warn-500" };
-    return { label: "All Systems Operational", color: "bg-rust-500/10 border-rust-500/20 text-rust-400", dot: "bg-rust-500" };
+      return {
+        label: "Degraded Performance",
+        to: "/monitoring",
+        title: `Health score ${healthScore} — open monitoring`,
+        color: "bg-warn-500/10 border-warn-500/20 text-warn-400",
+        dot: "bg-warn-500",
+      };
+    return {
+      label: "All Systems Operational",
+      to: "/monitoring",
+      title: "View monitoring & system status",
+      color: "bg-rust-500/10 border-rust-500/20 text-rust-400",
+      dot: "bg-rust-500",
+    };
   }, [intel]);
 
   // Feature #6: Also update bandwidth when network changes via polling
@@ -575,7 +725,13 @@ export default function Dashboard() {
         <div className="flex items-center gap-3">
           <div>
             <h1 className="page-header-title">Dashboard</h1>
-            <p className="text-xs text-dark-400 mt-0.5">{system?.hostname || "Loading..."}</p>
+            {/* `system` is an admin-only read, so for anybody else it never
+                arrives — and "Loading..." that never resolves is the visible
+                half of the same defect as the refusal banner. Say what this
+                account is instead. */}
+            <p className="text-xs text-dark-400 mt-0.5">
+              {system?.hostname || (isAdmin ? "Loading..." : user?.email)}
+            </p>
           </div>
           <span
             className="flex items-center gap-1.5"
@@ -592,30 +748,71 @@ export default function Dashboard() {
           </span>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {intel && (
-            <Link to="/monitoring" title="View monitoring & system status" className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium hover:opacity-80 transition-opacity ${overallStatus.color}`}>
+          {intel && isVisible("health_banner") && (
+            <Link to={overallStatus.to} title={overallStatus.title} className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium hover:opacity-80 transition-opacity ${overallStatus.color}`}>
               <span className={`w-1.5 h-1.5 rounded-full ${overallStatus.dot} ${overallStatus.dot === "bg-rust-500" ? "animate-pulse" : ""}`} />
               {overallStatus.label}
             </Link>
           )}
-          <div className="h-4 w-px bg-dark-600 hidden sm:block" />
+          {intel && isVisible("health_banner") && (
+            <div className="h-4 w-px bg-dark-600 hidden sm:block" />
+          )}
+          {onCallSchedules.length > 0 && (
+            isAdmin ? (
+              <Link
+                to="/alerts"
+                title={`You're on call for: ${onCallSchedules.map(s => s.schedule_name).join(", ")}`}
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium hover:opacity-80 transition-opacity bg-rust-500/10 border-rust-500/20 text-rust-400"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-rust-500" />
+                On call: {onCallSchedules.map(s => s.schedule_name).join(", ")}
+              </Link>
+            ) : (
+              // Non-admins have no page to land on — Alerts.tsx's OnCallTab is
+              // admin-only — so this is informational only, not a link.
+              <span
+                title="You're currently the on-call responder for this schedule"
+                className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium bg-rust-500/10 border-rust-500/20 text-rust-400"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-rust-500" />
+                On call: {onCallSchedules.map(s => s.schedule_name).join(", ")}
+              </span>
+            )
+          )}
+          {onCallSchedules.length > 0 && (
+            <div className="h-4 w-px bg-dark-600 hidden sm:block" />
+          )}
           <button onClick={() => setShowWidgetConfig(!showWidgetConfig)}
             className="px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
             {showWidgetConfig ? "Done" : "Customize"}
           </button>
           <div className="h-4 w-px bg-dark-600 hidden sm:block" />
-          <Link to="/apps" className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
-            Deploy App
-          </Link>
-          <Link to="/sites" className="px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors">
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
-            Add Site
-          </Link>
-          <Link to="/security" className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75a4.5 4.5 0 01-4.884 4.484c-1.076-.091-2.264.071-2.95.904l-7.152 8.684a2.548 2.548 0 11-3.586-3.586l8.684-7.152c.833-.686.995-1.874.904-2.95a4.5 4.5 0 016.336-4.486l-3.276 3.276a3.004 3.004 0 002.25 2.25l3.276-3.276c.256.565.398 1.192.398 1.852z" /></svg>
-            Diagnostics
-          </Link>
+          {/* The same dead end as "Add Site" below, one link earlier and missed
+              when that one was fixed: `Apps.tsx` bounces any non-admin straight
+              back here, and every handler in `routes/docker_apps.rs` requires
+              admin. Docker Apps is an operator capability, so say so by not
+              offering it. */}
+          {isAdmin && (
+            <Link to="/apps" className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
+              Deploy App
+            </Link>
+          )}
+          {/* A `client` cannot bring a new domain into service by any route, so
+              offering it the shortcut named for exactly that is a dead end —
+              it lands on the one refusal the role is defined by. */}
+          {user?.role !== "client" && (
+            <Link to="/sites" className="px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
+              Add Site
+            </Link>
+          )}
+          {isAdmin && (
+            <Link to={REC_ACTION_ROUTES.diagnostics} className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75a4.5 4.5 0 01-4.884 4.484c-1.076-.091-2.264.071-2.95.904l-7.152 8.684a2.548 2.548 0 11-3.586-3.586l8.684-7.152c.833-.686.995-1.874.904-2.95a4.5 4.5 0 016.336-4.486l-3.276 3.276a3.004 3.004 0 002.25 2.25l3.276-3.276c.256.565.398 1.192.398 1.852z" /></svg>
+              Diagnostics
+            </Link>
+          )}
           {/* Feature #4: Quick Server Actions — hidden on mobile.
               Shown only once there is something to restart. On a brand-new box
               these sat next to "Add Site" as the first thing an operator met,
@@ -624,7 +821,7 @@ export default function Dashboard() {
               Diagnostics (they post the same restart-service fix); Reboot has no
               other home, so it also appears whenever the system reports one is
               actually required. */}
-          {(sites.total > 0 || appCount > 0) && (
+          {isAdmin && (sites.total > 0 || appCount > 0) && (
             <>
               <div className="h-4 w-px bg-dark-600 hidden sm:block" />
               <button onClick={() => setConfirmAction("nginx")} className="hidden sm:inline-block px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
@@ -635,7 +832,7 @@ export default function Dashboard() {
               </button>
             </>
           )}
-          {(rebootRequired || sites.total > 0 || appCount > 0) && (
+          {isAdmin && (rebootRequired || sites.total > 0 || appCount > 0) && (
             <button onClick={() => setConfirmAction("reboot")} className="hidden sm:inline-block px-2.5 py-1.5 bg-danger-500/10 border border-danger-500/20 rounded-lg text-xs text-danger-400 hover:bg-danger-500/20">
               {rebootRequired ? "Reboot required" : "Reboot"}
             </button>
@@ -648,22 +845,28 @@ export default function Dashboard() {
         <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 mb-4">
           <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest mb-3">Dashboard Widgets</h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {/* `hostOnly` marks a widget fed by an admin-only read. Offering a
+                client a checkbox for a panel that can never draw is the same
+                empty promise as a menu entry that refuses — eight of these
+                fourteen were exactly that. */}
             {[
-              { id: "metrics", label: "CPU / Memory / Disk" },
-              { id: "disk_io", label: "Disk I/O" },
-              { id: "charts", label: "Historical Charts" },
+              { id: "metrics", label: "CPU / Memory / Disk", hostOnly: true },
+              { id: "disk_io", label: "Disk I/O", hostOnly: true },
+              { id: "charts", label: "Historical Charts", hostOnly: true },
               { id: "status_bar", label: "Status Bar" },
               { id: "health_banner", label: "Health Indicator" },
               { id: "sites_grid", label: "Sites Grid" },
-              { id: "activity", label: "Recent Activity" },
+              { id: "activity", label: "Recent Activity", hostOnly: true },
+              { id: "timeline", label: "Timeline" },
+              { id: "fleet", label: "Fleet Health", hostOnly: true },
               { id: "issues", label: "Active Issues" },
               { id: "ssl_countdown", label: "SSL Countdown" },
-              { id: "network", label: "Network I/O" },
-              { id: "processes", label: "Top Processes" },
-              { id: "system_info", label: "System Info" },
-              { id: "onboarding", label: "Getting Started" },
+              { id: "network", label: "Network I/O", hostOnly: true },
+              { id: "processes", label: "Top Processes", hostOnly: true },
+              { id: "system_info", label: "System Info", hostOnly: true },
+              { id: "onboarding", label: "Getting Started", hostOnly: true },
               { id: "bookmarks", label: "Quick Links" },
-            ].map(w => (
+            ].filter(w => isAdmin || !w.hostOnly).map(w => (
               <label key={w.id} className="flex items-center gap-2 text-xs text-dark-200 cursor-pointer hover:text-dark-100">
                 <input type="checkbox" checked={isVisible(w.id)} onChange={() => toggleWidget(w.id)}
                   className="w-3.5 h-3.5 accent-rust-500" />
@@ -688,7 +891,7 @@ export default function Dashboard() {
               <span className="text-dark-400 ml-1">(current: v{updateInfo.current_version})</span>
             </span>
           </div>
-          <Link to="/telemetry" className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors whitespace-nowrap">
+          <Link to="/telemetry?tab=updates" className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors whitespace-nowrap">
             View Update
           </Link>
         </div>
@@ -720,11 +923,19 @@ export default function Dashboard() {
                   setActionMessage({ text: action === "nginx" ? "Nginx restarted" : "PHP-FPM restarted", type: "success" });
                   setTimeout(() => setActionMessage(null), 3000);
                 }
-              } catch {
-                setActionMessage({ text: `Failed to ${action === "reboot" ? "reboot server" : `restart ${action === "nginx" ? "Nginx" : "PHP-FPM"}`}`, type: "error" });
-                setTimeout(() => setActionMessage(null), 3000);
+              } catch (err) {
+                // The agent authors a real sentence for these — nginx's own
+                // "[emerg] invalid parameter" is what tells the operator which
+                // line of which vhost to fix — and `error.rs::agent_error`
+                // passes a 4xx through intact precisely so it survives. Bare
+                // catching it here deleted the useful half and left "Failed to
+                // restart Nginx", which is the #90/#91/#92 class all over again.
+                const what = action === "reboot" ? "reboot the server" : `restart ${action === "nginx" ? "Nginx" : "PHP-FPM"}`;
+                const why = err instanceof Error ? err.message : "";
+                setActionMessage({ text: why ? `Could not ${what}: ${why}` : `Could not ${what}`, type: "error" });
+                setTimeout(() => setActionMessage(null), 10000);
               }
-            }} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">
+            }} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-600 transition-colors">
               Confirm
             </button>
             <button onClick={() => setConfirmAction(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">
@@ -761,8 +972,13 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Getting Started */}
-      {isVisible("onboarding") && !dismissed && system && (() => {
+      {/* Getting Started. Explicitly admin-only: it is titled "set up your server"
+          and four of its five steps land on pages a client cannot open (/apps,
+          /settings, /backup-orchestrator are all adminOnly). It used to be gated
+          on `system` being loaded, which hid it from clients by accident — the
+          right outcome for the wrong reason, and it broke the moment the body
+          below stopped being keyed on `system`. */}
+      {isAdmin && isVisible("onboarding") && !dismissed && system && (() => {
         // Every check must be able to come back FALSE. "Run diagnostics" used to
         // sit here with `check: () => true`, so a box where nothing had been done
         // still reported 1/5 — a checklist that counts a step nobody performed
@@ -773,8 +989,8 @@ export default function Dashboard() {
           // never mentioned. A live certificate is the proof: HTTPS cannot be
           // issued until the domain actually resolves to this server.
           { id: "dns", label: "Point your domain here", description: "HTTPS is issued once your domain resolves to this server", link: "/sites", check: () => (intel?.ssl_countdowns.length ?? 0) > 0 },
-          { id: "app", label: "Deploy a Docker app", description: "One-click deploy from 151 templates", link: "/apps", check: () => appCount > 0 },
-          { id: "2fa", label: "Enable 2FA", description: "Protect your panel with two-factor authentication", link: "/settings", check: () => twoFaEnabled },
+          { id: "app", label: "Deploy a Docker app", description: "One-click deploy from the app catalogue", link: "/apps", check: () => appCount > 0 },
+          { id: "2fa", label: "Enable 2FA", description: "Protect your panel with two-factor authentication", link: "/account", check: () => twoFaEnabled },
           { id: "backup", label: "Set up backups", description: "Schedule recurring backups or run one manually", link: "/backup-orchestrator", check: () => backupSetup.has_schedule || backupSetup.has_backup },
         ];
         const completed = steps.filter(s => s.check()).length;
@@ -848,7 +1064,16 @@ export default function Dashboard() {
         );
       })()}
 
-      {!system ? (
+      {/* `system` is an admin-only read — `fetchRealtimeData` returns early for
+          anybody else and the metrics socket 403s them (ws_metrics.rs), so there
+          are exactly two writers and both are gated. Keying the WHOLE body on it
+          therefore meant a client sat in this skeleton for ever: not "six missing
+          tiles" but six pulsing placeholders and nothing underneath, which is what
+          the field report meant by "the Dashboard also have no stats".
+          The skeleton is a LOADING state, so it belongs only to the account that
+          has something loading. Everything below now renders for every role, and
+          the host-level pieces carry their own `system &&` / `isAdmin &&`. */}
+      {isAdmin && !system ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" role="status" aria-live="polite">
           {[...Array(6)].map((_, i) => (
             <div key={i} className="bg-dark-800 rounded-lg border border-dark-500 p-4 animate-pulse">
@@ -859,8 +1084,9 @@ export default function Dashboard() {
         </div>
       ) : (
         <>
-          {/* System Information */}
-          {isVisible("system_info") && <div className="hidden sm:grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-px bg-dark-600 border border-dark-500 rounded-lg overflow-hidden mb-6">
+          {/* System Information — host-level, so `system &&` rather than relying
+              on the outer gate that used to supply it. */}
+          {system && isVisible("system_info") && <div className="hidden sm:grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-px bg-dark-600 border border-dark-500 rounded-lg overflow-hidden mb-6">
             {[
               ["Hostname", system.hostname],
               ["OS", system.os],
@@ -876,8 +1102,8 @@ export default function Dashboard() {
             ))}
           </div>}
 
-          {/* Resource Metrics — 3 column */}
-          {isVisible("metrics") && <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6 stagger-children">
+          {/* Resource Metrics — 3 column. Host CPU/memory/disk: admin-only data. */}
+          {system && isVisible("metrics") && <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6 stagger-children">
             {[
               { label: "CPU Usage", pct: system.cpu_usage, type: "cpu" as const, detail: `${system.cpu_count} cores${system.load_avg_1 !== undefined ? ` · Load ${system.load_avg_1?.toFixed(2)}` : ""}`,
                 icon: <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><rect x="6" y="6" width="12" height="12" rx="1" /><path d="M9 1v4m6-4v4M9 19v4m6-4v4M1 9h4m-4 6h4M19 9h4m-4 6h4" strokeLinecap="round" /></svg> },
@@ -934,10 +1160,14 @@ export default function Dashboard() {
 
           {/* Status Bar — grid of stat cells */}
           {isVisible("status_bar") && <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-px bg-dark-600 border border-dark-600 rounded-lg overflow-hidden mb-6 shadow-sm shadow-black/5 stagger-children">
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-              <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Uptime</span>
-              <span className="text-sm text-dark-50 font-medium">{formatUptime(system.uptime_secs)}</span>
-            </div>
+            {/* The one host-derived cell in an otherwise tenant-safe grid, which is
+                why this bar could not simply be shown or hidden as a whole. */}
+            {system && (
+              <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Uptime</span>
+                <span className="text-sm text-dark-50 font-medium">{formatUptime(system.uptime_secs)}</span>
+              </div>
+            )}
             <Link to="/sites" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Sites</span>
               <span className="text-sm text-dark-50 font-medium">{sites.total}{sites.active > 0 && <span className="text-rust-400 ml-1 text-xs">({sites.active} active)</span>}</span>
@@ -946,16 +1176,25 @@ export default function Dashboard() {
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Databases</span>
               <span className="text-sm text-dark-50 font-medium">{dbCount}</span>
             </Link>
-            {/* Feature #1: Docker container overview */}
-            <Link to="/apps" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-              <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Docker</span>
-              <span className="text-sm text-dark-50 font-medium">
-                {dockerInfo?.running ?? 0}<span className="text-xs text-dark-300 font-normal">/{dockerInfo?.total ?? 0}</span>
-                <span className="text-[10px] text-dark-400 ml-1">running</span>
-              </span>
-            </Link>
+            {/* Feature #1: Docker container overview. Admin-only both ways: the
+                count comes from an admin endpoint, and the cell links to a page
+                that redirects anybody else. Rendered ungated it read "0/0 running"
+                to a client — a number, not a blank, and a false one. */}
+            {isAdmin && (
+              <Link to="/apps" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Docker</span>
+                <span className="text-sm text-dark-50 font-medium">
+                  {dockerInfo?.running ?? 0}<span className="text-xs text-dark-300 font-normal">/{dockerInfo?.total ?? 0}</span>
+                  <span className="text-[10px] text-dark-400 ml-1">running</span>
+                </span>
+              </Link>
+            )}
             {intel && <>
-              <Link to="/security?tab=diagnostics" title="View system diagnostics that drive this score" className={`px-4 py-3 flex flex-col card-interactive ${
+              {/* /security is adminOnly. For anybody else the score is now built
+                  purely from their own alerts, certificates and backups (the host
+                  diagnostics term is admin-only since v2.77.0), so /monitoring is
+                  both reachable and the right explanation of the number. */}
+              <Link to={isAdmin ? "/security?tab=diagnostics" : "/monitoring"} title={isAdmin ? "View system diagnostics that drive this score" : "View the alerts and certificates behind this score"} className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.health_score < 60 ? "bg-danger-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Health</span>
@@ -987,7 +1226,9 @@ export default function Dashboard() {
                   : <span className="text-sm text-rust-400 font-medium">0</span>
                 }
               </Link>
-              <Link to="/backup-orchestrator" className={`px-4 py-3 flex flex-col card-interactive ${
+              {/* /backup-orchestrator is adminOnly; a client's backups live per-site,
+                  so send them where they can actually act on this count. */}
+              <Link to={isAdmin ? "/backup-orchestrator" : "/sites"} className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.stale_backups > 0 ? "bg-warn-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Backups</span>
@@ -997,15 +1238,22 @@ export default function Dashboard() {
                 }
               </Link>
             </>}
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-              <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Updates</span>
-              {updateCount > 0
-                ? <span className="text-sm text-warn-400 font-bold">{updateCount} available</span>
-                : <span className="text-sm text-rust-400 font-medium">up to date</span>
-              }
-            </div>
+            {/* `updateCount` is only ever fetched for an admin, so for anybody else
+                this cell asserted "up to date" about a machine it had not asked
+                about. An unhidden blank is honest; an unhidden zero is a claim. */}
+            {isAdmin && (
+              <Link to="/updates" className={`px-4 py-3 flex flex-col card-interactive ${
+                updateCount > 0 ? "bg-warn-500/5" : "bg-dark-800"
+              }`}>
+                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Updates</span>
+                {updateCount > 0
+                  ? <span className="text-sm text-warn-400 font-bold">{updateCount} available</span>
+                  : <span className="text-sm text-rust-400 font-medium">up to date</span>
+                }
+              </Link>
+            )}
             {/* Disk I/O */}
-            {diskIo && <>
+            {diskIo && isVisible("disk_io") && <>
               <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Disk Read</span>
                 <span className="text-sm text-dark-50 font-medium font-mono">{formatRate(diskIo.read_bytes_sec)}</span>
@@ -1015,21 +1263,28 @@ export default function Dashboard() {
                 <span className="text-sm text-dark-50 font-medium font-mono">{formatRate(diskIo.write_bytes_sec)}</span>
               </div>
             </>}
-            {/* Feature #6: Bandwidth usage summary */}
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-              <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Bandwidth</span>
-              <span className="text-sm text-dark-50 font-medium">
-                <span className="text-dark-400">{"\u2193"}</span>{formatSize(bandwidthTotal.rx)}
-                <span className="text-dark-400 ml-1">{"\u2191"}</span>{formatSize(bandwidthTotal.tx)}
-              </span>
-            </div>
-            {/* Feature #9: Mail queue widget */}
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-              <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Mail Queue</span>
-              <span className={`text-sm font-medium ${(mailQueue ?? 0) > 0 ? "text-warn-400" : "text-dark-50"}`}>
-                {mailQueue ?? 0} <span className="text-[10px] text-dark-400">messages</span>
-              </span>
-            </div>
+            {/* Feature #6: Bandwidth usage summary. Derived from `network`, which
+                `fetchRealtimeData` only fetches for an admin \u2014 so this read
+                "0 B / 0 B" to everybody else, host traffic reported as none. */}
+            {isAdmin && (
+              <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Bandwidth</span>
+                <span className="text-sm text-dark-50 font-medium">
+                  <span className="text-dark-400">{"\u2193"}</span>{formatSize(bandwidthTotal.rx)}
+                  <span className="text-dark-400 ml-1">{"\u2191"}</span>{formatSize(bandwidthTotal.tx)}
+                </span>
+              </div>
+            )}
+            {/* Feature #9: Mail queue widget. `/mail/queue` is admin-gated, so the
+                same false zero \u2014 and mail is admin-only end to end anyway. */}
+            {isAdmin && (
+              <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Mail Queue</span>
+                <span className={`text-sm font-medium ${(mailQueue ?? 0) > 0 ? "text-warn-400" : "text-dark-50"}`}>
+                  {mailQueue ?? 0} <span className="text-[10px] text-dark-400">messages</span>
+                </span>
+              </div>
+            )}
           </div>}
 
           {/* Reboot Required Warning */}
@@ -1046,6 +1301,37 @@ export default function Dashboard() {
             </div>
           )}
 
+          {/* Fleet Health — cross-server overview for admins. GET /api/dashboard/fleet
+              was fully built and hardened (v2.185.0/v2.188.0) but had zero frontend
+              caller; a single-server install has nothing this adds over the rest of
+              the page, so it only renders once there's an actual fleet to show. */}
+          {isAdmin && isVisible("fleet") && fleetOverview && fleetOverview.servers.length > 1 && (
+            <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mb-6">
+              <div className="px-4 py-2.5 border-b border-dark-600 flex justify-between items-center">
+                <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Fleet Health</h3>
+                <Link to="/servers" className="text-[10px] text-rust-400 hover:text-rust-300">Manage</Link>
+              </div>
+              <div className="divide-y divide-dark-600">
+                {fleetOverview.servers.map((s) => (
+                  <Link key={s.id} to="/servers" className="px-4 py-2 flex items-center justify-between text-xs hover:bg-dark-700/50 transition-colors">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className={`w-2 h-2 rounded-full shrink-0 ${s.status === "healthy" ? "bg-rust-500" : "bg-warn-500"}`} />
+                      <span className="text-dark-100 font-mono truncate">{s.name}</span>
+                    </div>
+                    <div className="flex items-center gap-3 text-[10px] text-dark-300 shrink-0">
+                      {s.cpu_pct != null && <span>CPU {s.cpu_pct.toFixed(0)}%</span>}
+                      {s.mem_pct != null && <span>Mem {s.mem_pct.toFixed(0)}%</span>}
+                      <span>{s.sites} sites</span>
+                      {s.firing_alerts > 0
+                        ? <span className="text-danger-400 font-bold">{s.firing_alerts} firing</span>
+                        : <span className="text-rust-400">0 firing</span>}
+                    </div>
+                  </Link>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Feature #5: Site Status Mini-Grid */}
           {isVisible("sites_grid") && sitesList.length > 0 && (
             <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mb-6">
@@ -1056,7 +1342,12 @@ export default function Dashboard() {
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-px bg-dark-600">
                 {sitesList.slice(0, 12).map((s) => (
                   <Link key={s.id} to={`/sites/${s.id}`} className="bg-dark-800 px-3 py-2 flex items-center gap-2 hover:bg-dark-700/50 transition-colors">
-                    <div className={`w-2 h-2 rounded-full shrink-0 ${s.status === "active" ? "bg-rust-500" : "bg-dark-500"}`} />
+                    <div
+                      title={s.enabled === false ? "Disabled" : s.status}
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        s.enabled === false ? "bg-warn-500" : s.status === "active" ? "bg-rust-500" : "bg-dark-500"
+                      }`}
+                    />
                     <span className="text-xs text-dark-100 truncate font-mono">{s.domain || s.id}</span>
                   </Link>
                 ))}
@@ -1069,7 +1360,7 @@ export default function Dashboard() {
             <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mb-6">
               <div className="px-4 py-2.5 border-b border-dark-600 flex justify-between items-center">
                 <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Recent Activity</h3>
-                <Link to="/logs" className="text-[10px] text-rust-400 hover:text-rust-300">View all</Link>
+                <Link to="/logs?tab=audit" className="text-[10px] text-rust-400 hover:text-rust-300">View all</Link>
               </div>
               <div className="divide-y divide-dark-600">
                 {recentActivity.map((a, i) => (
@@ -1089,19 +1380,58 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Active Issues + SSL — side by side */}
-          {isVisible("issues") && intel && (intel.top_issues.length > 0 || intel.ssl_countdowns.length > 0) && (
+          {/* Timeline — unified deploy/backup/incident/alert/security feed. Scoped
+              server-side to the caller's own resources, so (unlike Recent Activity
+              above) it renders for every role, not just admins. GET
+              /api/dashboard/timeline was fully built and hardened but had zero
+              frontend caller. */}
+          {isVisible("timeline") && timeline.length > 0 && (
+            <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mb-6">
+              <div className="px-4 py-2.5 border-b border-dark-600 flex justify-between items-center">
+                <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Timeline</h3>
+              </div>
+              <div className="divide-y divide-dark-600">
+                {timeline.slice(0, 10).map((e, i) => (
+                  <div key={i} className="px-4 py-2 flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 uppercase ${
+                        e.type === "alert" || e.type === "incident" ? "bg-danger-500/15 text-danger-400" :
+                        e.type === "security" ? "bg-warn-500/15 text-warn-400" :
+                        e.type === "deploy" ? "bg-rust-500/15 text-rust-400" :
+                        "bg-dark-700 text-dark-200"
+                      }`}>{e.type}</span>
+                      <span className="text-dark-100 font-mono truncate">{e.detail}</span>
+                      {e.target && <span className="text-dark-400 truncate">· {e.target}</span>}
+                    </div>
+                    <span className="text-dark-400 text-[10px] shrink-0 ml-2">{timeAgo(e.created_at)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Active Issues + SSL — side by side when both have content; a solo
+              panel spans the full row instead of sitting at half width in an
+              empty 2-col grid (the "Active Issues looks narrower than Recent
+              Activity/Recommendations" report — it only IS narrower than its
+              full-width siblings when SSL has nothing to show beside it). */}
+          {intel && (() => {
+            const showIssues = isVisible("issues") && intel.top_issues.length > 0;
+            const showSsl = isVisible("ssl_countdown") && intel.ssl_countdowns.length > 0;
+            if (!showIssues && !showSsl) return null;
+            const solo = showIssues !== showSsl;
+            return (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
-              {intel.top_issues.length > 0 && (
-                <div className="border border-dark-500 bg-dark-800 rounded-lg p-4">
+              {showIssues && (
+                <div className={`border border-dark-500 bg-dark-800 rounded-lg p-4 ${solo ? "lg:col-span-2" : ""}`}>
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-xs text-dark-300 uppercase tracking-widest">Active Issues</h3>
-                    <Link to="/monitors" className="text-xs text-rust-400 hover:text-rust-300">View all</Link>
+                    <Link to={REC_ACTION_ROUTES.alerts} className="text-xs text-rust-400 hover:text-rust-300">View all</Link>
                   </div>
                   <div className="space-y-2">
                     {intel.top_issues.slice(0, 4).map((issue, i) => (
                       <div key={i} className="flex items-start gap-2">
-                        <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
+                        <div className={`w-2 h-2 rounded-full mt-0.5 flex-shrink-0 ${
                           issue.severity === "critical" ? "bg-danger-500" :
                           issue.severity === "warning" ? "bg-warn-500" : "bg-accent-500"
                         }`} />
@@ -1111,13 +1441,21 @@ export default function Dashboard() {
                   </div>
                 </div>
               )}
-              {intel.ssl_countdowns.length > 0 && (
-                <div className="border border-dark-500 bg-dark-800 rounded-lg p-4">
+              {showSsl && (
+                <div className={`border border-dark-500 bg-dark-800 rounded-lg p-4 ${solo ? "lg:col-span-2" : ""}`}>
                   <h3 className="text-xs text-dark-300 uppercase tracking-widest mb-3">SSL Certificates</h3>
                   <div className="space-y-2">
                     {intel.ssl_countdowns.map((ssl, i) => (
                       <div key={i} className="flex items-center justify-between">
-                        <span className="text-xs text-dark-100 truncate max-w-[200px]">{ssl.domain}</span>
+                        <span className="text-xs text-dark-100 truncate max-w-[200px] flex items-center gap-1.5">
+                          {ssl.domain}
+                          {/* A stack and a site can share the same domain string;
+                              this is the only cue on the tile for which one is
+                              expiring. */}
+                          {ssl.stack_id && (
+                            <span className="text-[9px] px-1 py-0.5 rounded bg-dark-700 text-dark-300 uppercase tracking-wider shrink-0">Stack</span>
+                          )}
+                        </span>
                         <span className={`text-xs ${
                           ssl.severity === "critical" ? "text-danger-400" :
                           ssl.severity === "warning" ? "text-warn-400" :
@@ -1129,7 +1467,8 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-          )}
+            );
+          })()}
 
           {/* Smart Recommendations */}
           {intel && intel.recommendations && intel.recommendations.length > 0 && (
@@ -1140,10 +1479,20 @@ export default function Dashboard() {
               </div>
               <div className="divide-y divide-dark-600">
                 {intel.recommendations.map((rec, i) => {
-                  const route = REC_ACTION_ROUTES[rec.action];
+                  // The recommendation itself is worth showing to whoever it is
+                  // about — a client whose own site has no recent backup should
+                  // hear that. Its ACTION is a different question: three of these
+                  // six routes are administrator-only, and a chevron into one of
+                  // them lands the caller straight back on this page with nothing
+                  // said. Ask the same registry the sidebar and the command
+                  // palette ask, so the answer cannot drift from theirs; a row
+                  // whose destination is not for this caller keeps the message
+                  // and loses the link.
+                  const target = REC_ACTION_ROUTES[rec.action];
+                  const route = target && isNavVisible(navFlagsFor(target), user?.role ?? "") ? target : undefined;
                   const inner = (
                     <>
-                      <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
+                      <div className={`w-2 h-2 rounded-full mt-0.5 flex-shrink-0 ${
                         rec.severity === "critical" ? "bg-danger-500" :
                         rec.severity === "warning" ? "bg-warn-500" : "bg-accent-500"
                       }`} />

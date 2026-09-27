@@ -67,6 +67,12 @@ pub struct SiteConfig {
     /// Bot protection mode: "off", "rate-limit", "challenge", "block"
     #[serde(default)]
     pub bot_protection: Option<String>,
+    /// PHP-FPM pool user (SFTP-enabled sites only — see `services::sftp_accounts`).
+    /// `None` keeps the shared `www-data` identity every other site uses.
+    #[serde(default)]
+    pub pool_user: Option<String>,
+    #[serde(default)]
+    pub pool_group: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -140,30 +146,40 @@ async fn put_site(
         if let Some(ref socket) = config.php_socket {
             // Extract socket path (e.g., "unix:/run/php/php8.4-fpm.sock" → "/run/php/php8.4-fpm.sock")
             let socket_path = socket.strip_prefix("unix:").unwrap_or(socket);
-            if !std::path::Path::new(socket_path).exists() {
-                // Extract version for a helpful error message
-                let version = socket_path
-                    .strip_prefix("/run/php/php")
-                    .and_then(|s| s.strip_suffix("-fpm.sock"))
-                    .unwrap_or("unknown");
-                // Where this used to send people was a dead end. Settings →
-                // Services has one PHP tile with no version on it, and it
-                // reports installed if ANY version is — so on a box with 8.4
-                // the operator was told to go and install 8.3 on a screen
-                // showing "Installed / Uninstall" and no install button at all.
-                // The PHP Version control is the one place that can do this,
-                // and since v2.49.0 it offers the install itself.
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(NginxResponse {
-                        success: false,
-                        message: format!(
-                            "PHP {version} is not installed, or its PHP-FPM service is not \
-                             running. Install it from the PHP Version control on the site — \
-                             it offers any version this server does not have yet."
-                        ),
-                    }),
-                ));
+            // Extract version to resolve against, not to check literally: the panel
+            // always sends the Debian-shaped path above as the wire format, but the
+            // REAL socket on a RHEL-family host is a different, unversioned path
+            // (`/run/php-fpm/www.sock`) that this literal `Path::exists()` could
+            // never see — every PHP site creation on RHEL was rejected as "not
+            // installed" even with PHP-FPM correctly installed and running.
+            // `resolve_php_fpm_socket` is the same resolver `php.rs::settle()`
+            // already uses, so the two routes can't disagree on what's real.
+            let version = socket_path
+                .strip_prefix("/run/php/php")
+                .and_then(|s| s.strip_suffix("-fpm.sock"))
+                .unwrap_or("unknown");
+            match crate::services::pkg::resolve_php_fpm_socket(version).await {
+                Some(real_socket) => config.php_socket = Some(format!("unix:{real_socket}")),
+                None => {
+                    // Where this used to send people was a dead end. Settings →
+                    // Services has one PHP tile with no version on it, and it
+                    // reports installed if ANY version is — so on a box with 8.4
+                    // the operator was told to go and install 8.3 on a screen
+                    // showing "Installed / Uninstall" and no install button at all.
+                    // The PHP Version control is the one place that can do this,
+                    // and since v2.49.0 it offers the install itself.
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(NginxResponse {
+                            success: false,
+                            message: format!(
+                                "PHP {version} is not installed, or its PHP-FPM service is not \
+                                 running. Install it from the PHP Version control on the site — \
+                                 it offers any version this server does not have yet."
+                            ),
+                        }),
+                    ));
+                }
             }
         }
 
@@ -174,7 +190,11 @@ async fn put_site(
             if let Some(ver) = socket.strip_prefix("unix:/run/php/php").and_then(|s| s.strip_suffix("-fpm.sock")) {
                 let memory = config.php_memory_mb.unwrap_or(256);
                 let workers = config.php_max_workers.unwrap_or(5);
-                if let Err(e) = services::nginx::write_php_pool_config(&domain, ver, memory, workers) {
+                let pool_owner = match (config.pool_user.as_deref(), config.pool_group.as_deref()) {
+                    (Some(u), Some(g)) => Some((u, g)),
+                    _ => None,
+                };
+                if let Err(e) = services::nginx::write_php_pool_config(&domain, ver, memory, workers, pool_owner) {
                     tracing::warn!("Failed to write PHP pool config for {domain}: {e}");
                 } else {
                     // Reload PHP-FPM so the new per-site pool is actually picked up.
@@ -268,7 +288,13 @@ async fn put_site(
     // site could remove that site's config while some *other* vhost was broken.
     // Nothing reloads nginx on that path, so the box kept serving from memory and
     // the loss only surfaced at the next reload.
-    let config_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    //
+    // Where it lands is not a constant: a site the operator took offline keeps a
+    // stub in service and its real body parked beside it, and writing the render
+    // into service would put that site back on the internet. See
+    // `services::nginx::vhost_target_between`.
+    let target = services::nginx::vhost_target(&domain);
+    let config_path = target.path().to_string();
     let previous = std::fs::read_to_string(&config_path).ok();
     let tmp_path = format!("{config_path}.tmp");
     let write_result = std::fs::write(&tmp_path, &rendered)
@@ -306,12 +332,27 @@ async fn put_site(
     } else {
         let index_path = format!("{actual_root}/index.html");
         if !std::path::Path::new(&index_path).exists() {
-            let _ = std::fs::write(&index_path, format!(
-                "<!DOCTYPE html><html><head><title>{domain}</title></head>\
-                 <body><h1>Welcome to {domain}</h1>\
-                 <p>Site is ready. Upload your files to replace this page.</p></body></html>"
-            ));
+            let _ = std::fs::write(
+                &index_path,
+                crate::services::nginx::placeholder_page(&domain),
+            );
         }
+    }
+
+    // A parked body is not in service, so there is nothing for `nginx -t` to read
+    // and nothing to reload. Returning the ordinary "configured and nginx
+    // reloaded" here would be the sentence that kept this invisible: the panel
+    // would report success for a change the operator cannot see, on a site it
+    // simultaneously displays as disabled.
+    if !target.is_live() {
+        tracing::info!("Site {domain} is disabled: saved its configuration to {config_path} and left the maintenance response in service");
+        return Ok(Json(NginxResponse {
+            success: true,
+            message: format!(
+                "Site {domain} is disabled — its configuration was saved and takes effect \
+                 when the site is enabled. Nginx was not reloaded."
+            ),
+        }));
     }
 
     // Test nginx config
@@ -413,7 +454,7 @@ async fn delete_site(
         ));
     }
 
-    let config_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    let config_path = format!("{}/{domain}.conf", services::nginx::sites_dir());
 
     if !std::path::Path::new(&config_path).exists() {
         return Err((
@@ -591,7 +632,7 @@ async fn get_site(
         ));
     }
 
-    let config_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    let config_path = format!("{}/{domain}.conf", services::nginx::sites_dir());
     let ssl_cert_path = format!("/etc/dockpanel/ssl/{domain}/fullchain.pem");
     let config_exists = std::path::Path::new(&config_path).exists();
     let ssl_enabled = std::path::Path::new(&ssl_cert_path).exists();
@@ -632,6 +673,55 @@ fn copy_dir_shallow(src: &str, dst: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The backup trees this agent keys by site domain.
+///
+/// Two trees, two spellings of the same site, and each one is rebuilt from
+/// the LIVE domain by whoever reads it — the panel's `backups` table stores a
+/// filename and no path at all. So a rename that does not carry these leaves
+/// every archive on disk under a name nothing will look up again, while the
+/// panel keeps listing the rows and answers a restore with a path that does
+/// not exist.
+fn domain_backup_trees(old_domain: &str, new_domain: &str) -> Vec<(String, String)> {
+    let root = "/var/backups/dockpanel";
+    vec![
+        (format!("{root}/{old_domain}"), format!("{root}/{new_domain}")),
+        (
+            format!("{root}/wp-snapshots/{old_domain}"),
+            format!("{root}/wp-snapshots/{new_domain}"),
+        ),
+    ]
+}
+
+/// Does anything already live at `path`?
+///
+/// `NotFound` is the only answer that means "free". Every other error — a
+/// permission problem, a dangling mount — answers `true`, because the
+/// alternative is moving one tenant's archives on top of something we could not
+/// read.
+fn dir_is_occupied(path: &str) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Put carried trees back, most recent move first.
+///
+/// Best-effort by necessity — it runs on a path that is already failing — but
+/// never silent. A tree that cannot be put back is an archive the panel will
+/// look for under the old name and not find, which is the exact defect the
+/// carry exists to prevent, so both paths go into the log at ERROR.
+fn undo_backup_carry(carried: &[(String, String)], old_domain: &str) {
+    for (old_tree, new_tree) in carried.iter().rev() {
+        if let Err(e) = std::fs::rename(new_tree, old_tree) {
+            tracing::error!(
+                "Rolling back the rename of {old_domain}, but {new_tree} could not be put back                  at {old_tree}: {e}. Those archives are on disk under the new name while the                  panel will look for them under the old one."
+            );
+        }
+    }
+}
+
 async fn rename_site(
     Path(old_domain): Path<String>,
     Json(body): Json<serde_json::Value>,
@@ -652,11 +742,38 @@ async fn rename_site(
         })));
     }
 
-    let old_conf = format!("/etc/nginx/sites-enabled/{old_domain}.conf");
+    let old_conf = format!("{}/{old_domain}.conf", services::nginx::sites_dir());
     if !std::path::Path::new(&old_conf).exists() {
         return Err((StatusCode::NOT_FOUND, Json(NginxResponse {
             success: false, message: format!("No nginx config for {old_domain}"),
         })));
+    }
+
+    // 0. Refuse, before anything moves, if a backup tree is already occupied at
+    //    the destination.
+    //
+    //    This is not a hypothetical collision — every completed site delete
+    //    manufactures one. The panel writes a pre-delete archive for a site it is
+    //    about to remove and records no row for it, then the site row goes and the
+    //    cascade takes the backup rows with it. The directory outlives every
+    //    record of itself. Rename another site onto that domain and two tenants'
+    //    archives become one listing, with no ownership filter between them and a
+    //    restore one click away.
+    //
+    //    Refusing costs the operator one directory they can inspect and remove.
+    //    Merging costs them somebody else's site restored over their webroot.
+    let backup_trees = domain_backup_trees(&old_domain, new_domain);
+    for (old_tree, new_tree) in &backup_trees {
+        if std::path::Path::new(old_tree).exists() && dir_is_occupied(new_tree) {
+            return Err((StatusCode::CONFLICT, Json(NginxResponse {
+                success: false,
+                message: format!(
+                    "{new_tree} already holds files. {old_domain} has backups that must move \
+                     there, and merging them would put two sites' archives in one listing. \
+                     Move or delete that directory, then rename again."
+                ),
+            })));
+        }
     }
 
     // 1. Rename site directory
@@ -685,7 +802,7 @@ async fn rename_site(
     // a legacy config predating the panel) is claimable, and was silently
     // overwritten here and then bare-deleted on rollback. The tenant's own
     // config came back; the operator's never existed anywhere else.
-    let new_conf = format!("/etc/nginx/sites-enabled/{new_domain}.conf");
+    let new_conf = format!("{}/{new_domain}.conf", services::nginx::sites_dir());
     let displaced = std::fs::read_to_string(&new_conf).ok();
     if let Some(ref bytes) = displaced {
         tracing::warn!(
@@ -706,6 +823,37 @@ async fn rename_site(
 
     // 4. Remove old config
     std::fs::remove_file(&old_conf).ok();
+
+    // 4b. Carry the parked body across too, if this site is disabled.
+    //
+    // What step 3 just rewrote is whatever nginx has in service, and for a
+    // disabled site that is the maintenance stub — which would leave the real
+    // body parked under the OLD name, where enabling the site will never look.
+    // The site becomes unenableable through the panel while its configuration
+    // sits on disk under a name nothing reads.
+    let (_, old_parked) = services::nginx::vhost_paths(&old_domain);
+    let (_, new_parked) = services::nginx::vhost_paths(new_domain);
+    if std::path::Path::new(&old_parked).exists() {
+        match std::fs::read_to_string(&old_parked) {
+            Ok(parked) => {
+                let carried = parked.replace(&old_domain, new_domain);
+                if std::fs::write(&new_parked, &carried).is_ok() {
+                    std::fs::remove_file(&old_parked).ok();
+                    tracing::info!(
+                        "Carried the parked configuration for disabled site {old_domain} over to {new_domain}"
+                    );
+                } else {
+                    tracing::warn!(
+                        "Could not carry the parked configuration for disabled site {old_domain} \
+                         over to {new_parked} — it can still be enabled under its old name"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                "Could not read the parked configuration for disabled site {old_domain}: {e}"
+            ),
+        }
+    }
 
     // 5. Rename SSL certificates directory.
     //
@@ -813,6 +961,97 @@ async fn rename_site(
         }
     }
 
+    // 9c. Carry the backup trees.
+    //
+    // Last among the moves, deliberately. It is the heaviest and it is the only
+    // one whose failure aborts the rename, so putting it here keeps the undo a
+    // single self-contained loop and means a cheap failure earlier never has to
+    // unwind gigabytes.
+    //
+    // The result of each move is matched, never discarded. A move that lands on
+    // a destination which filled up since step 0 answers ENOTEMPTY, and
+    // swallowing that answer is precisely the "reports success while leaking"
+    // defect this whole step exists to close.
+    let mut carried: Vec<(String, String)> = Vec::new();
+    let mut files_renamed = 0usize;
+    for (old_tree, new_tree) in &backup_trees {
+        if !std::path::Path::new(old_tree).exists() {
+            continue;
+        }
+        if let Some(parent) = std::path::Path::new(new_tree).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        match std::fs::rename(old_tree, new_tree) {
+            Ok(()) => {
+                carried.push((old_tree.clone(), new_tree.clone()));
+                tracing::info!("Carried backups for {old_domain}: {old_tree} to {new_tree}");
+            }
+            Err(e) => {
+                undo_backup_carry(&carried, &old_domain);
+                std::fs::write(&old_conf, &config_content).ok();
+                services::nginx::restore_or_remove(&new_conf, displaced.as_deref());
+                if std::path::Path::new(&new_dir).exists() {
+                    std::fs::rename(&new_dir, &old_dir).ok();
+                }
+                // A destination that filled up is the operator's to clear, so it
+                // gets a status that carries this sentence to them. Anything else
+                // is this machine's fault and keeps its incident id.
+                let status = match e.kind() {
+                    std::io::ErrorKind::DirectoryNotEmpty
+                    | std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                return Err((status, Json(NginxResponse {
+                    success: false,
+                    message: format!(
+                        "Could not move {old_tree} to {new_tree}: {e}. The rename was rolled \
+                         back and {old_domain} is unchanged."
+                    ),
+                })));
+            }
+        }
+    }
+
+    // The archive names carry the old domain as a prefix, and that prefix is load
+    // bearing rather than decorative: off-site retention is handed the site's
+    // live domain and uses it to choose which remote objects it may delete. Left
+    // alone, remote pruning silently stops matching this site's archives — and
+    // starts matching the previous occupant's if the old name is ever reused.
+    if !carried.is_empty() {
+        let moved_dir = format!("/var/backups/dockpanel/{new_domain}");
+        let old_prefix = format!("{old_domain}-");
+        let new_prefix = format!("{new_domain}-");
+        if let Ok(entries) = std::fs::read_dir(&moved_dir) {
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(|n| n.to_string()) else {
+                    continue;
+                };
+                let Some(rest) = name.strip_prefix(&old_prefix) else {
+                    continue;
+                };
+                let renamed = format!("{new_prefix}{rest}");
+                if let Err(e) = std::fs::rename(
+                    std::path::Path::new(&moved_dir).join(&name),
+                    std::path::Path::new(&moved_dir).join(&renamed),
+                ) {
+                    tracing::warn!("Could not rename archive {name} to {renamed}: {e}");
+                } else {
+                    files_renamed += 1;
+                }
+            }
+        }
+
+        // A moved directory keeps the mode it was created with, and archives are
+        // created with the process umask rather than the tightened one. The
+        // repair otherwise runs only at agent start, so a tree created since the
+        // last restart would ride to its new name still world-traversable.
+        services::backups::secure_backup_tree();
+        tracing::info!(
+            "Backup carry for {old_domain} to {new_domain}: {} trees, {files_renamed} archives renamed",
+            carried.len()
+        );
+    }
+
     // 10. Test and reload nginx
     match services::nginx::test_config().await {
         Ok(output) if output.success => {
@@ -831,6 +1070,7 @@ async fn rename_site(
             // Rollback: restore old config, and put back whatever we displaced
             // at the destination rather than deleting it.
             std::fs::write(&old_conf, &config_content).ok();
+            undo_backup_carry(&carried, &old_domain);
             let restored = services::nginx::restore_or_remove(&new_conf, displaced.as_deref());
             if std::path::Path::new(&new_dir).exists() {
                 std::fs::rename(&new_dir, &old_dir).ok();
@@ -846,6 +1086,7 @@ async fn rename_site(
         }
         Err(e) => {
             std::fs::write(&old_conf, &config_content).ok();
+            undo_backup_carry(&carried, &old_domain);
             services::nginx::restore_or_remove(&new_conf, displaced.as_deref());
             if std::path::Path::new(&new_dir).exists() {
                 std::fs::rename(&new_dir, &old_dir).ok();
@@ -914,7 +1155,7 @@ async fn add_redirect(
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
 
     // Include in nginx site config if not already
-    let site_conf = format!("/etc/nginx/sites-enabled/{}.conf", body.domain);
+    let site_conf = format!("{}/{}.conf", services::nginx::sites_dir(), body.domain);
     let site_content = std::fs::read_to_string(&site_conf).unwrap_or_default();
     if !site_content.contains(&format!("include /etc/nginx/redirects/{}.conf", body.domain)) {
         let include_line = format!(
@@ -1108,7 +1349,7 @@ async fn password_protect(
     }
 
     // Include in site config if not already
-    let site_conf = format!("/etc/nginx/sites-enabled/{}.conf", body.domain);
+    let site_conf = format!("{}/{}.conf", services::nginx::sites_dir(), body.domain);
     let site_content = std::fs::read_to_string(&site_conf).unwrap_or_default();
     if !site_content.contains(&format!("include /etc/nginx/auth/{}.conf", body.domain)) {
         if let Some(pos) = site_content.rfind('}') {
@@ -1261,7 +1502,7 @@ async fn add_alias(
         return Err(api_err(StatusCode::BAD_REQUEST, "Invalid alias domain format"));
     }
 
-    let site_conf = format!("/etc/nginx/sites-enabled/{}.conf", body.domain);
+    let site_conf = format!("{}/{}.conf", services::nginx::sites_dir(), body.domain);
     let content = std::fs::read_to_string(&site_conf)
         .map_err(|_| api_err(StatusCode::NOT_FOUND, "Site config not found"))?;
 
@@ -1317,7 +1558,7 @@ async fn list_aliases(Path(domain): Path<String>) -> Result<Json<serde_json::Val
     if !super::is_valid_domain(&domain) {
         return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
-    let site_conf = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    let site_conf = format!("{}/{domain}.conf", services::nginx::sites_dir());
     let content = std::fs::read_to_string(&site_conf).unwrap_or_default();
 
     let mut aliases: Vec<String> = Vec::new();
@@ -1360,7 +1601,7 @@ async fn remove_alias(
         return Err(api_err(StatusCode::BAD_REQUEST, "Alias required"));
     }
 
-    let site_conf = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    let site_conf = format!("{}/{domain}.conf", services::nginx::sites_dir());
     let content = std::fs::read_to_string(&site_conf)
         .map_err(|_| api_err(StatusCode::NOT_FOUND, "Site config not found"))?;
 
@@ -1547,6 +1788,141 @@ async fn site_stats(Path(domain): Path<String>) -> Result<Json<serde_json::Value
     })))
 }
 
+#[derive(serde::Deserialize)]
+struct TrafficDeltaQuery {
+    last_inode: Option<u64>,
+    last_size: Option<u64>,
+}
+
+/// Extract the response-size field from one `combined`-format access-log line
+/// (`... "METHOD /path HTTP/x.x" STATUS SIZE ...`).
+fn parse_log_line_size(line: &str) -> Option<u64> {
+    let rest = line.split("\" ").nth(1)?;
+    rest.split_whitespace().nth(1)?.parse::<u64>().ok()
+}
+
+/// Read `path` starting at byte offset `from`, sum the response-size field of
+/// every COMPLETE line found, and return `(bytes_summed, new_offset)`.
+///
+/// `new_offset` only advances to the last `\n` actually present in what was
+/// read — never to whatever `tail` happened to return. nginx can still be
+/// mid-write on the final line when this runs; a partial line's bytes are left
+/// unconsumed so the NEXT poll re-reads it complete, rather than this poll
+/// parsing a truncated size field (which is the number being summed, so a
+/// truncated one corrupts the total, not just under-counts a request) and then
+/// permanently skipping past it.
+async fn read_and_advance(path: &str, from: u64) -> (u64, u64) {
+    let output = match safe_command("tail")
+        .args(["-c", &format!("+{}", from + 1), path])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return (0, from),
+    };
+    let bytes = &output.stdout;
+    let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') else {
+        return (0, from);
+    };
+    let complete = &bytes[..=last_nl];
+    let sum: u64 = String::from_utf8_lossy(complete)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(parse_log_line_size)
+        .sum();
+    (sum, from + complete.len() as u64)
+}
+
+/// GET /nginx/site-traffic-delta/{domain}?last_inode=&last_size= — bytes
+/// transferred since the caller's last checkpoint, crossing a log rotation if
+/// one happened in between.
+///
+/// Stateless by design (mirrors `site_stats`): the caller (the backend's
+/// `traffic_accounting_scheduler`) owns the checkpoint and persists it
+/// centrally, because the agent itself has no durable store that survives a
+/// restart or reinstall. `last_inode`/`last_size` absent means "first poll ever
+/// for this site" — nothing to diff against, so this reads whatever the CURRENT
+/// file holds (bounded to at most today's traffic, since the file rotates
+/// daily) rather than reaching into rotated history no checkpoint ever priced in.
+///
+/// Only ONE rotation is reconciled per call. `delaycompress` keeps the
+/// just-rotated file plain-text as `.1` for one more rotation cycle (about a
+/// day) — long enough for any reasonable poll interval — but if the caller goes
+/// quiet for longer than that, the tail end of whatever rotated out from under
+/// it is dropped rather than guessed at from `.2.gz` onward: an inode neither
+/// the current file nor `.1` matches isn't "rotated once", it's "rotated an
+/// unknown number of times", and reconstructing that from compressed history
+/// for a byte-accounting feature would manufacture a number that looks precise
+/// and isn't.
+async fn site_traffic_delta(
+    Path(domain): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<TrafficDeltaQuery>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !super::is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let log_file = format!("/var/log/nginx/{domain}.access.log");
+
+    use std::os::unix::fs::MetadataExt;
+    let cur_inode = match std::fs::metadata(&log_file) {
+        Ok(m) => m.ino(),
+        Err(_) => {
+            return Ok(Json(serde_json::json!({
+                "inode": 0, "size": 0, "delta_bytes": 0, "rotated": false,
+            })));
+        }
+    };
+
+    let (delta, new_offset, rotated) = match q.as_pair() {
+        Some((last_inode, last_size)) if last_inode == cur_inode => {
+            let (d, off) = read_and_advance(&log_file, last_size).await;
+            (d, off, false)
+        }
+        Some((last_inode, last_size)) => {
+            // Inode changed: rotation happened. The rotated predecessor lives at
+            // `.1` (uncompressed — delaycompress) as long as this poll lands
+            // within one rotation cycle of the previous one.
+            let mut carried = 0u64;
+            let rotated_file = format!("/var/log/nginx/{domain}.access.log.1");
+            // If `.1`'s inode doesn't match, it has already rotated again
+            // (missed more than one cycle) — the tail from the old checkpoint
+            // is unrecoverable, by design (see the doc comment above).
+            if let Ok(rmeta) = std::fs::metadata(&rotated_file)
+                && rmeta.ino() == last_inode
+            {
+                let (d, _) = read_and_advance(&rotated_file, last_size).await;
+                carried = d;
+            }
+            // The new current file is entirely unaccounted for — read it whole.
+            let (d2, off2) = read_and_advance(&log_file, 0).await;
+            (carried + d2, off2, true)
+        }
+        None => {
+            // First poll ever for this site: no checkpoint to diff against.
+            let (d, off) = read_and_advance(&log_file, 0).await;
+            (d, off, false)
+        }
+    };
+
+    Ok(Json(serde_json::json!({
+        "inode": cur_inode,
+        "size": new_offset,
+        "delta_bytes": delta,
+        "rotated": rotated,
+    })))
+}
+
+// Local helper: `Option<(u64, u64)>` from the two independently-optional query
+// params — either both are present (a real checkpoint) or the caller has none.
+impl TrafficDeltaQuery {
+    fn as_pair(&self) -> Option<(u64, u64)> {
+        match (self.last_inode, self.last_size) {
+            (Some(i), Some(s)) => Some((i, s)),
+            _ => None,
+        }
+    }
+}
+
 /// GET /nginx/php-errors/{domain} — Get PHP-FPM error log for a site.
 async fn php_errors(
     Path(domain): Path<String>,
@@ -1602,35 +1978,33 @@ async fn clone_site(Json(body): Json<CloneRequest>) -> Result<Json<serde_json::V
     if body.source_domain.is_empty() || body.target_domain.is_empty() {
         return Err(api_err(StatusCode::BAD_REQUEST, "Source and target domains required"));
     }
+    if !is_valid_domain(&body.source_domain) || !is_valid_domain(&body.target_domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
 
-    let source_dir = format!("/var/www/{}", body.source_domain);
     let target_dir = format!("/var/www/{}", body.target_domain);
 
-    if !std::path::Path::new(&source_dir).exists() {
-        return Err(api_err(StatusCode::NOT_FOUND, "Source site directory not found"));
-    }
-
-    // Create target directory
-    tokio::fs::create_dir_all(&target_dir).await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create directory: {e}")))?;
-
-    // Copy files using rsync (preserves permissions, faster than cp -r)
-    let output = tokio::time::timeout(
+    // The actual copy — source-existence check, target dir creation, `rsync -a
+    // --delete`, and the www-data/`.git` ownership fixup — lives in
+    // `services::staging::clone_files`, which also backs `POST /staging/clone`.
+    // This used to be a second, inline copy of that same logic; the 300s cap
+    // stays here as the request-level SLA guard it's always been. `is_valid_domain`
+    // above is strictly narrower than `clone_files`'s own internal domain check
+    // (it requires dotted, length-capped labels), so anything that reaches this
+    // point already satisfies `clone_files`'s validation too.
+    tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("rsync")
-            .args(["-a", "--delete", &format!("{source_dir}/"), &format!("{target_dir}/")])
-            .output()
+        services::staging::clone_files(&body.source_domain, &body.target_domain),
     ).await
         .map_err(|_| api_err(StatusCode::GATEWAY_TIMEOUT, "Clone timed out (300s)"))?
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("rsync failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Clone failed: {stderr}")));
-    }
-
-    // Fix ownership
-    let _ = safe_command("chown").args(["-R", "www-data:www-data", &target_dir]).output().await;
+        .map_err(|e| {
+            let status = if e.contains("directory not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            api_err(status, &e)
+        })?;
 
     // Get size
     let du_output = safe_command("du").args(["-sb", &target_dir]).output().await;
@@ -1647,7 +2021,10 @@ async fn clone_site(Json(body): Json<CloneRequest>) -> Result<Json<serde_json::V
 // ──────────────────────────────────────────────────────────────
 
 /// GET /nginx/env/{domain} — Read .env file for a site.
-async fn get_env(Path(domain): Path<String>) -> Json<serde_json::Value> {
+async fn get_env(Path(domain): Path<String>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
     let env_path = format!("/var/www/{domain}/.env");
     let content = std::fs::read_to_string(&env_path).unwrap_or_default();
 
@@ -1661,11 +2038,14 @@ async fn get_env(Path(domain): Path<String>) -> Json<serde_json::Value> {
         })
         .collect();
 
-    Json(serde_json::json!({ "vars": vars, "raw": content }))
+    Ok(Json(serde_json::json!({ "vars": vars, "raw": content })))
 }
 
 /// PUT /nginx/env/{domain} — Write .env file for a site.
 async fn set_env(Path(domain): Path<String>, Json(body): Json<serde_json::Value>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
     let vars = body.get("vars").and_then(|v| v.as_array());
 
     let content = match vars {
@@ -1707,8 +2087,7 @@ async fn disable_site(Path(domain): Path<String>) -> Result<Json<serde_json::Val
     if !is_valid_domain(&domain) {
         return Err((StatusCode::BAD_REQUEST, "Invalid domain".into()));
     }
-    let conf_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
-    let backup_path = format!("/etc/nginx/sites-available/{domain}.conf.disabled");
+    let (conf_path, backup_path) = services::nginx::vhost_paths(&domain);
 
     // Check config exists
     if !std::path::Path::new(&conf_path).exists() {
@@ -1716,15 +2095,24 @@ async fn disable_site(Path(domain): Path<String>) -> Result<Json<serde_json::Val
     }
 
     // Back up the current config
+    let live = std::fs::read_to_string(&conf_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Read config: {e}")))?;
     std::fs::copy(&conf_path, &backup_path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Backup config: {e}")))?;
+
+    // The maintenance response has to answer where the SITE answered. Naming the
+    // addresses here instead of taking them from the body being parked is what
+    // made disabling a site do nothing at all on any install whose panel knows
+    // its own address — see `services::nginx::listener_lines`.
+    let mut listeners = services::nginx::listener_lines(&live);
+    if listeners.trim().is_empty() {
+        listeners = "    listen 80;\n    listen [::]:80;\n".to_string();
+    }
 
     // Write a 503 maintenance page config
     let disabled_conf = format!(
         r#"server {{
-    listen 80;
-    listen [::]:80;
-    server_name {domain} www.{domain};
+{listeners}    server_name {domain} www.{domain};
     return 503;
     error_page 503 @maintenance;
     location @maintenance {{
@@ -1756,15 +2144,28 @@ async fn enable_site(Path(domain): Path<String>) -> Result<Json<serde_json::Valu
     if !is_valid_domain(&domain) {
         return Err((StatusCode::BAD_REQUEST, "Invalid domain".into()));
     }
-    let conf_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
-    let backup_path = format!("/etc/nginx/sites-available/{domain}.conf.disabled");
+    let (conf_path, backup_path) = services::nginx::vhost_paths(&domain);
 
     // Restore the backed-up config
     if !std::path::Path::new(&backup_path).exists() {
         return Err((StatusCode::NOT_FOUND, format!("No disabled config backup for {domain}")));
     }
 
-    std::fs::copy(&backup_path, &conf_path)
+    // The backup holds the body as it was when the site was disabled. For a site
+    // switched php→static under v2.67.0 and disabled before the operator upgraded,
+    // that is the UNPATCHED body — and the startup retrofit cannot reach it: it
+    // scans sites-enabled for `*.conf`, while this is `*.conf.disabled` in
+    // sites-available, failing both tests. A plain copy therefore re-arms the
+    // disclosure v2.68.0 shipped for, at the exact moment the body goes back into
+    // service. Patch on the way in: restoring is the only path by which a disabled
+    // body is ever served, so this is where that population is reachable.
+    let backup = std::fs::read_to_string(&backup_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Read disabled config: {e}")))?;
+    let patched = services::nginx::patch_static_vhost(&backup);
+    if patched.is_some() {
+        tracing::info!("Retrofitted static denies onto {domain} while re-enabling it");
+    }
+    std::fs::write(&conf_path, patched.as_deref().unwrap_or(&backup))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Restore config: {e}")))?;
     std::fs::remove_file(&backup_path).ok();
 
@@ -2209,7 +2610,17 @@ async fn optimize_images(
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid domain"}))));
     }
 
-    let site_dir = format!("/var/www/{domain}/public");
+    // Where this site's files actually are. node/python/proxy serve from the site
+    // root; static and php nest under `public/`. This hardcoded `public/`, which
+    // for a node or python site is not where the images are — and before v2.123.0
+    // that directory existed and was empty (`create_app_service` made it), so the
+    // WebP/AVIF buttons reported a clean run over zero files rather than failing.
+    // An absent `runtime` means an older backend, and keeps the previous behaviour.
+    let runtime = body.get("runtime").and_then(|v| v.as_str());
+    let site_dir = crate::services::nginx::document_root_for(
+        &format!("/var/www/{domain}"),
+        runtime.unwrap_or("static"),
+    );
     if !std::path::Path::new(&site_dir).exists() {
         return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site directory not found"}))));
     }
@@ -2371,10 +2782,131 @@ pub fn router() -> Router<AppState> {
         // Site Logs & Stats
         .route("/nginx/site-logs/{domain}", get(site_logs))
         .route("/nginx/site-stats/{domain}", get(site_stats))
+        .route("/nginx/site-traffic-delta/{domain}", get(site_traffic_delta))
         .route("/nginx/last-activity/{domain}", get(last_activity))
         .route("/nginx/php-errors/{domain}", get(php_errors))
         // Site Cloning
         .route("/nginx/clone-site", post(clone_site))
         // Environment Variables
         .route("/nginx/env/{domain}", get(get_env).put(set_env))
+}
+
+#[cfg(test)]
+mod traffic_delta_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn parse_log_line_size_extracts_the_response_size_field() {
+        let line = r#"1.2.3.4 - - [08/Sep/2026:10:00:00 +0000] "GET /index.html HTTP/1.1" 200 4521 "-" "curl/8.0""#;
+        assert_eq!(parse_log_line_size(line), Some(4521));
+    }
+
+    #[test]
+    fn parse_log_line_size_rejects_a_line_with_no_quoted_request() {
+        assert_eq!(parse_log_line_size("not a log line"), None);
+    }
+
+    #[test]
+    fn parse_log_line_size_rejects_a_non_numeric_size_field() {
+        let line = r#"1.2.3.4 - - [x] "GET / HTTP/1.1" 200 not-a-number "-" "-""#;
+        assert_eq!(parse_log_line_size(line), None);
+    }
+
+    fn write_temp(content: &[u8]) -> std::path::PathBuf {
+        // Tests run concurrently in the same process, so PID + a coarse
+        // timestamp isn't unique enough — an atomic counter is.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "dockpanel-traffic-delta-test-{}-{n}",
+            std::process::id()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content).unwrap();
+        f.sync_all().unwrap();
+        path
+    }
+
+    fn log_line(size: u64) -> String {
+        format!(
+            "1.2.3.4 - - [08/Sep/2026:10:00:00 +0000] \"GET / HTTP/1.1\" 200 {size} \"-\" \"-\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn read_and_advance_sums_complete_lines_from_the_given_offset() {
+        let l1 = log_line(100);
+        let l2 = log_line(250);
+        let content = format!("{l1}{l2}");
+        let path = write_temp(content.as_bytes());
+
+        let (sum, new_offset) = read_and_advance(path.to_str().unwrap(), 0).await;
+        assert_eq!(sum, 350);
+        assert_eq!(new_offset, content.len() as u64);
+
+        // A second read starting at the returned offset finds nothing new.
+        let (sum2, offset2) = read_and_advance(path.to_str().unwrap(), new_offset).await;
+        assert_eq!(sum2, 0);
+        assert_eq!(offset2, new_offset);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn read_and_advance_only_counts_bytes_after_the_given_offset() {
+        let l1 = log_line(100);
+        let l2 = log_line(250);
+        let content = format!("{l1}{l2}");
+        let path = write_temp(content.as_bytes());
+
+        // Simulate having already consumed the first line.
+        let (sum, new_offset) = read_and_advance(path.to_str().unwrap(), l1.len() as u64).await;
+        assert_eq!(sum, 250);
+        assert_eq!(new_offset, content.len() as u64);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn read_and_advance_leaves_a_partial_trailing_line_unconsumed() {
+        let complete = log_line(100);
+        // No trailing newline: nginx caught mid-write.
+        let partial = r#"5.6.7.8 - - [x] "GET /still-writing HTTP/1.1" 200 99"#;
+        let content = format!("{complete}{partial}");
+        let path = write_temp(content.as_bytes());
+
+        let (sum, new_offset) = read_and_advance(path.to_str().unwrap(), 0).await;
+        // Only the complete line is counted...
+        assert_eq!(sum, 100);
+        // ...and the offset stops right after it, NOT at end-of-file — so the
+        // partial line's bytes are re-read (and get counted) once it's finished.
+        assert_eq!(new_offset, complete.len() as u64);
+        assert!(new_offset < content.len() as u64);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn read_and_advance_on_a_missing_file_returns_zero_and_the_same_offset() {
+        let (sum, offset) = read_and_advance("/nonexistent/dockpanel-test-path.log", 42).await;
+        assert_eq!(sum, 0);
+        assert_eq!(offset, 42);
+    }
+
+    #[test]
+    fn traffic_delta_query_as_pair_requires_both_fields() {
+        assert_eq!(
+            TrafficDeltaQuery { last_inode: Some(1), last_size: Some(2) }.as_pair(),
+            Some((1, 2))
+        );
+        assert_eq!(
+            TrafficDeltaQuery { last_inode: Some(1), last_size: None }.as_pair(),
+            None
+        );
+        assert_eq!(
+            TrafficDeltaQuery { last_inode: None, last_size: None }.as_pair(),
+            None
+        );
+    }
 }

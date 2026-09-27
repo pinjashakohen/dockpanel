@@ -6,7 +6,7 @@ use axum::{
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::auth::{AuthUser, ServerScope};
+use crate::auth::{AuthUser, Claims};
 use crate::error::{internal_error, err, agent_error, paginate, ApiError};
 use crate::routes::sites::ProvisionStep;
 use crate::services::activity;
@@ -32,18 +32,13 @@ pub struct Backup {
     pub databases_expected: i32,
 }
 
-/// Verify site ownership, return domain.
-async fn get_site_domain(state: &AppState, site_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(site_id)
-            .bind(user_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("unknown", e))?;
-
-    row.map(|(d,)| d)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))
+/// Helper: resolve a site this caller may act on, and return its domain.
+///
+/// One line over [`crate::helpers::site_domain_for_caller`], which is shared with
+/// the five other modules that each carried their own copy of this query. The
+/// rules — including why only the admin arm is scoped by server — live there.
+async fn get_site_domain(state: &AppState, site_id: Uuid, claims: &Claims) -> Result<String, ApiError> {
+    crate::helpers::site_domain_for_caller(state, site_id, claims).await
 }
 
 /// The databases attached to a site, ready to hand to the agent.
@@ -65,7 +60,7 @@ impl SiteDatabases {
 ///
 /// The agent has no access to the `databases` table, so this is the only place
 /// that can answer "what does backing up this site actually involve?".
-async fn site_databases(state: &AppState, site_id: Uuid) -> SiteDatabases {
+pub(crate) async fn site_databases(state: &AppState, site_id: Uuid) -> SiteDatabases {
     site_database_specs(&state.db, &state.config.jwt_secret, site_id).await
 }
 
@@ -132,9 +127,8 @@ pub async fn create(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let backup_id = Uuid::new_v4();
 
@@ -156,6 +150,7 @@ pub async fn create(
     let user_id = claims.sub;
     let email = claims.email.clone();
     let domain_clone = domain.clone();
+    let key_id = claims.key_id;
 
     tokio::spawn(async move {
         let emit = |step: &str, label: &str, status: &str, msg: Option<String>| {
@@ -196,10 +191,22 @@ pub async fn create(
 
                 // Feature 13: Backup integrity chain — compute hash and link to previous
                 let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let previous_hash: Option<String> = match sqlx::query_scalar(
+                // `::<_, Option<String>>` is load-bearing: sha256_hash is NULLABLE, so
+                // decoding it as a bare String turns the ordinary "predecessor has no
+                // hash" case into a decode ERROR — which this arm then reported as
+                // `DB error fetching previous backup hash`, blaming the database for a
+                // column that was simply empty. Same annotation at the six sibling sites.
+                //
+                // ⚠ Do not drop it now that the unattended writers fill the column in
+                // (#114). The reason this comment used to give — "the scheduled writers
+                // leave it NULL" — is gone; the annotation is not. Every row written
+                // before v2.118.0 still has a NULL hash and it is the NEWEST of those
+                // this query hits first, and a failed `sha256sum` on the agent still
+                // writes NULL today.
+                let previous_hash: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
                     "SELECT sha256_hash FROM backups WHERE site_id = $1 ORDER BY created_at DESC LIMIT 1"
                 ).bind(id).fetch_optional(&db).await {
-                    Ok(v) => v,
+                    Ok(v) => v.flatten(),
                     Err(e) => {
                         tracing::warn!("DB error fetching previous backup hash: {e}");
                         None
@@ -266,7 +273,7 @@ pub async fn create(
                 );
                 activity::log_activity(
                     &db, user_id, &email, "backup.create",
-                    Some("backup"), Some(&domain_clone), Some(&filename), None,
+                    Some("backup"), Some(&domain_clone), Some(&filename), None, key_id,
                 ).await;
 
                 fire_event(&db, "backup.created", serde_json::json!({
@@ -302,7 +309,7 @@ pub async fn list(
     Query(params): Query<BackupListQuery>,
 ) -> Result<Json<Vec<Backup>>, ApiError> {
     // Verify ownership
-    get_site_domain(&state, id, claims.sub).await?;
+    get_site_domain(&state, id, &claims).await?;
 
     let (limit, offset) = paginate(params.limit, params.offset);
 
@@ -324,9 +331,9 @@ pub async fn restore(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path((id, backup_id)): Path<(Uuid, Uuid)>,
-    ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let backup: Backup = sqlx::query_as(
         "SELECT * FROM backups WHERE id = $1 AND site_id = $2",
@@ -359,6 +366,8 @@ pub async fn restore(
     let email = claims.email.clone();
     let domain_clone = domain.clone();
     let filename = backup.filename.clone();
+    let ip = crate::routes::client_ip(&headers);
+    let key_id = claims.key_id;
 
     tokio::spawn(async move {
         let emit = |step: &str, label: &str, status: &str, msg: Option<String>| {
@@ -434,7 +443,11 @@ pub async fn restore(
                     );
                     activity::log_activity(
                         &db, user_id, &email, "backup.restore_partial",
-                        Some("backup"), Some(&domain_clone), Some(&filename), None,
+                        Some("backup"), Some(&domain_clone), Some(&filename), ip.as_deref(), key_id,
+                    ).await;
+                    crate::services::security_hardening::audit_log(
+                        &db, "backup.restore_partial", Some(&email), ip.as_deref(),
+                        Some("backup"), Some(&domain_clone), Some(&filename), None, "warning", key_id,
                     ).await;
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&restore_id);
@@ -490,7 +503,11 @@ pub async fn restore(
                 tracing::info!("Backup restored: {filename} for {domain_clone}");
                 activity::log_activity(
                     &db, user_id, &email, "backup.restore",
-                    Some("backup"), Some(&domain_clone), Some(&filename), None,
+                    Some("backup"), Some(&domain_clone), Some(&filename), ip.as_deref(), key_id,
+                ).await;
+                crate::services::security_hardening::audit_log(
+                    &db, "backup.restore", Some(&email), ip.as_deref(),
+                    Some("backup"), Some(&domain_clone), Some(&filename), None, "info", key_id,
                 ).await;
             }
             Err(e) => {
@@ -515,9 +532,8 @@ pub async fn remove(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path((id, backup_id)): Path<(Uuid, Uuid)>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let backup: Backup = sqlx::query_as(
         "SELECT * FROM backups WHERE id = $1 AND site_id = $2",
@@ -544,78 +560,4 @@ pub async fn remove(
     tracing::info!("Backup deleted: {} for {domain}", backup.filename);
 
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-/// POST /api/sites/{id}/restic/backup — Run incremental Restic backup.
-pub async fn restic_backup(
-    State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
-
-    let result = agent
-        .post_long(
-            &format!("/backups/{}/restic/backup", domain),
-            None,
-            600,
-        )
-        .await
-        .map_err(|e| agent_error("Restic backup", e))?;
-
-    activity::log_activity(
-        &state.db, claims.sub, &claims.email,
-        "backup.restic.create", Some("site"), Some(&domain), None, None,
-    ).await;
-
-    Ok(Json(result))
-}
-
-/// GET /api/sites/{id}/restic/snapshots — List Restic snapshots.
-pub async fn restic_snapshots(
-    State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
-
-    let result = agent
-        .get(&format!("/backups/{}/restic/snapshots", domain))
-        .await
-        .map_err(|e| agent_error("Restic snapshots", e))?;
-
-    Ok(Json(result))
-}
-
-/// POST /api/sites/{id}/restic/restore/{snapshot_id} — Restore from Restic snapshot.
-pub async fn restic_restore(
-    State(state): State<AppState>,
-    AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
-    Path((id, snapshot_id)): Path<(Uuid, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
-
-    // Validate snapshot ID
-    if snapshot_id.len() < 6 || !snapshot_id.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(err(StatusCode::BAD_REQUEST, "Invalid snapshot ID"));
-    }
-
-    let result = agent
-        .post_long(
-            &format!("/backups/{}/restic/restore/{}", domain, snapshot_id),
-            None,
-            600,
-        )
-        .await
-        .map_err(|e| agent_error("Restic restore", e))?;
-
-    activity::log_activity(
-        &state.db, claims.sub, &claims.email,
-        "backup.restic.restore", Some("site"), Some(&domain), Some(&snapshot_id), None,
-    ).await;
-
-    Ok(Json(result))
 }

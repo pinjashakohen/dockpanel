@@ -46,6 +46,142 @@ pub async fn write_key_file(path: &str, content: &str) -> Result<(), String> {
     }
 }
 
+/// Normalise a DNS name for comparison: trim, drop ONE trailing root dot,
+/// lowercase. Both sides go through this — `is_valid_domain` permits uppercase,
+/// so the site's own domain needs it as much as the certificate's names do.
+fn normalise_dns_name(name: &str) -> String {
+    let n = name.trim();
+    n.strip_suffix('.').unwrap_or(n).to_ascii_lowercase()
+}
+
+/// Does one name presented by a certificate cover `domain`?
+///
+/// A wildcard covers EXACTLY ONE label and only the leftmost one, per RFC 6125.
+/// `*.example.com` covers `app.example.com` and does NOT cover
+/// `app.staging.example.com` or the bare apex. Getting this wrong in the
+/// permissive direction is what makes a panel report TLS that browsers reject;
+/// getting it wrong in the strict direction would refuse working certificates,
+/// so both halves are pinned by tests below.
+fn dns_name_covers(name: &str, domain: &str) -> bool {
+    if name == domain {
+        return true;
+    }
+    let Some(base) = name.strip_prefix("*.") else {
+        return false;
+    };
+    // `*.com` and partial wildcards (`w*.example.com`) are not names we accept.
+    if base.is_empty() || base.contains('*') || !base.contains('.') {
+        return false;
+    }
+    match domain.split_once('.') {
+        Some((label, rest)) => !label.is_empty() && !label.contains('*') && rest == base,
+        None => false,
+    }
+}
+
+/// The DNS names a parsed certificate presents.
+///
+/// The Common Name is a FALLBACK, consulted only when the certificate carries no
+/// subjectAltName extension at all — which is what every browser does, and what
+/// makes a `CN=other.example.com, SAN=real.example.com` certificate correctly
+/// refused for `other.example.com`.
+fn presented_dns_names(cert: &x509_parser::certificate::X509Certificate<'_>) -> Vec<String> {
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        let names: Vec<String> = san
+            .value
+            .general_names
+            .iter()
+            .filter_map(|gn| match gn {
+                x509_parser::extensions::GeneralName::DNSName(n) => Some(normalise_dns_name(n)),
+                _ => None,
+            })
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    cert.subject()
+        .iter_common_name()
+        .filter_map(|cn| cn.as_str().ok())
+        .map(normalise_dns_name)
+        .collect()
+}
+
+/// Check that an uploaded certificate actually names the site it is being
+/// installed for. On success returns the names it presents, so the caller can
+/// show them back to the operator.
+///
+/// Three decisions here are load-bearing and each of them is the opposite of an
+/// obvious alternative that was measured and rejected:
+///
+/// 1. **Only the FIRST `CERTIFICATE` block is asked**, because that is the one
+///    nginx binds as the leaf. Measured against nginx 1.24.0: a bundle of
+///    `[wrong.crt, right.crt]` paired with `wrong.key` passes `nginx -t` and
+///    then serves `wrong.crt`. A rule that accepted the bundle because SOME
+///    block covered the domain would wave through exactly the silent mismatch
+///    this function exists to stop.
+/// 2. **Blocks are filtered by label, and a non-certificate block is refused
+///    outright.** The certificate field was checked with a bare
+///    `contains("BEGIN CERTIFICATE")`, which a key-then-certificate paste
+///    satisfies. That paste lands in `fullchain.pem`, written with a plain
+///    `fs::write` at **0644** while the key beside it is deliberately 0600 —
+///    driven on a fresh box and confirmed. ⚠ Do NOT overstate this: the key is
+///    not actually reachable by other local accounts, because `/etc/dockpanel`
+///    and `/etc/dockpanel/ssl` are both **0700**, so traversal stops above the
+///    file. The protection comes from the directory, not from the write, and it
+///    survives only as long as that stays true. The sharper half of the same
+///    paste is that it blinds the expiry ladder: the status reader decodes the
+///    first PEM block whatever its label and gets no date out of a key, so a
+///    first upload in that shape records no expiry at all — the row the
+///    countdown, the alerts and the healer all filter OUT.
+/// 3. **There is no `is_ca()` filter.** `openssl req -x509` stamps
+///    `basicConstraints CA:TRUE` on its output, so every self-signed staging
+///    certificate is a "CA" by that test and an `is_ca()` leaf filter refuses
+///    all of them. Note for whoever writes fixtures: `rcgen` defaults to
+///    `IsCa::NoCa`, so a suite built only on rcgen defaults stays GREEN with
+///    that filter wrongly restored — one fixture below sets it by hand.
+pub fn cert_covers_domain(cert_pem: &str, domain: &str) -> Result<Vec<String>, String> {
+    let want = normalise_dns_name(domain);
+    let mut leaf: Option<Vec<String>> = None;
+
+    for block in x509_parser::pem::Pem::iter_from_buffer(cert_pem.as_bytes()) {
+        let block = block.map_err(|e| format!("the certificate could not be read: {e}"))?;
+        if block.label != "CERTIFICATE" {
+            return Err(format!(
+                "the certificate field contains a {} block. Paste only the certificate here, with \
+                 its chain if it has one — the private key belongs in its own field, where it is \
+                 stored with the permissions a key needs and where this site's expiry can still \
+                 be read.",
+                block.label.to_ascii_lowercase()
+            ));
+        }
+        if leaf.is_none() {
+            let cert = block
+                .parse_x509()
+                .map_err(|e| format!("the certificate could not be read: {e}"))?;
+            leaf = Some(presented_dns_names(&cert));
+        }
+    }
+
+    let Some(names) = leaf else {
+        return Err("no certificate was found in the certificate field.".to_string());
+    };
+
+    if names.iter().any(|n| dns_name_covers(n, &want)) {
+        return Ok(names);
+    }
+    let presented = if names.is_empty() {
+        "no host name at all".to_string()
+    } else {
+        names.join(", ")
+    };
+    Err(format!(
+        "this certificate is for {presented}, not {want}. A certificate has to name the site it \
+         secures or browsers reject it whatever the panel says — check that you pasted the \
+         certificate for {want} and not for another site."
+    ))
+}
+
 /// Options controlling an ACME order — profile selection + ARI replacement chain.
 /// `None` or all-None fields means "classic, no prior cert" (backwards-compatible).
 #[derive(Default, Clone)]
@@ -56,6 +192,18 @@ pub struct ProvisionOpts<'a> {
     /// PEM of the certificate being replaced (RFC 9773 ARI `replaces` hint).
     /// When set, the CA can correlate the renewal with the prior issuance.
     pub replaces_pem: Option<&'a str>,
+    /// Order even though the certificate already installed for this domain was
+    /// demonstrably issued by somebody else.
+    ///
+    /// ⛔ FALSE IS THE SAFE VALUE, AND ABSENT MEANS FALSE. Both writers take
+    /// `Option<&ProvisionOpts>` and several callers pass `None` — the compose
+    /// deploy, the git build. Those are exactly the callers that never asked the
+    /// issuer question, so `None` must fail CLOSED or the guard protects only
+    /// the doors that did not need it.
+    ///
+    /// Set it only where a human has been told what will be destroyed and said
+    /// yes anyway (`dockpanel ssl provision --force`).
+    pub replace_foreign: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -94,70 +242,216 @@ pub struct CertStatus {
     pub days_remaining: Option<i64>,
 }
 
-/// Load existing ACME account or create a new one.
+/// Outcome of persisting freshly-minted ACME account credentials.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Persisted {
+    /// These credentials are the ones now on disk.
+    Written,
+    /// Somebody else's credentials were already there. Ours are abandoned, and
+    /// the caller MUST adopt what is on disk instead of using what it minted.
+    Adopted,
+}
+
+/// Write account credentials only if no account file exists yet.
+///
+/// `create_new` is the whole point: the create-or-fail is atomic in the kernel,
+/// so however many writers race, exactly one is told `Written` and every other
+/// is told `Adopted`. A plain write would let the last one silently overwrite
+/// the account every earlier certificate was issued under.
+///
+/// The 0600 is applied AT CREATION rather than by a following `set_permissions`,
+/// for the reason `write_key_file` above already documents: this file is an ACME
+/// account key, so the write-then-chmod window left the credential that can
+/// order and revoke this box's certificates briefly world-readable.
+pub(crate) async fn persist_account_credentials(
+    path: &str,
+    json: &str,
+) -> Result<Persisted, String> {
+    if let Some(parent) = Path::new(path).parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // `mode` here is tokio's own inherent method on its OpenOptions, so this
+    // needs no `OpenOptionsExt` import — adding one is an unused-import warning,
+    // not a fix. The permission is asserted on the file that lands, in
+    // `the_account_file_is_owner_only_from_creation`, because reading this line
+    // cannot tell you which `mode` resolved.
+    #[cfg(unix)]
+    opts.mode(0o600);
+
+    match opts.open(path).await {
+        Ok(mut f) => {
+            use tokio::io::AsyncWriteExt;
+            f.write_all(json.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to save ACME account: {e}"))?;
+            f.flush()
+                .await
+                .map_err(|e| format!("Failed to save ACME account: {e}"))?;
+            Ok(Persisted::Written)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Persisted::Adopted),
+        Err(e) => Err(format!("Failed to save ACME account: {e}")),
+    }
+}
+
+/// Read the stored ACME account, or `None` when no account file exists.
+async fn stored_account() -> Result<Option<Account>, String> {
+    if !Path::new(ACME_ACCOUNT_PATH).exists() {
+        return Ok(None);
+    }
+    let json = tokio::fs::read_to_string(ACME_ACCOUNT_PATH)
+        .await
+        .map_err(|e| format!("Failed to read ACME account: {e}"))?;
+    let creds: AccountCredentials = serde_json::from_str(&json)
+        .map_err(|e| format!("Failed to parse ACME account: {e}"))?;
+    let account = Account::builder()
+        .map_err(|e| format!("Failed to build ACME client: {e}"))?
+        .from_credentials(creds)
+        .await
+        .map_err(|e| format!("Failed to load ACME account: {e}"))?;
+    Ok(Some(account))
+}
+
+/// Load the existing ACME account or create one.
+///
+/// ⛔ THE INVARIANT: the account handed back is ALWAYS the one whose credentials
+/// are on disk. It is not a tidiness property — a certificate issued under an
+/// account key that is nowhere on disk can never be renewed. Every renewal door
+/// attaches the prior certificate as an RFC 9773 ARI `replaces` hint, the CA
+/// answers `unauthorized` because that account did not request the certificate
+/// being replaced, and `provision_cert` has no path that retries without the
+/// hint — so the order is refused, every cycle, until the certificate expires
+/// and the site goes dark behind a panel that reported a successful issuance.
+///
+/// ⭐ HOW THAT USED TO HAPPEN, and it needed no operator mistake: this was a
+/// check-then-act with a network round trip in the middle. Two sites created
+/// together on a fresh box each spawn an auto-SSL task; both looked, both saw no
+/// account file, both created a DIFFERENT account at Let's Encrypt, and the
+/// second `write` clobbered the first. Measured on a throwaway box: two
+/// "Created new ACME account" lines 443 ms apart, after which the certificates
+/// issued inside that window answered 422 to every renewal for ever, while one
+/// issued after it renewed 200. The window is the whole account-creation round
+/// trip, and creating two sites at once is ordinary first-run behaviour.
+///
+/// Two mechanisms, because they cover different racers:
+///   1. The mutex serialises the doors inside THIS process, which is where the
+///      race actually happened — seven call sites, all of them reachable from a
+///      `tokio::spawn`.
+///   2. `create_new` covers a second process (an agent restart overlapping a
+///      running one), which no in-process lock can see. Losing that race is not
+///      an error: the loser adopts the winner's account and abandons its own.
 pub async fn load_or_create_account(email: &str) -> Result<Account, String> {
-    if Path::new(ACME_ACCOUNT_PATH).exists() {
-        let json = tokio::fs::read_to_string(ACME_ACCOUNT_PATH)
-            .await
-            .map_err(|e| format!("Failed to read ACME account: {e}"))?;
-        let creds: AccountCredentials = serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse ACME account: {e}"))?;
-        let account = Account::builder()
-            .map_err(|e| format!("Failed to build ACME client: {e}"))?
-            .from_credentials(creds)
-            .await
-            .map_err(|e| format!("Failed to load ACME account: {e}"))?;
+    // Held across the whole load-or-create, including the round trip to the CA.
+    // It is taken once per boot in practice; the cost is bounded by the very
+    // thing it prevents happening twice.
+    static ACCOUNT_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serialise = ACCOUNT_INIT.lock().await;
+
+    if let Some(account) = stored_account().await? {
         tracing::info!("Loaded existing ACME account");
-        Ok(account)
-    } else {
-        let (account, creds) = Account::builder()
-            .map_err(|e| format!("Failed to build ACME client: {e}"))?
-            .create(
-                &NewAccount {
-                    contact: &[&format!("mailto:{email}")],
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                LetsEncrypt::Production.url().to_string(),
-                None,
-            )
-            .await
-            .map_err(|e| format!("Failed to create ACME account: {e}"))?;
+        return Ok(account);
+    }
 
-        // Save credentials
-        let json = serde_json::to_string_pretty(&creds)
-            .map_err(|e| format!("Failed to serialize ACME creds: {e}"))?;
-        if let Some(parent) = Path::new(ACME_ACCOUNT_PATH).parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
+    let (account, creds) = Account::builder()
+        .map_err(|e| format!("Failed to build ACME client: {e}"))?
+        .create(
+            &NewAccount {
+                contact: &[&format!("mailto:{email}")],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            LetsEncrypt::Production.url().to_string(),
+            None,
+        )
+        .await
+        .map_err(|e| format!("Failed to create ACME account: {e}"))?;
+
+    let json = serde_json::to_string_pretty(&creds)
+        .map_err(|e| format!("Failed to serialize ACME creds: {e}"))?;
+
+    match persist_account_credentials(ACME_ACCOUNT_PATH, &json).await? {
+        Persisted::Written => {
+            tracing::info!("Created new ACME account for {email}");
+            Ok(account)
         }
-        tokio::fs::write(ACME_ACCOUNT_PATH, json)
-            .await
-            .map_err(|e| format!("Failed to save ACME account: {e}"))?;
-
-        // Restrict ACME account key permissions to owner-only (0o600)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = tokio::fs::set_permissions(
-                ACME_ACCOUNT_PATH,
-                std::fs::Permissions::from_mode(0o600),
-            ).await {
-                tracing::error!("Failed to set ACME account key permissions: {e}");
-            }
+        Persisted::Adopted => {
+            // Another PROCESS wrote first. Returning the account just minted
+            // would issue certificates under a key that is nowhere on disk,
+            // which is precisely the defect this function was rewritten to
+            // remove — so adopt the stored one and let ours go unused.
+            tracing::warn!(
+                "An ACME account was written by another process first — adopting it and \
+                 abandoning the one just created, so every certificate is issued under the \
+                 account whose key is on disk"
+            );
+            stored_account().await?.ok_or_else(|| {
+                "ACME account file disappeared between creation and read".to_string()
+            })
         }
-
-        tracing::info!("Created new ACME account for {email}");
-        Ok(account)
     }
 }
 
 /// Provision a Let's Encrypt certificate for a domain using HTTP-01 challenge.
+/// Marks an error the CERTIFICATE AUTHORITY produced, as opposed to one this
+/// machine produced.
+///
+/// The two are worth telling apart because only one of them is the operator's to
+/// act on. A rejected challenge, a rate limit, an order the CA will not accept —
+/// those are answers, and repeating them to the operator is useful. A full disk
+/// or an unwritable directory here is an agent fault, and describing it as
+/// anything the CA said would be a lie in the one direction that matters: it
+/// sends somebody to check their DNS while their server is out of space.
+///
+/// ⚠ Marked POSITIVELY, and everything unmarked is treated as local. A new arm
+/// added below therefore defaults to "this machine's fault", which keeps its
+/// incident id — the safe direction. The inverse default would quietly hand
+/// every future error to the operator as though the CA had spoken.
+pub const CA_DECLINED: &str = "[ca] ";
+
+/// The same idea for the OTHER party the DNS-01 door talks to.
+///
+/// `provision_cert_dns01` has three ways to fail, not two: the CA can decline,
+/// this machine can break, and — uniquely on this door — the DNS provider can
+/// refuse. A token without `DNS:Edit` is the commonest real failure here, and it
+/// is the operator's to fix, so hiding it behind an incident id wastes the one
+/// sentence that would have helped. But it is NOT something the CA said, and
+/// marking it `CA_DECLINED` would make the panel attribute Cloudflare's refusal
+/// to Let's Encrypt — a lie about who declined, in a message written to be
+/// trusted.
+///
+/// ⚠ Marked POSITIVELY, exactly like [`CA_DECLINED`]: an arm added below with no
+/// marker defaults to "this machine's fault" and keeps its incident id.
+pub const DNS_PROVIDER_DECLINED: &str = "[dns] ";
+
+/// A refusal, not a fault — the third thing an ACME order can end as.
+///
+/// ⛔ WITHOUT THIS MARKER THE SENTENCE IS THROWN AWAY. Everything unlabelled
+/// leaves this crate as a 500, and the panel hides every agent 5xx behind an
+/// incident id — correctly, because an unlabelled 500 really is an internal
+/// fault nobody outside can act on. But "somebody else's certificate is
+/// installed here and I will not overwrite it" is the most actionable message
+/// this door produces, and answering it with a reference number is precisely the
+/// outcome this guard exists to improve on.
+pub const FOREIGN_CERT_REFUSED: &str = "[foreign] ";
+
 pub async fn provision_cert(
     account: &Account,
     domain: &str,
     opts: Option<&ProvisionOpts<'_>>,
 ) -> Result<CertInfo, String> {
     tracing::info!("Provisioning SSL for {domain}");
+
+    // ⛔ THE CHOKE POINT. Asked before the order, not after, because the damage is
+    //    done by the write below and a refused order costs nothing.
+    if !opts.map(|o| o.replace_foreign).unwrap_or(false) {
+        if let Some(issuer) = foreign_installed_issuer(domain).await {
+            tracing::warn!("Refusing ACME order for {domain}: installed certificate is from {issuer}");
+            return Err(foreign_cert_refusal(domain, &issuer));
+        }
+    }
 
     // Create order with optional profile + ARI replaces hint
     let identifier = Identifier::Dns(domain.to_string());
@@ -178,25 +472,25 @@ pub async fn provision_cert(
     let mut order = account
         .new_order(&new_order)
         .await
-        .map_err(|e| format!("Failed to create ACME order: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA refused the certificate order: {e}"))?;
 
     let state = order.state();
     let needs_challenge = matches!(state.status, OrderStatus::Pending);
 
     if !needs_challenge && !matches!(state.status, OrderStatus::Ready) {
-        return Err(format!("Unexpected order status: {:?}", state.status));
+        return Err(format!("{CA_DECLINED}The CA returned an unexpected order status: {:?}", state.status));
     }
 
     if needs_challenge {
         // Get authorizations and solve HTTP-01 challenge
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
-            let mut authz = result.map_err(|e| format!("Failed to get authorization: {e}"))?;
+            let mut authz = result.map_err(|e| format!("{CA_DECLINED}The CA would not return an authorization: {e}"))?;
 
             match authz.status {
                 AuthorizationStatus::Valid => continue,
                 AuthorizationStatus::Pending => {}
-                status => return Err(format!("Unexpected authorization status: {status:?}")),
+                status => return Err(format!("{CA_DECLINED}The CA returned an unexpected authorization status: {status:?}")),
             }
 
             let mut challenge = authz
@@ -222,7 +516,7 @@ pub async fn provision_cert(
             challenge
                 .set_ready()
                 .await
-                .map_err(|e| format!("Failed to set challenge ready: {e}"))?;
+                .map_err(|e| format!("{CA_DECLINED}The CA would not accept the challenge as ready: {e}"))?;
         }
     }
 
@@ -233,19 +527,19 @@ pub async fn provision_cert(
     order
         .poll_ready(&RetryPolicy::new().timeout(timeout))
         .await
-        .map_err(|e| format!("Order not ready: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA did not validate the challenge: {e}"))?;
 
     // Finalize — generates CSR internally and returns private key PEM
     let private_key_pem = order
         .finalize()
         .await
-        .map_err(|e| format!("Failed to finalize order: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA would not finalize the order: {e}"))?;
 
     // Poll for certificate
     let cert_chain_pem = order
         .poll_certificate(&RetryPolicy::new().timeout(timeout))
         .await
-        .map_err(|e| format!("Failed to get certificate: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA would not hand back the certificate: {e}"))?;
 
     // Save certificate and private key
     let cert_dir = format!("{SSL_DIR}/{domain}");
@@ -297,6 +591,19 @@ pub async fn provision_cert_dns01(
     let label = if wildcard { "wildcard" } else { "dns01" };
     tracing::info!("Provisioning SSL ({label}) for {domain}");
 
+    // ⛔ THE CHOKE POINT, and this writer needs it MORE than its sibling. For a
+    //    wildcard the caller hands us the zone APEX, and the apex directory is
+    //    what every sibling vhost in that zone points at — so an unguarded order
+    //    here replaces one certificate and takes an unbounded number of sites
+    //    with it. `domain` is both what we check and what we write, by
+    //    construction, so the two can never name different files.
+    if !opts.map(|o| o.replace_foreign).unwrap_or(false) {
+        if let Some(issuer) = foreign_installed_issuer(domain).await {
+            tracing::warn!("Refusing ACME {label} order for {domain}: installed certificate is from {issuer}");
+            return Err(foreign_cert_refusal(domain, &issuer));
+        }
+    }
+
     // Build identifiers
     let mut ids = vec![Identifier::Dns(domain.to_string())];
     if wildcard {
@@ -319,11 +626,11 @@ pub async fn provision_cert_dns01(
     let mut order = account
         .new_order(&new_order)
         .await
-        .map_err(|e| format!("ACME order: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA refused the certificate order: {e}"))?;
 
     let state = order.state();
     if !matches!(state.status, OrderStatus::Pending | OrderStatus::Ready) {
-        return Err(format!("Unexpected order status: {:?}", state.status));
+        return Err(format!("{CA_DECLINED}The CA returned an unexpected order status: {:?}", state.status));
     }
 
     // Build Cloudflare client
@@ -334,12 +641,24 @@ pub async fn provision_cert_dns01(
     let cf_api = "https://api.cloudflare.com/client/v4";
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(email) = cf_api_email {
-        headers.insert("X-Auth-Email", email.parse().map_err(|_| "Invalid CF email")?);
-        headers.insert("X-Auth-Key", cf_api_token.parse().map_err(|_| "Invalid CF token")?);
+        headers.insert(
+            "X-Auth-Email",
+            email.parse().map_err(|_| {
+                format!("{DNS_PROVIDER_DECLINED}The Cloudflare account email for this zone is not a usable header value")
+            })?,
+        );
+        headers.insert(
+            "X-Auth-Key",
+            cf_api_token.parse().map_err(|_| {
+                format!("{DNS_PROVIDER_DECLINED}The Cloudflare API key for this zone is not a usable header value")
+            })?,
+        );
     } else {
         headers.insert(
             "Authorization",
-            format!("Bearer {cf_api_token}").parse().map_err(|_| "Invalid CF token")?,
+            format!("Bearer {cf_api_token}").parse().map_err(|_| {
+                format!("{DNS_PROVIDER_DECLINED}The Cloudflare API token for this zone is not a usable header value")
+            })?,
         );
     }
 
@@ -352,7 +671,7 @@ pub async fn provision_cert_dns01(
                 Ok(a) => a,
                 Err(e) => {
                     cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
-                    return Err(format!("Authorization: {e}"));
+                    return Err(format!("{CA_DECLINED}The CA would not return an authorization: {e}"));
                 }
             };
 
@@ -361,7 +680,7 @@ pub async fn provision_cert_dns01(
                 AuthorizationStatus::Pending => {}
                 status => {
                     cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
-                    return Err(format!("Auth status: {status:?}"));
+                    return Err(format!("{CA_DECLINED}The CA returned an unexpected authorization status: {status:?}"));
                 }
             }
 
@@ -369,9 +688,9 @@ pub async fn provision_cert_dns01(
                 Some(c) => c,
                 None => {
                     cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
-                    return Err(
-                        "No DNS-01 challenge (Let's Encrypt may require HTTP-01 for this domain)".to_string(),
-                    );
+                    return Err(format!(
+                        "{CA_DECLINED}The CA offered no DNS-01 challenge for this domain"
+                    ));
                 }
             };
 
@@ -397,7 +716,7 @@ pub async fn provision_cert_dns01(
                 Ok(r) => r,
                 Err(e) => {
                     cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
-                    return Err(format!("CF create TXT: {e}"));
+                    return Err(format!("{DNS_PROVIDER_DECLINED}Cloudflare could not be reached to publish the challenge record: {e}"));
                 }
             };
 
@@ -405,14 +724,14 @@ pub async fn provision_cert_dns01(
                 Ok(j) => j,
                 Err(e) => {
                     cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
-                    return Err(format!("CF parse: {e}"));
+                    return Err(format!("{DNS_PROVIDER_DECLINED}Cloudflare returned a response that could not be read: {e}"));
                 }
             };
 
             if resp_json.get("success").and_then(|v| v.as_bool()) != Some(true) {
                 cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
                 let errs = resp_json.get("errors").cloned().unwrap_or_default();
-                return Err(format!("CF TXT create failed: {errs}"));
+                return Err(format!("{DNS_PROVIDER_DECLINED}Cloudflare refused to create the challenge record: {errs}"));
             }
 
             if let Some(rid) = resp_json.pointer("/result/id").and_then(|v| v.as_str()) {
@@ -424,7 +743,7 @@ pub async fn provision_cert_dns01(
 
             if let Err(e) = challenge.set_ready().await {
                 cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
-                return Err(format!("Challenge ready: {e}"));
+                return Err(format!("{CA_DECLINED}The CA would not accept the challenge as ready: {e}"));
             }
         }
     }
@@ -437,18 +756,18 @@ pub async fn provision_cert_dns01(
     // Always clean up TXT records
     cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
 
-    poll_result.map_err(|e| format!("Order not ready: {e}"))?;
+    poll_result.map_err(|e| format!("{CA_DECLINED}The CA did not validate the DNS-01 challenge: {e}"))?;
 
     // Finalize
     let private_key_pem = order
         .finalize()
         .await
-        .map_err(|e| format!("Finalize: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA would not finalize the order: {e}"))?;
 
     let cert_chain_pem = order
         .poll_certificate(&RetryPolicy::new().timeout(timeout))
         .await
-        .map_err(|e| format!("Certificate fetch: {e}"))?;
+        .map_err(|e| format!("{CA_DECLINED}The CA would not hand back the certificate: {e}"))?;
 
     // Save cert (use base domain for directory)
     let cert_dir = format!("{SSL_DIR}/{domain}");
@@ -502,6 +821,70 @@ async fn get_cert_expiry(cert_path: &str) -> Option<String> {
 }
 
 /// Get SSL certificate status for a domain.
+/// The issuer of the certificate installed for `domain`, but ONLY when that
+/// issuer proves DockPanel did not put it there.
+///
+/// ⛔ THIS IS THE LAST GATE BEFORE AN ACME ORDER OVERWRITES A FILE. It is placed
+/// at the two write primitives rather than at their callers because the callers
+/// are not a list anybody can keep: twenty-six reachable call sites across the
+/// panel, the CLI, git deploys, template apps and Compose stacks reach these two
+/// functions, and before v2.162.0 exactly three of them asked this question. A
+/// per-caller guard is a census that goes stale the next time somebody adds a
+/// deploy path — which is how the Compose-stack door shipped without one.
+///
+/// ⭐ And unlike a caller-side guard, this one cannot end up asking about a
+/// different file than the one it protects: `get_cert_status` reads
+/// `{SSL_DIR}/{domain}/fullchain.pem`, which is the exact path both writers
+/// write, from the same `domain` binding. The panel's DNS-01 renewal guard has
+/// precisely that bug — it asks about the site's own name while the wildcard
+/// branch writes the zone apex.
+///
+/// ⚠ Returns `None` for "we do not know" as well as for "ours" — no certificate
+/// yet, an unreadable file, an issuer the parser could not produce. Every caller
+/// must treat `None` as PERMISSION TO PROCEED, because the alternative is
+/// refusing to issue because a file was briefly unreadable, and that ends in a
+/// site with no certificate at all. We act only on a positive identification.
+///
+/// ⛔ MIRRORS `panel/backend/src/helpers.rs::cert_provenance`, and cannot import
+/// it — the agent and the panel are separate crates with no shared dependency.
+/// Both spellings of the CA's name are deliberate there and deliberate here: the
+/// apostrophe is a typographic hazard, not a fact about the CA, and an issuer
+/// string that lost it must not read as foreign.
+pub async fn foreign_installed_issuer(domain: &str) -> Option<String> {
+    foreign_issuer_of(&get_cert_status(domain).await)
+}
+
+/// The decision itself, over a status the caller already holds.
+///
+/// Split out from the read for the same reason the panel splits
+/// `cert_provenance` from `foreign_cert_issuer`: this is the half that decides
+/// whether a file gets destroyed, and a decision that can only be exercised by
+/// putting a real certificate on a real disk is a decision nothing tests.
+pub(crate) fn foreign_issuer_of(status: &CertStatus) -> Option<String> {
+    if !status.has_cert {
+        return None;
+    }
+    let issuer = status.issuer.as_deref().map(str::trim).unwrap_or("");
+    if issuer.is_empty() {
+        return None;
+    }
+    let lowered = issuer.to_ascii_lowercase();
+    if lowered.contains("let's encrypt") || lowered.contains("lets encrypt") {
+        return None;
+    }
+    Some(issuer.to_string())
+}
+
+/// The refusal an ACME order earns when it would replace somebody else's
+/// certificate. One spelling, so both writers say the same thing.
+fn foreign_cert_refusal(domain: &str, issuer: &str) -> String {
+    format!(
+        "{FOREIGN_CERT_REFUSED}Refusing to issue a Let's Encrypt certificate for {domain}: the certificate already \
+         installed there was issued by {issuer}, not by DockPanel, and ordering would overwrite \
+         it. Renew it wherever it was issued, or pass --force if you intend to replace it."
+    )
+}
+
 pub async fn get_cert_status(domain: &str) -> CertStatus {
     let cert_path = format!("{SSL_DIR}/{domain}/fullchain.pem");
 
@@ -545,6 +928,46 @@ pub async fn get_cert_status(domain: &str) -> CertStatus {
     }
 }
 
+/// Every certificate this host actually holds, whether the panel issued it or not.
+///
+/// The diagnostics scanner has always walked this directory — that is where
+/// "SSL certificate expiring soon: {domain}" comes from — but nothing else could
+/// enumerate it, so the panel could raise a finding about a certificate it was
+/// unable to list anywhere. An administrator was told to fix something no screen
+/// could show them.
+///
+/// Deliberately reports what is on DISK and nothing else: whether a certificate
+/// belongs to a site, who owns it, and whether it can be renewed here are all
+/// questions the agent has no database to answer. It lists; the panel decides.
+pub async fn list_cert_status() -> Vec<CertStatus> {
+    let mut out = Vec::new();
+
+    let mut entries = match tokio::fs::read_dir(SSL_DIR).await {
+        Ok(e) => e,
+        // No directory means no certificates, which is an empty list and not an
+        // error — a fresh box has never issued one.
+        Err(_) => return out,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let domain = entry.file_name().to_string_lossy().to_string();
+        // The ACME account material lives beside the certificates and is not one.
+        if domain.starts_with('.') {
+            continue;
+        }
+        let status = get_cert_status(&domain).await;
+        if status.has_cert {
+            out.push(status);
+        }
+    }
+
+    out.sort_by(|a, b| a.domain.cmp(&b.domain));
+    out
+}
+
 /// Regenerate nginx config with SSL enabled and reload.
 /// Switch a site's vhost to the HTTPS template and, if it is a WordPress site
 /// still advertising plain HTTP, move its canonical URL across with it.
@@ -560,6 +983,12 @@ pub async fn enable_ssl_for_site(
     domain: &str,
     site_config: &SiteConfig,
 ) -> Result<crate::services::wordpress::CanonicalUrlOutcome, String> {
+    // Every caller (provision, upload_cert, renew, DNS-01, Docker-app auto-SSL,
+    // git-deploy auto-SSL) funnels through here — locking once here, rather than
+    // in each of the 6 callers, is what makes them all mutually exclusive on the
+    // same domain. See site_lock's module doc.
+    let _guard = crate::site_lock::lock_site(domain).await;
+
     let ssl_config = SiteConfig {
         runtime: site_config.runtime.clone(),
         root: site_config.root.clone(),
@@ -583,12 +1012,19 @@ pub async fn enable_ssl_for_site(
         csp_policy: site_config.csp_policy.clone(),
         permissions_policy: site_config.permissions_policy.clone(),
         bot_protection: site_config.bot_protection.clone(),
+        pool_user: site_config.pool_user.clone(),
+        pool_group: site_config.pool_group.clone(),
     };
 
     let rendered = nginx::render_site_config(templates, domain, &ssl_config)
         .map_err(|e| format!("Template render error: {e}"))?;
 
-    let config_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    // A site the operator took offline gets its parked body updated instead, so
+    // the certificate is already in it when the site is enabled again. Writing
+    // into service here is what used to bring a disabled site back the moment it
+    // gained a certificate.
+    let target = nginx::vhost_target(domain);
+    let config_path = target.path().to_string();
     let tmp_path = format!("{config_path}.tmp");
     tokio::fs::write(&tmp_path, &rendered)
         .await
@@ -596,6 +1032,17 @@ pub async fn enable_ssl_for_site(
     tokio::fs::rename(&tmp_path, &config_path)
         .await
         .map_err(|e| format!("Failed to rename nginx config: {e}"))?;
+
+    if !target.is_live() {
+        tracing::info!(
+            "Site {domain} is disabled: its parked configuration now carries the certificate, \
+             and nginx was not reloaded"
+        );
+        // The canonical URL is left alone deliberately: nothing is being served
+        // over the new certificate yet, so moving WordPress to HTTPS now would
+        // point it at a name answering 503.
+        return Ok(crate::services::wordpress::CanonicalUrlOutcome::Untouched);
+    }
 
     let test_result = nginx::test_config()
         .await
@@ -695,4 +1142,562 @@ fn first_cert_der(pem_bytes: &[u8]) -> Option<Vec<u8>> {
 
 fn offset_to_chrono(dt: time::OffsetDateTime) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(dt.unix_timestamp(), dt.nanosecond())
+}
+
+// ─── Registered certificates (#104) ──────────────────────────────────────
+
+/// Where a certificate registered BY NAME lives: one directory per alias,
+/// holding the same `fullchain.pem` + `privkey.pem` pair a domain directory
+/// holds, referenced from a vhost by alias rather than by the domain it fronts.
+///
+/// A SIBLING root, deliberately not a subdirectory of the per-domain tree, and
+/// the placement is the whole design:
+///
+/// - `list_cert_status`, the diagnostics expiry check and the security scanner
+///   all walk the per-domain tree treating EVERY directory as a domain and
+///   offering a renew-by-name fix for it. An alias must never be enumerated as a
+///   domain, so it must not sit where those walks look.
+/// - `unexpose_domain` deletes a domain's own directory when its stack is
+///   removed. A registered certificate is shared across claims and has to
+///   survive any one stack's removal.
+/// - The per-domain renew door replaces whatever sits at the domain's path with
+///   an ACME certificate. The registry is never at that path, so no renewal
+///   door can reach a certificate the operator supplied. ⚠ Since v2.161.0 the
+///   per-domain path IS walked on a schedule — the panel's
+///   `security_scanner::renew_stack_certificate` renews a stack's ACME
+///   certificate weekly — so this placement is no longer belt-and-braces over a
+///   door nobody opens. It is the structural half of the guarantee; the other
+///   half is the panel declining any stack whose effective mode is not `acme`,
+///   and neither half may be removed on the assumption the other holds.
+///
+/// `/etc/dockpanel` is already in the unit's writable set, so the new root
+/// needs no sandbox change.
+pub const SSL_REGISTRY_DIR: &str = "/etc/dockpanel/ssl-registry";
+
+/// What a registered certificate says about itself — the metadata the panel
+/// records so a screen can show it without ever holding the PEM.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CertMetadata {
+    /// The names the leaf presents, through the same SAN-then-CN rule
+    /// `cert_covers_domain` uses.
+    pub dns_names: Vec<String>,
+    pub issuer: String,
+    pub not_before: chrono::DateTime<chrono::Utc>,
+    pub not_after: chrono::DateTime<chrono::Utc>,
+    /// SHA-256 of the leaf's DER, lowercase hex. What `openssl x509
+    /// -fingerprint -sha256` prints, minus the colons.
+    pub fingerprint_sha256: String,
+}
+
+/// Is `alias` a name a registered certificate may carry?
+///
+/// A DNS-label shape: lowercase letters, digits and inner hyphens, 1–64 bytes.
+/// It becomes a directory name on this box and is spliced into a vhost, so it
+/// has to satisfy the vhost renderer's path check as well — the grammar is a
+/// strict subset of that character class and can never spell `..`. Uppercase
+/// is refused rather than folded: the panel stores the alias lowercase, and an
+/// agent that silently folded would answer for a name the panel's row does not
+/// carry.
+pub fn is_valid_cert_alias(alias: &str) -> bool {
+    let b = alias.as_bytes();
+    if b.is_empty() || b.len() > 64 {
+        return false;
+    }
+    let inner = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-';
+    let edge = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    edge(b[0]) && edge(b[b.len() - 1]) && b.iter().all(|&c| inner(c))
+}
+
+/// The certificate and key paths a registered alias resolves to, in that
+/// order. One spelling: the upload writes here, the vhost renderer names it,
+/// and the delete guard greps vhosts for it — three readers of one string.
+pub fn registry_paths(alias: &str) -> (String, String) {
+    (
+        format!("{SSL_REGISTRY_DIR}/{alias}/fullchain.pem"),
+        format!("{SSL_REGISTRY_DIR}/{alias}/privkey.pem"),
+    )
+}
+
+/// Read the FIRST certificate block of a PEM and describe it.
+///
+/// The first block is the leaf — the one nginx binds — for the reason
+/// `cert_covers_domain` documents at length, and the names come from the same
+/// helper so a registered certificate and an uploaded one can never disagree
+/// about what a certificate presents. A non-certificate block is refused with
+/// the same sentence family: a pasted key is the ordinary slip, and it would
+/// otherwise land in a 0644 file.
+pub fn cert_metadata(cert_pem: &str) -> Result<CertMetadata, String> {
+    use sha2::Digest;
+
+    if !cert_pem.contains("-----BEGIN") {
+        return Err("no certificate was found in the certificate field.".to_string());
+    }
+    // The first PEM block, whatever it is labelled — judged below, because a
+    // key pasted here is the ordinary slip and deserves its sentence.
+    let (_, block) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|e| format!("the certificate could not be read: {e}"))?;
+    match block.label.as_str() {
+        "CERTIFICATE" => {}
+        other => {
+            return Err(format!(
+                "the certificate field contains a {} block. Paste only the certificate here, with \
+                 its chain if it has one — the private key belongs in its own field, where it is \
+                 stored with the permissions a key needs.",
+                other.to_ascii_lowercase()
+            ));
+        }
+    }
+    let (_, cert) = x509_parser::parse_x509_certificate(&block.contents)
+        .map_err(|e| format!("the certificate could not be read: {e}"))?;
+    let validity = cert.validity();
+    let not_before = offset_to_chrono(validity.not_before.to_datetime())
+        .ok_or_else(|| "the certificate's validity start is not a date".to_string())?;
+    let not_after = offset_to_chrono(validity.not_after.to_datetime())
+        .ok_or_else(|| "the certificate's expiry is not a date".to_string())?;
+    Ok(CertMetadata {
+        dns_names: presented_dns_names(&cert),
+        issuer: cert.issuer().to_string(),
+        not_before,
+        not_after,
+        fingerprint_sha256: hex::encode(sha2::Sha256::digest(&block.contents)),
+    })
+}
+
+/// Does this private key belong to this certificate?
+///
+/// nginx answers this question only at `nginx -t`, after both files are on
+/// disk, and for a REGISTERED certificate there may be no vhost to test yet —
+/// so a mismatched pair would sit in the registry looking healthy until the
+/// first claim reloaded nginx into a refusal. Asked here instead, before
+/// anything is written, by comparing the key's public half against the leaf's
+/// SubjectPublicKeyInfo — the same comparison rustls makes before it will serve
+/// a pair. The crypto provider this goes through is the one the binary already
+/// installs at start-up; nothing new is linked.
+pub fn key_matches_cert(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("the certificate could not be read: {e}"))?;
+    if chain.is_empty() {
+        return Err("no certificate was found in the certificate field.".to_string());
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|e| format!("the private key could not be read: {e}"))?
+        .ok_or_else(|| {
+            "no private key was found in the private key field. Paste the PEM-encoded key \
+             (a PRIVATE KEY, RSA PRIVATE KEY or EC PRIVATE KEY block) that was generated with \
+             this certificate."
+                .to_string()
+        })?;
+    let signer = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
+        .map_err(|e| format!("the private key is not a kind nginx can serve with: {e}"))?;
+    match rustls::sign::CertifiedKey::new(chain, signer).keys_match() {
+        Ok(()) => Ok(()),
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            Err("the private key does not belong to this certificate".to_string())
+        }
+        // The signer could not produce its public half, so nothing was compared —
+        // a different sentence from a mismatch, which is a fact about the pair.
+        Err(rustls::Error::InconsistentKeys(_)) => Err(
+            "the private key could not be compared against the certificate; it is not a kind \
+             nginx can serve with"
+                .to_string(),
+        ),
+        Err(e) => Err(format!("the certificate could not be read: {e}")),
+    }
+}
+
+// ⚠ These test modules must stay the LAST thing in this file. The pin suites
+// blank from the first `#[cfg(test)]` to EOF and never resume, so a test module
+// placed mid-file hides every production line below it from every `prod_*` arm
+// in every suite that reads this file. Adding a module is fine; adding
+// PRODUCTION code below one is not.
+#[cfg(test)]
+mod cert_coverage_tests {
+    use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    /// A self-signed certificate presenting `sans` as subjectAltName dNSNames.
+    fn cert_with_sans(sans: &[&str]) -> String {
+        let key = KeyPair::generate().unwrap();
+        let params =
+            CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    /// A certificate carrying a Common Name and NO subjectAltName extension —
+    /// legal, deprecated, and still issued by corporate PKI.
+    fn cert_with_cn_only(cn: &str) -> String {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.self_signed(&key).unwrap().pem()
+    }
+
+    #[test]
+    fn an_exact_name_is_accepted_case_and_trailing_dot_insensitively() {
+        let pem = cert_with_sans(&["Shop.Example.com"]);
+        assert!(cert_covers_domain(&pem, "shop.example.com").is_ok());
+        assert!(cert_covers_domain(&pem, "SHOP.EXAMPLE.COM.").is_ok());
+    }
+
+    #[test]
+    fn a_certificate_for_another_site_is_refused_and_names_what_it_covers() {
+        let pem = cert_with_sans(&["www.example.com", "example.com"]);
+        let err = cert_covers_domain(&pem, "shop.example.com").unwrap_err();
+        assert!(err.contains("www.example.com"), "{err}");
+        assert!(err.contains("shop.example.com"), "{err}");
+    }
+
+    #[test]
+    fn a_wildcard_covers_exactly_one_label() {
+        let pem = cert_with_sans(&["*.example.com", "example.com"]);
+        // one label below the wildcard base — covered
+        assert!(cert_covers_domain(&pem, "app.example.com").is_ok());
+        // the apex — covered only because this cert also carries the apex SAN
+        assert!(cert_covers_domain(&pem, "example.com").is_ok());
+        // TWO labels below — NOT covered. This is the half a permissive
+        // `ends_with` rule gets wrong, and it is the shape that makes a panel
+        // report TLS the browser rejects.
+        assert!(cert_covers_domain(&pem, "app.staging.example.com").is_err());
+    }
+
+    #[test]
+    fn a_bare_wildcard_apex_does_not_cover_the_apex() {
+        let pem = cert_with_sans(&["*.example.com"]);
+        assert!(cert_covers_domain(&pem, "example.com").is_err());
+    }
+
+    #[test]
+    fn a_partial_wildcard_label_is_not_a_wildcard() {
+        assert!(!dns_name_covers("w*.example.com", "www.example.com"));
+        assert!(!dns_name_covers("*.com", "example.com"));
+    }
+
+    #[test]
+    fn the_common_name_is_a_fallback_only_when_no_san_is_present() {
+        let cn_only = cert_with_cn_only("legacy.example.com");
+        assert!(cert_covers_domain(&cn_only, "legacy.example.com").is_ok());
+        assert!(cert_covers_domain(&cn_only, "other.example.com").is_err());
+
+        // With a SAN present the CN is ignored, exactly as browsers do.
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["real.example.com".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "cn.example.com");
+        let pem = params.self_signed(&key).unwrap().pem();
+        assert!(cert_covers_domain(&pem, "real.example.com").is_ok());
+        assert!(cert_covers_domain(&pem, "cn.example.com").is_err());
+    }
+
+    #[test]
+    fn a_self_signed_certificate_marked_ca_is_still_accepted() {
+        // `openssl req -x509` stamps CA:TRUE by default, so an `is_ca()` leaf
+        // filter would refuse every self-signed staging certificate. rcgen
+        // defaults to NoCa, so this fixture sets it BY HAND — without that, a
+        // suite of rcgen defaults stays green with the wrong filter restored.
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["staging.example.com".to_string()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let pem = params.self_signed(&key).unwrap().pem();
+        assert!(cert_covers_domain(&pem, "staging.example.com").is_ok());
+    }
+
+    #[test]
+    fn only_the_first_certificate_block_is_asked() {
+        // nginx binds the FIRST certificate in the file as the leaf. Measured
+        // against nginx 1.24.0: `[wrong, right]` + the RIGHT key fails
+        // `nginx -t` with a key mismatch, naming the right key — proof it bound
+        // `wrong`. Paired with the WRONG key it passes and serves `wrong`. So a
+        // rule that accepted the bundle because SOME block covered the domain
+        // would wave through the exact mismatch this function exists to stop.
+        let wrong = cert_with_sans(&["wrong.example.com"]);
+        let right = cert_with_sans(&["right.example.com"]);
+        let bundle = format!("{wrong}{right}");
+        assert!(cert_covers_domain(&bundle, "right.example.com").is_err());
+        // The same two blocks the other way round is a normal leaf+chain paste.
+        let bundle = format!("{right}{wrong}");
+        assert!(cert_covers_domain(&bundle, "right.example.com").is_ok());
+    }
+
+    #[test]
+    fn a_private_key_in_the_certificate_field_is_refused() {
+        // The old `contains("BEGIN CERTIFICATE")` check accepted this. Driven on
+        // a fresh box: the key landed in `fullchain.pem` at 0644 beside a key
+        // file deliberately written 0600 — reachable by nobody else only because
+        // the enclosing directories are 0700, which is the directory's doing and
+        // not the write's. The sharper half is that it blinded the expiry
+        // ladder: the status reader decodes the first PEM block whatever its
+        // label and gets no date out of a key.
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["shop.example.com".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap().pem();
+        let pasted = format!("{}{}", key.serialize_pem(), cert);
+        let err = cert_covers_domain(&pasted, "shop.example.com").unwrap_err();
+        assert!(err.contains("private key"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_input_is_refused_rather_than_installed() {
+        assert!(cert_covers_domain("not a certificate at all", "shop.example.com").is_err());
+        assert!(
+            cert_covers_domain(
+                "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+                "shop.example.com"
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod acme_account_persist_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dp-acme-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// The defect, reproduced directly: many doors reach for the account at
+    /// once on a fresh box, and each of them has DIFFERENT credentials to
+    /// write, because each minted its own account at the CA.
+    ///
+    /// Exactly one may win. Before `create_new`, every one of them reported
+    /// success and the last write decided which account survived — leaving the
+    /// certificates issued under the others permanently unrenewable.
+    #[tokio::test]
+    async fn exactly_one_of_many_concurrent_writers_wins() {
+        let dir = scratch("race");
+        let path = dir.join("acme-account.json");
+        let path = path.to_str().unwrap().to_string();
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let path = path.clone();
+            set.spawn(async move {
+                let creds = format!("{{\"account\":{i}}}");
+                (i, persist_account_credentials(&path, &creds).await.unwrap())
+            });
+        }
+
+        let mut written = Vec::new();
+        let mut adopted = 0;
+        while let Some(r) = set.join_next().await {
+            let (i, outcome) = r.unwrap();
+            match outcome {
+                Persisted::Written => written.push(i),
+                Persisted::Adopted => adopted += 1,
+            }
+        }
+
+        assert_eq!(written.len(), 1, "exactly one writer may win, got {written:?}");
+        assert_eq!(adopted, 11, "every other writer must be told to adopt");
+
+        // …and the file holds the WINNER's bytes. Not a loser's, and not a mix:
+        // the winner is the account whose key every later certificate is bound
+        // to, so "somebody won" is not enough — it has to be the one that was
+        // told it won.
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(on_disk, format!("{{\"account\":{}}}", written[0]));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn an_existing_account_is_adopted_never_overwritten() {
+        let dir = scratch("adopt");
+        let path = dir.join("acme-account.json");
+        let path = path.to_str().unwrap().to_string();
+
+        assert_eq!(
+            persist_account_credentials(&path, "{\"account\":\"first\"}").await.unwrap(),
+            Persisted::Written
+        );
+        assert_eq!(
+            persist_account_credentials(&path, "{\"account\":\"second\"}").await.unwrap(),
+            Persisted::Adopted
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "{\"account\":\"first\"}",
+            "the incumbent account must survive a later writer"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The account key can order and revoke every certificate on this box, so
+    /// it must never exist even briefly at the default mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_account_file_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        let path = dir.join("acme-account.json");
+        let path = path.to_str().unwrap().to_string();
+
+        persist_account_credentials(&path, "{}").await.unwrap();
+        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+}
+
+#[cfg(test)]
+mod registered_certificate_tests {
+    use super::*;
+    use rcgen::{CertificateParams, KeyPair};
+
+    /// A self-signed leaf for `sans` and the key it was signed with, both PEM.
+    fn pair(sans: &[&str]) -> (String, String) {
+        let key = KeyPair::generate().unwrap();
+        let params =
+            CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+        let cert = params.self_signed(&key).unwrap().pem();
+        (cert, key.serialize_pem())
+    }
+
+    #[test]
+    fn the_alias_grammar_is_a_dns_label() {
+        for good in ["a", "wildcard-2026", "0", "x".repeat(64).as_str()] {
+            assert!(is_valid_cert_alias(good), "{good} should be accepted");
+        }
+        for bad in [
+            "",
+            "-lead",
+            "trail-",
+            "Upper",
+            "dot.inside",
+            "under_score",
+            "../etc",
+            "sp ace",
+            "x".repeat(65).as_str(),
+        ] {
+            assert!(!is_valid_cert_alias(bad), "{bad:?} should be refused");
+        }
+        // The vhost renderer's own path check must accept every path an alias
+        // can produce — a name that passed here and was refused there would be
+        // a certificate that registers but can never be served.
+        let (c, k) = registry_paths("wildcard-2026");
+        assert!(c.starts_with(SSL_REGISTRY_DIR) && c.ends_with("/fullchain.pem"));
+        assert!(k.starts_with(SSL_REGISTRY_DIR) && k.ends_with("/privkey.pem"));
+        assert!(!SSL_REGISTRY_DIR.starts_with("/etc/dockpanel/ssl/"));
+    }
+
+    #[test]
+    fn metadata_describes_the_leaf() {
+        let (cert, _) = pair(&["Shop.Example.com", "*.example.com"]);
+        let m = cert_metadata(&cert).unwrap();
+        assert_eq!(m.dns_names, vec!["shop.example.com", "*.example.com"]);
+        assert!(m.not_before < m.not_after);
+        assert_eq!(m.fingerprint_sha256.len(), 64);
+        assert!(m.fingerprint_sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(!m.issuer.is_empty());
+        // Two different certificates never share a fingerprint.
+        let (other, _) = pair(&["shop.example.com"]);
+        assert_ne!(cert_metadata(&other).unwrap().fingerprint_sha256, m.fingerprint_sha256);
+    }
+
+    #[test]
+    fn metadata_refuses_a_key_where_a_certificate_belongs() {
+        let (cert, key) = pair(&["a.example.com"]);
+        let err = cert_metadata(&format!("{key}{cert}")).unwrap_err();
+        assert!(err.contains("private key block"), "{err}");
+        assert!(cert_metadata("").unwrap_err().contains("no certificate was found"));
+        assert!(cert_metadata("not pem at all").unwrap_err().contains("no certificate was found"));
+    }
+
+    #[test]
+    fn a_generated_pair_matches_and_a_second_key_does_not() {
+        let (cert, key) = pair(&["a.example.com"]);
+        assert_eq!(key_matches_cert(&cert, &key), Ok(()));
+        // The certificate with SOMEBODY ELSE's key — the pair nginx would refuse
+        // at the first reload after the claim.
+        let (_, stranger) = pair(&["a.example.com"]);
+        assert_eq!(
+            key_matches_cert(&cert, &stranger),
+            Err("the private key does not belong to this certificate".to_string())
+        );
+        // A chain is judged by its FIRST block, like everything else here.
+        let (issuer_cert, _) = pair(&["ca.example.com"]);
+        assert_eq!(key_matches_cert(&format!("{cert}{issuer_cert}"), &key), Ok(()));
+        assert!(key_matches_cert(&format!("{issuer_cert}{cert}"), &key).is_err());
+    }
+
+    #[test]
+    fn key_matching_refuses_what_it_cannot_read() {
+        let (cert, key) = pair(&["a.example.com"]);
+        assert!(key_matches_cert("", &key).unwrap_err().contains("no certificate"));
+        assert!(key_matches_cert(&cert, "").unwrap_err().contains("no private key"));
+        assert!(key_matches_cert(&cert, &cert).unwrap_err().contains("no private key"));
+    }
+}
+
+
+// ⛔ TESTS ONLY BELOW THIS POINT — see the note above the first test module.
+#[cfg(test)]
+mod foreign_issuer_tests {
+    use super::*;
+
+    fn status(has_cert: bool, issuer: Option<&str>) -> CertStatus {
+        CertStatus {
+            domain: "example.com".to_string(),
+            has_cert,
+            issuer: issuer.map(str::to_string),
+            not_after: None,
+            days_remaining: None,
+        }
+    }
+
+    // ⚠ WHAT THIS COVERS AND WHAT IT DOES NOT. These exercise the DECISION —
+    // the half that answers "may this order overwrite the file?" — not the
+    // x509 parse that produces the issuer string, which needs a real file at a
+    // const path. The parse is exercised wherever `get_cert_status` is.
+
+    #[test]
+    fn a_purchased_certificate_is_foreign_and_names_its_issuer() {
+        assert_eq!(
+            foreign_issuer_of(&status(true, Some("DigiCert Inc"))).as_deref(),
+            Some("DigiCert Inc")
+        );
+        assert_eq!(
+            foreign_issuer_of(&status(true, Some("Cloudflare Origin CA"))).as_deref(),
+            Some("Cloudflare Origin CA")
+        );
+    }
+
+    #[test]
+    fn our_own_certificate_is_not_foreign_in_either_spelling() {
+        // The apostrophe is a typographic hazard, not a fact about the CA. A
+        // copy that knew only one spelling would refuse to renew a genuine
+        // Let's Encrypt certificate and let it lapse.
+        assert!(foreign_issuer_of(&status(true, Some("Let's Encrypt"))).is_none());
+        assert!(foreign_issuer_of(&status(true, Some("Lets Encrypt"))).is_none());
+        assert!(foreign_issuer_of(&status(true, Some("C=US, O=Let's Encrypt, CN=R11"))).is_none());
+        assert!(foreign_issuer_of(&status(true, Some("LET'S ENCRYPT"))).is_none());
+    }
+
+    #[test]
+    fn doubt_proceeds_it_never_refuses() {
+        // Every one of these is "we do not know", and every one must read as
+        // permission. Refusing on doubt is how a real certificate lapses and a
+        // site goes dark — the opposite failure, and the worse one.
+        assert!(foreign_issuer_of(&status(false, None)).is_none(), "no certificate yet");
+        assert!(foreign_issuer_of(&status(false, Some("DigiCert Inc"))).is_none(), "no cert outranks a stale issuer");
+        assert!(foreign_issuer_of(&status(true, None)).is_none(), "unreadable certificate");
+        assert!(foreign_issuer_of(&status(true, Some(""))).is_none(), "empty issuer");
+        assert!(foreign_issuer_of(&status(true, Some("   "))).is_none(), "whitespace issuer");
+    }
+
+    #[test]
+    fn the_refusal_names_the_issuer_and_wears_the_marker() {
+        // Without the marker the sentence leaves the agent as a 500 and the
+        // panel answers it with an incident id — throwing away the only part
+        // of it that helps.
+        let msg = foreign_cert_refusal("example.com", "DigiCert Inc");
+        assert!(msg.starts_with(FOREIGN_CERT_REFUSED), "refusal lost its marker: {msg}");
+        assert!(msg.contains("DigiCert Inc"), "refusal does not name the issuer: {msg}");
+        assert!(msg.contains("example.com"), "refusal does not name the domain: {msg}");
+    }
 }

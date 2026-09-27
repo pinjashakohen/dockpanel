@@ -6,7 +6,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
-use crate::error::{internal_error, err, agent_error, paginate, ApiError};
+use crate::error::{internal_error, err, agent_error, paginate, require_admin, ApiError};
 use crate::services::agent::AgentError;
 use crate::AppState;
 
@@ -63,7 +63,9 @@ pub struct ListQuery {
 
 #[derive(serde::Deserialize)]
 pub struct CreateDbRequest {
-    pub site_id: Uuid,
+    /// Exactly one of `site_id` / `stack_id` must be set — see `resolve_owner`.
+    pub site_id: Option<Uuid>,
+    pub stack_id: Option<Uuid>,
     pub name: String,
     pub engine: Option<String>,
 }
@@ -71,7 +73,8 @@ pub struct CreateDbRequest {
 #[derive(serde::Serialize, sqlx::FromRow)]
 pub struct Database {
     pub id: Uuid,
-    pub site_id: Uuid,
+    pub site_id: Option<Uuid>,
+    pub stack_id: Option<Uuid>,
     pub name: String,
     pub engine: String,
     pub db_user: String,
@@ -89,10 +92,23 @@ pub async fn list(
 ) -> Result<Json<Vec<Database>>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
 
+    // Same admin-widening create() already grants (helpers::SITE_CALLER_PREDICATE) —
+    // without it, a database an admin creates on a tenant's site via the local-box
+    // arm becomes invisible to its own creator (v2.216.0 audit finding).
+    //
+    // LEFT JOIN both possible owner tables and COALESCE: a row has exactly one
+    // non-null owner FK (chk_databases_owner), so each row matches at most one
+    // owner across the two joins and COALESCE picks whichever is present — one
+    // query covers site-owned and stack-owned databases without a UNION.
     let dbs: Vec<Database> = sqlx::query_as(
-        "SELECT d.id, d.site_id, d.name, d.engine, d.db_user, d.container_id, d.port, d.created_at \
-         FROM databases d JOIN sites s ON d.site_id = s.id \
-         WHERE s.user_id = $1 AND s.server_id = $2 ORDER BY d.created_at DESC LIMIT $3 OFFSET $4",
+        "SELECT d.id, d.site_id, d.stack_id, d.name, d.engine, d.db_user, d.container_id, d.port, d.created_at \
+         FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE (COALESCE(s.user_id, st.user_id) = $1 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $1 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id))) \
+         AND COALESCE(s.server_id, st.server_id) = $2 ORDER BY d.created_at DESC LIMIT $3 OFFSET $4",
     )
     .bind(claims.sub)
     .bind(server_id)
@@ -105,30 +121,75 @@ pub async fn list(
     Ok(Json(dbs))
 }
 
+/// Resolve the host + a caller-facing label for a database's owner — a site or a
+/// stack (GH #64: standalone DB provisioning), exactly one of which the caller must
+/// supply. The label only names `agent_for_site_server`'s refusal log line; no domain
+/// is loaded on these paths, so callers still identify the target by database name.
+async fn resolve_owner(
+    state: &AppState,
+    site_id: Option<Uuid>,
+    stack_id: Option<Uuid>,
+    user_id: Uuid,
+) -> Result<(Option<Uuid>, String), ApiError> {
+    match (site_id, stack_id) {
+        (Some(sid), None) => {
+            let row: Option<(Option<Uuid>, String)> = sqlx::query_as(&format!(
+                "SELECT s.server_id, s.domain FROM sites s WHERE {}",
+                crate::helpers::SITE_CALLER_PREDICATE
+            ))
+            .bind(sid)
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("resolve database owner", e))?;
+            row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))
+        }
+        (None, Some(kid)) => {
+            let row: Option<(Option<Uuid>, String)> = sqlx::query_as(&format!(
+                "SELECT st.server_id, st.name FROM docker_stacks st WHERE {}",
+                crate::helpers::STACK_CALLER_PREDICATE
+            ))
+            .bind(kid)
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("resolve database owner", e))?;
+            row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Stack not found"))
+        }
+        _ => Err(err(
+            StatusCode::BAD_REQUEST,
+            "Specify exactly one of site_id or stack_id",
+        )),
+    }
+}
+
 /// POST /api/databases — Create a new database.
 pub async fn create(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
     Json(body): Json<CreateDbRequest>,
 ) -> Result<(StatusCode, Json<Database>), ApiError> {
-    // Verify site ownership
-    let site_exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(body.site_id)
-            .bind(claims.sub)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("create databases", e))?;
+    // Verify ownership — and take the host from the same row while we are here. The
+    // container is created on whichever host the handle points at and then recorded
+    // against this owner, so a misdispatch leaves a `databases` row naming a
+    // container that does not exist on the owner's own machine, while the wrong
+    // machine keeps the container and the port. The row that decides WHICH OWNER has
+    // to decide WHICH HOST too.
+    let (owner_server_id, owner_label) =
+        resolve_owner(&state, body.site_id, body.stack_id, claims.sub).await?;
 
-    if site_exists.is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "Site not found"));
-    }
+    let agent =
+        crate::helpers::agent_for_site_server(&state, owner_server_id, &owner_label).await?;
 
     // Hard per-account cap on total databases (independent of reseller quota) so a
     // single tenant cannot exhaust the shared, host-wide DB port pool / host RAM.
+    // Counts both site-owned and stack-owned rows (COALESCE — chk_databases_owner
+    // guarantees exactly one of the two joins matches per row).
     let (db_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM databases d JOIN sites s ON d.site_id = s.id WHERE s.user_id = $1",
+        "SELECT COUNT(*) FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE COALESCE(s.user_id, st.user_id) = $1",
     )
     .bind(claims.sub)
     .fetch_one(&state.db)
@@ -155,6 +216,28 @@ pub async fn create(
             "Database name must be alphanumeric with underscores",
         ));
     }
+    // ⛔ The AGENT is the authority on this name — it is what creates the
+    // container — and its `is_valid_name` demands an alphanumeric FIRST
+    // character. Without this clause the panel accepted `_mydata`, called the
+    // agent, and handed the operator the agent's own refusal: a form the product
+    // had just validated, answered by a machine. The rule belongs where the
+    // person typing it can read it.
+    //
+    // ⚠ The 63 above is NOT the same divergence and must not be "aligned" to the
+    // agent's 64: a PostgreSQL identifier is 63 bytes, so 63 is the cross-engine
+    // cap and the stricter side is the correct one. It refuses in the panel's own
+    // words, which is the behaviour this clause exists to produce.
+    if !body
+        .name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Database name must start with a letter or a number",
+        ));
+    }
 
     if is_reserved_db_name(&body.name) {
         return Err(err(
@@ -163,17 +246,24 @@ pub async fn create(
         ));
     }
 
-    // Check uniqueness per-site
-    let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM databases WHERE site_id = $1 AND name = $2")
-            .bind(body.site_id)
-            .bind(&body.name)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("create databases", e))?;
+    // Check uniqueness per-owner (site OR stack — whichever the caller supplied;
+    // resolve_owner already refused a request naming both or neither).
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM databases WHERE site_id IS NOT DISTINCT FROM $1 \
+         AND stack_id IS NOT DISTINCT FROM $2 AND name = $3",
+    )
+    .bind(body.site_id)
+    .bind(body.stack_id)
+    .bind(&body.name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("create databases", e))?;
 
     if existing.is_some() {
-        return Err(err(StatusCode::CONFLICT, "Database name already exists for this site"));
+        return Err(err(
+            StatusCode::CONFLICT,
+            "Database name already exists for this owner",
+        ));
     }
 
     let engine = body.engine.as_deref().unwrap_or("postgres");
@@ -201,11 +291,12 @@ pub async fn create(
     // Insert DB record first to atomically claim the port (unique index prevents races).
     // container_id is empty until the agent creates it.
     let db_record: Database = match sqlx::query_as(
-        "INSERT INTO databases (site_id, name, engine, db_user, db_password_enc, container_id, port) \
-         VALUES ($1, $2, $3, $4, $5, '', $6) \
-         RETURNING id, site_id, name, engine, db_user, container_id, port, created_at",
+        "INSERT INTO databases (site_id, stack_id, name, engine, db_user, db_password_enc, container_id, port) \
+         VALUES ($1, $2, $3, $4, $5, $6, '', $7) \
+         RETURNING id, site_id, stack_id, name, engine, db_user, container_id, port, created_at",
     )
     .bind(body.site_id)
+    .bind(body.stack_id)
     .bind(&body.name)
     .bind(engine)
     .bind(&body.name)
@@ -224,12 +315,20 @@ pub async fn create(
         }
     };
 
-    // Call agent to create container
+    // Call agent to create container. `stack_id` tells the agent to join the
+    // stack's own private bridge network (already used to give the stack's other
+    // containers name-based reachability) instead of the shared, ICC-disabled
+    // `dockpanel-db` bridge every site-owned database uses — the stack network is
+    // single-tenant by construction, so this introduces no new cross-tenant
+    // exposure, and every panel-side query/backup/credential operation already
+    // reaches the container via `docker exec`, which is unaffected by which
+    // network the container is on.
     let agent_body = serde_json::json!({
         "name": body.name,
         "engine": engine,
         "password": password,
         "port": port,
+        "stack_id": body.stack_id.map(|id| id.to_string()),
     });
 
     let result = match agent.post("/databases", Some(agent_body)).await {
@@ -272,10 +371,16 @@ pub async fn credentials(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Admin-widened to match create()/list() — see the v2.216.0 audit note on list().
+    // LEFT JOIN both owner tables + COALESCE, same pattern as list() — see its comment.
     let row: Option<(String, String, String, Option<i32>, Option<String>)> = sqlx::query_as(
         "SELECT d.name, d.engine, d.db_password_enc, d.port, d.container_id \
-         FROM databases d JOIN sites s ON d.site_id = s.id \
-         WHERE d.id = $1 AND s.user_id = $2",
+         FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE d.id = $1 AND (COALESCE(s.user_id, st.user_id) = $2 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $2 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id)))",
     )
     .bind(id)
     .bind(claims.sub)
@@ -317,13 +422,25 @@ pub async fn remove(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Verify ownership through site
-    let db: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT d.id, d.name, d.container_id FROM databases d \
-         JOIN sites s ON d.site_id = s.id \
-         WHERE d.id = $1 AND s.user_id = $2",
+    // Verify ownership through site — and take the host from the same row while we
+    // are here. The join to `sites` was already carrying the ownership term; the
+    // host it also knows about was thrown away, and the agent came from the request
+    // header instead. That is a destructive mismatch in both directions: the panel
+    // row is deleted whether or not the container was, so dispatching to the wrong
+    // machine either destroys a same-named `dockpanel-db-{name}` container that
+    // belongs to somebody else's tenant, or fails to find one while the real
+    // container is orphaned on its own host with its row already gone.
+    // Admin-widened to match create()/list() — see the v2.216.0 audit note on list().
+    // LEFT JOIN both owner tables + COALESCE, same pattern as list() — see its comment.
+    let db: Option<(Uuid, String, Option<String>, Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT d.id, d.name, d.container_id, COALESCE(s.server_id, st.server_id), \
+         COALESCE(s.domain, st.name) FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE d.id = $1 AND (COALESCE(s.user_id, st.user_id) = $2 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $2 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id)))",
     )
     .bind(id)
     .bind(claims.sub)
@@ -331,7 +448,11 @@ pub async fn remove(
     .await
     .map_err(|e| internal_error("remove databases", e))?;
 
-    let (_, name, container_id) = db.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
+    let (_, name, container_id, owner_server_id, owner_label) =
+        db.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
+
+    let agent =
+        crate::helpers::agent_for_site_server(&state, owner_server_id, &owner_label).await?;
 
     // Remove container via agent (must succeed before DB deletion)
     if let Some(cid) = &container_id {
@@ -353,21 +474,123 @@ pub async fn remove(
          WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)"
     ).bind(claims.sub).execute(&state.db).await;
 
+    purge_dumps_if_unclaimed(&state, &agent, &name, owner_server_id).await;
+
     tracing::info!("Database deleted: {name}");
 
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
-/// Helper: fetch database info (name, engine, password) with ownership check.
+/// Remove a database's dump directory, but only once nothing else can claim it.
+///
+/// ⛔ ORDERING IS THE ONLY GUARD, and getting it wrong is silent. The `shared`
+/// probe has no self-exclusion term, so every row still present answers the
+/// question about ITSELF: call this before the row is gone and `shared` is
+/// always true, nothing is ever purged, and the log line reads exactly like
+/// correct behaviour. Call it only AFTER the row (or the cascade that takes it)
+/// has committed.
+pub(crate) async fn purge_dumps_if_unclaimed(
+    state: &AppState,
+    agent: &crate::services::agent::AgentHandle,
+    name: &str,
+    site_server_id: Option<Uuid>,
+) {
+    let name = name.to_string();
+    // Take the dumps with it — but only once nothing else is using them.
+    //
+    // The dump directory is named for the DATABASE and nothing else, while the
+    // name is unique only per SITE, so two live databases belonging to two
+    // different sites on this host share one directory. Purging on the first
+    // delete would take the survivor's backups with it, which is a worse failure
+    // than the leak being closed and would be discovered at a restore.
+    //
+    // ⚠ A row whose site names no server is counted as possibly-here rather than
+    // elsewhere. It cannot be acted on through the panel — the agent lookup above
+    // refuses it — but its dumps, if any, are on some host, and this host is one
+    // of the candidates. Doubt keeps the files; only positive evidence that
+    // nothing else claims the name removes them. The reverse default trades a
+    // disclosed leak for silent data loss.
+    let shared: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM databases d \
+         LEFT JOIN sites s ON s.id = d.site_id \
+         LEFT JOIN docker_stacks st ON st.id = d.stack_id \
+         WHERE d.name = $1 AND (COALESCE(s.server_id, st.server_id) = $2 \
+         OR COALESCE(s.server_id, st.server_id) IS NULL))",
+    )
+    .bind(&name)
+    .bind(site_server_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(true);
+
+    if shared {
+        tracing::info!(
+            "Keeping the dump directory for {name}: another database on this server still uses that name"
+        );
+    } else {
+        match agent.delete(&format!("/db-backups/{name}")).await {
+            Ok(v) => tracing::info!(
+                "Purged dump directory for {name}: {} file(s) removed, {} kept, directory removed: {}",
+                v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0),
+                v.get("kept").and_then(|x| x.as_u64()).unwrap_or(0),
+                v.get("dir_removed").and_then(|x| x.as_bool()).unwrap_or(false),
+            ),
+            // Best-effort on purpose: the database IS deleted by now, and failing
+            // the request over leftover files would report a destructive operation
+            // that succeeded as though it had not.
+            Err(e) => tracing::warn!("Could not purge dump directory for {name}: {e}"),
+        }
+    }
+
+}
+
+
+/// Helper: fetch database info (name, engine, password, port) — and the id of the server
+/// the owning site actually runs on — with an ownership check.
+///
+/// The join to `sites` was here all along for the ownership term, and `sites` is where the
+/// authoritative `server_id` lives; the column simply was not selected. So every caller
+/// below answered WHICH DATABASE from this row and then took WHICH HOST from `ServerScope`
+/// — an `X-Server-Id` request header that falls back to the LOCAL agent whenever the caller
+/// owns no `servers` row. No non-admin ever owns one (the only INSERT is admin-gated), so
+/// for a tenant whose database lives on a fleet member that fallback was always the wrong
+/// machine, and nothing in the response said so.
+///
+/// What that leaked matters as much as where it dispatched: this helper returns the
+/// DECRYPTED database password, and every caller forwards it to the agent it chose, which
+/// spends it on a `docker exec -e MYSQL_PWD=…` child process. A misdispatch therefore
+/// handed one tenant's live credential to a host their database does not run on, in the
+/// argv/environment of a process on that host — a disclosure that happened on ordinary
+/// read-only calls like listing tables, with no error for anyone to notice.
+///
+/// The row is the authority for the host exactly as it is for the ownership check, so the
+/// server id now comes back in the same tuple and each caller resolves its handle from it
+/// via `agent_for_site_server`, which REFUSES rather than substituting a reachable host.
+/// That helper's third argument only labels its refusal log line; no domain is loaded on
+/// these paths, so callers identify the target by database name.
+///
+/// `Option<Uuid>` because the column is `NOT NULL` in the schema but optional in the
+/// structs that predate the fleet work — a `None` means a row older than the backfill, and
+/// guessing a host for it is the thing that must not happen.
 async fn get_db_info(
     state: &AppState,
     id: Uuid,
     user_id: Uuid,
-) -> Result<(String, String, String, i32), ApiError> {
-    let row: Option<(String, String, String, Option<i32>, Option<String>)> = sqlx::query_as(
-        "SELECT d.name, d.engine, d.db_password_enc, d.port, d.container_id \
-         FROM databases d JOIN sites s ON d.site_id = s.id \
-         WHERE d.id = $1 AND s.user_id = $2",
+) -> Result<(String, String, String, i32, Option<Uuid>), ApiError> {
+    // Admin-widened to match create()/list() — see the v2.216.0 audit note on list().
+    // This is the shared chokepoint for tables/table_schema/query/table_indexes/
+    // foreign_keys/schema_overview/update_pitr_config/pitr_restore/reset_password/
+    // dumps/import — one fix here covers all 11 callers.
+    // LEFT JOIN both owner tables + COALESCE, same pattern as list() — see its comment.
+    let row: Option<(String, String, String, Option<i32>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT d.name, d.engine, d.db_password_enc, d.port, d.container_id, \
+         COALESCE(s.server_id, st.server_id) \
+         FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE d.id = $1 AND (COALESCE(s.user_id, st.user_id) = $2 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $2 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id)))",
     )
     .bind(id)
     .bind(user_id)
@@ -375,7 +598,7 @@ async fn get_db_info(
     .await
     .map_err(|e| internal_error("remove databases", e))?;
 
-    let (name, engine, password_enc, port, container_id) =
+    let (name, engine, password_enc, port, container_id, site_server_id) =
         row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
     // Security (H1, v2.19.0): every exec/reset path resolves the target container by
     // the (per-site, NON-unique) name `dockpanel-db-{name}`. create() inserts the row
@@ -391,7 +614,7 @@ async fn get_db_info(
     let port = port.unwrap_or(5432);
     // Decrypt password for agent use (with legacy plaintext fallback)
     let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(&password_enc, &state.config.jwt_secret);
-    Ok((name, engine, password, port))
+    Ok((name, engine, password, port, site_server_id))
 }
 
 /// GET /api/databases/{id}/tables — List tables in the database.
@@ -399,9 +622,10 @@ pub async fn tables(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
 
     let sql = match engine.as_str() {
         "mysql" | "mariadb" => {
@@ -437,41 +661,59 @@ pub async fn tables(
         .map_err(sql_error)
 }
 
+/// The one charset any table name is interpolated under.
+///
+/// `/databases/query` has no bind-parameter channel — the agent's `QueryDbRequest`
+/// carries `sql` and nothing else, and the statement is handed verbatim to
+/// `mariadb -e` / `psql -c`. So every table name that reaches a statement is
+/// interpolated, and this predicate is the only thing standing between a path
+/// segment and that statement. It admits no quote, no backslash and no shell
+/// metacharacter, which is what makes `'{table}'` safe to build.
+///
+/// It lives here as ONE function on purpose. There were two copies with two
+/// different charsets — the interpolating one refused `-`, the other allowed it —
+/// and a divergence between a validator and the statement it guards is the bug
+/// this file already shipped once.
+fn is_safe_table_name(table: &str) -> bool {
+    !table.is_empty()
+        && table.len() <= 128
+        && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// GET /api/databases/{id}/tables/{table} — Get table schema (columns, types).
 pub async fn table_schema(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path((id, table)): Path<(Uuid, String)>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Validate table name to prevent injection
-    if table.is_empty()
-        || table.len() > 128
-        || !table
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+    if !is_safe_table_name(&table) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid table name"));
     }
 
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
 
-    let (sql, params) = match engine.as_str() {
-        "mysql" | "mariadb" => (
+    // Interpolated, not bound. `29d959b` rewrote these two statements to use `?`/`$1`
+    // for injection safety and sent the values under a `"params"` key — but the agent
+    // has never had a `params` field to receive them, so serde dropped it and the
+    // placeholder reached the engine unbound. Every column listing 400'd from
+    // 2026-03-23 until this fix, invisibly, because the caller swallowed the error.
+    // The sibling `table_indexes` below always interpolated and always worked; this
+    // now matches it, which also keeps the fix backend-only — a bind channel would
+    // need the agent to ship in lockstep, and an old agent would still fail.
+    let sql = match engine.as_str() {
+        "mysql" | "mariadb" => format!(
             "SELECT column_name, column_type, is_nullable, column_default, column_key, extra \
              FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = ? \
+             WHERE table_schema = DATABASE() AND table_name = '{table}' \
              ORDER BY ordinal_position"
-                .to_string(),
-            vec![table.clone()],
         ),
-        _ => (
+        _ => format!(
             "SELECT column_name, data_type, character_maximum_length, is_nullable, column_default \
              FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = $1 \
+             WHERE table_schema = 'public' AND table_name = '{table}' \
              ORDER BY ordinal_position"
-                .to_string(),
-            vec![table.clone()],
         ),
     };
 
@@ -483,7 +725,6 @@ pub async fn table_schema(
         "password": password,
         "database": name,
         "sql": sql,
-        "params": params,
     });
 
     agent
@@ -503,7 +744,6 @@ pub async fn query(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
     Json(body): Json<SqlQueryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if body.sql.trim().is_empty() {
@@ -516,7 +756,15 @@ pub async fn query(
         ));
     }
 
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    // The host comes from the site's row, never from the caller's server switcher. This
+    // request body carries the tenant's DECRYPTED database password to the agent, which
+    // puts it in a `docker exec -e MYSQL_PWD=…` child process; sent to a machine the
+    // database does not run on, the credential is disclosed to that host — and the query
+    // either runs against a same-named container belonging to someone else or fails with a
+    // "not found" that reads like an ordinary error.
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
 
     let container = format!("dockpanel-db-{name}");
     let agent_body = serde_json::json!({
@@ -540,13 +788,14 @@ pub async fn table_indexes(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path((id, table)): Path<(Uuid, String)>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if table.is_empty() || table.len() > 128 || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !is_safe_table_name(&table) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid table name"));
     }
 
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
 
     let sql = match engine.as_str() {
         "mysql" | "mariadb" => format!(
@@ -583,9 +832,10 @@ pub async fn foreign_keys(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
 
     let sql = match engine.as_str() {
         "mysql" | "mariadb" =>
@@ -632,9 +882,13 @@ pub async fn schema_overview(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (name, engine, password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    // Both halves of the join below go through this one handle, so it has to be the
+    // site's own host — otherwise the two concurrent queries carry the decrypted
+    // password to a foreign machine twice over.
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
     let container = format!("dockpanel-db-{name}");
 
     // Execute all queries concurrently
@@ -786,8 +1040,17 @@ pub async fn pitr_config(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Verify ownership
-    let _db: (String,) = sqlx::query_as("SELECT name FROM databases WHERE id = $1 AND site_id IN (SELECT id FROM sites WHERE user_id = $2)")
+    // Verify ownership — admin-widened to match create()/list() (v2.216.0 audit note).
+    // Owner is either a site or a stack (chk_databases_owner enforces exactly one).
+    let _db: (String,) = sqlx::query_as(
+        "SELECT name FROM databases WHERE id = $1 AND (\
+         site_id IN (SELECT s.id FROM sites s WHERE s.user_id = $2 OR EXISTS \
+         (SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+         AND sv.id = s.server_id AND (sv.is_local OR sv.user_id = u.id))) \
+         OR stack_id IN (SELECT st.id FROM docker_stacks st WHERE st.user_id = $2 OR EXISTS \
+         (SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+         AND sv.id = st.server_id AND (sv.is_local OR sv.user_id = u.id))))"
+    )
         .bind(id).bind(claims.sub)
         .fetch_optional(&state.db).await
         .map_err(|e| internal_error("pitr config", e))?
@@ -829,7 +1092,10 @@ pub async fn update_pitr_config(
     Json(body): Json<PitrConfigRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Ownership + container-readiness check (get_db_info also enforces the H1 guard).
-    let (name, _engine, _password, _port) = get_db_info(&state, id, claims.sub).await?;
+    // No agent call on this path — the handler only persists the intent flag (see the
+    // note below), so the server id this now returns has nothing to dispatch.
+    let (name, _engine, _password, _port, _site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
     let enabled = body.pitr_enabled.unwrap_or(false);
     let hours = body.retention_hours.unwrap_or(24).max(1).min(720);
 
@@ -859,7 +1125,7 @@ pub async fn update_pitr_config(
     crate::services::activity::log_activity(
         &state.db, claims.sub, &claims.email,
         if enabled { "database.pitr_enabled" } else { "database.pitr_disabled" },
-        Some("database"), Some(&name), None, None,
+        Some("database"), Some(&name), None, None, claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -895,10 +1161,28 @@ pub async fn reset_password(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Fetch current db info with ownership check (returns decrypted old password)
-    let (name, engine, old_password, _port) = get_db_info(&state, id, claims.sub).await?;
+    let (name, engine, old_password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+
+    // The host MUST come from the site's row here, and this is the handler where taking
+    // it from the request header did the most damage. Container names are
+    // `dockpanel-db-{name}` and are unique only per host, so a request dispatched to the
+    // wrong machine acts on ANY same-named container living there, for a tenant who has
+    // nothing to do with the caller. `ServerScope` made that the DEFAULT rather than the
+    // edge case: a non-admin owns no `servers` row, so their scope always fell back to
+    // the local agent even when their database lives on a fleet member. The panel row is
+    // then updated with the new password regardless, so the real database is left with a
+    // credential the panel no longer knows.
+    //
+    // The agent's mysql/mariadb branch used to reach the account as container-root and
+    // ignore the `old_password` this body sends. That never worked — the branch could not
+    // authenticate at all — and it now authenticates AS THE TENANT with this password, so
+    // the value below is load-bearing rather than decorative. See the note on
+    // `services::database::reset_password` in the agent crate for the measurement.
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
 
     // Generate a new random password (same pattern as create())
     let new_password = uuid::Uuid::new_v4().to_string().replace('-', "");
@@ -931,9 +1215,22 @@ pub async fn reset_password(
         .map_err(|e| internal_error("reset password", e))?;
 
     // Log activity
+    let ip = crate::routes::client_ip(&headers);
     crate::services::activity::log_activity(
         &state.db, claims.sub, &claims.email, "database.password_reset",
-        Some("database"), Some(&name), None, None,
+        Some("database"), Some(&name), None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "database.password_reset",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("database"),
+        Some(&name),
+        None,
+        None,
+        "warning",
+        claims.key_id,
     ).await;
 
     tracing::info!("Database password reset: {name}");
@@ -942,6 +1239,234 @@ pub async fn reset_password(
         "ok": true,
         "password": new_password,
     })))
+}
+
+/// GET /api/databases/{id}/dumps — What is sitting in this database's dump directory.
+///
+/// The intake pattern here is the migration wizard's, not the file manager's: the
+/// operator puts the dump on the server themselves and the panel takes it by NAME. That
+/// is deliberate. A dump travels as base64-in-JSON through two axum services with a 2 MiB
+/// body limit each, so the file manager tops out around 1.5 MB — and a `.sql` under
+/// 1.5 MB is close to a rounding error. `Migration.tsx` has told operators to SFTP the
+/// archive up and hand the panel a path since the wizard shipped, and a 40 GB cPanel
+/// backup already moves through this product that way.
+///
+/// ⛔ ADMIN ONLY, and this is a security boundary rather than a tidiness rule. The
+/// directory is keyed by DATABASE NAME, and a name is reusable. Deleting a database now
+/// also purges that directory — but only when no surviving row on the same host still
+/// answers to the name, so the door below still has to assume leftovers exist: dumps
+/// written before this behaviour shipped are still there, and a shared name keeps them
+/// deliberately. `databases.name` is unique only per SITE (the global
+/// constraint was dropped in `20260312000000_data_integrity.sql`). So a tenant who
+/// creates a database with a name a previous tenant used would, under a
+/// tenant-reachable listing, see and be able to import that tenant's leftover dumps —
+/// which are unencrypted for ad-hoc backups. Row-scoping (what
+/// `/api/backup-orchestrator/db-backups` does) cannot fix it, because the whole point of
+/// this door is files that have no row. `require_admin` can, and costs nothing real:
+/// putting a file in this directory needs root on the box, there is no per-site SFTP,
+/// and an admin can already read `/var/backups` directly.
+pub async fn dumps(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
+
+    let (name, engine, _password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+
+    let listing = agent
+        .get(&format!("/db-backups/{name}/list"))
+        .await
+        .map_err(|e| agent_error("Database dump listing", e))?;
+
+    // The agent answers "is this a backup at all". Whether a given backup can go into
+    // THIS database is a second question it cannot answer, because it does not know the
+    // engine — so it is answered here and annotated onto each entry, and the import
+    // handler enforces the identical rule below. Annotating without enforcing would be a
+    // UI that merely asks nicely.
+    let mut entries = match listing {
+        serde_json::Value::Array(a) => a,
+        // A shape we do not recognise is not an empty directory, and must not render as
+        // one — the empty state is a positive claim about the disk.
+        other => return Ok(Json(other)),
+    };
+    for entry in &mut entries {
+        let filename = entry.get("filename").and_then(|f| f.as_str()).unwrap_or("").to_string();
+        if entry.get("unsupported").and_then(|u| u.as_str()).is_some() {
+            continue; // Already explained: not a backup file at all.
+        }
+        if let Some(reason) = import_blocked_reason(&filename, &engine) {
+            entry["import_blocked"] = serde_json::Value::String(reason);
+        }
+    }
+
+    Ok(Json(serde_json::Value::Array(entries)))
+}
+
+/// Why a real backup still cannot be imported into THIS database, if it cannot.
+///
+/// Split out as a pure function so the boundary is judgeable with no request, no agent
+/// and no database — the `exceeds_upload_limit` shape from v2.137.0 — and so the
+/// listing and the import door cannot drift apart: they are the same call.
+fn import_blocked_reason(filename: &str, engine: &str) -> Option<String> {
+    if filename.ends_with(".enc") {
+        // Not an operator mistake. This is a backup the PANEL took and encrypted with a
+        // key derived from the panel's own secret; the import door has no key to offer,
+        // so the agent would answer "Encryption key required" every single time. Naming
+        // the door that CAN open it is the difference between a dead end and an answer.
+        return Some(
+            "Encrypted panel backup. Restore it from Backup Manager, which holds the key."
+                .to_string(),
+        );
+    }
+    // `.archive.gz` is MongoDB's dump format — `dump_mongo` is its only producer. Fed to
+    // a postgres or mariadb restore it becomes a BSON stream piped into `psql`, which
+    // fails deep inside the pipe on content rather than at the door.
+    let is_mongo = matches!(engine, "mongo" | "mongodb");
+    if filename.ends_with(".archive.gz") && !is_mongo {
+        return Some(format!(
+            "MongoDB archive format. This database is {engine}, which reads .sql.gz."
+        ));
+    }
+    if filename.ends_with(".sql.gz") && is_mongo {
+        return Some("SQL dump. This database is MongoDB, which reads .archive.gz.".to_string());
+    }
+    None
+}
+
+#[derive(serde::Deserialize)]
+pub struct ImportDbRequest {
+    pub filename: String,
+}
+
+/// POST /api/databases/{id}/import — Import a dump the operator placed on the server.
+///
+/// Answers the half of issue #121 that v2.137.0 left open. The importer itself is not new
+/// and is not written here: the agent's `POST /db-backups/{db}/restore/{filename}` already
+/// pins the path per database, validates every identifier it puts on an argv, passes the
+/// password by environment rather than command line, and reads the child's exit status
+/// instead of treating EOF as success. What did not exist was a door onto it for a dump the
+/// operator brought themselves — only for one the panel had taken.
+///
+/// ⛔ Admin only, for the reason documented on [`dumps`] above.
+pub async fn import(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ImportDbRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
+
+    let filename = body.filename.trim();
+    // The agent's `is_safe_filename` is the real gate, but this name is about to be
+    // interpolated into an HTTP request line, and a character that is merely UNUSUAL
+    // rather than dangerous breaks that far from anything that can explain it: a single
+    // space makes `Request::builder().uri(...)` fail, which surfaced as a transport error
+    // and not as "that filename cannot be used". So the charset is checked HERE, where
+    // the answer can still be a sentence about the file.
+    let charset_ok = !filename.is_empty()
+        && filename.len() <= 255
+        && !filename.contains("..")
+        && filename
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if !charset_ok {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "That filename cannot be used. Backup names may contain letters, digits, \
+             dash, underscore and dot only — rename the file on the server and try again.",
+        ));
+    }
+
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+
+    // The same rule the listing shows, ENFORCED. A caller that posts a filename the UI
+    // greyed out gets the same sentence the UI displayed, rather than a failure from
+    // inside a decompression pipe.
+    if let Some(reason) = import_blocked_reason(filename, &engine) {
+        return Err(err(StatusCode::BAD_REQUEST, &reason));
+    }
+
+    // Same rule as `reset_password` and for the same reason: the host comes from the
+    // site's row, never from the caller's scope. `dockpanel-db-{name}` is unique only per
+    // machine, and this call hands the tenant's decrypted password to whichever agent
+    // answers.
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+
+    let agent_body = serde_json::json!({
+        "container_name": format!("dockpanel-db-{name}"),
+        "db_type": engine,
+        "user": name,
+        "password": password,
+    });
+
+    // ⛔ The timeout is taken HERE rather than read off the error that comes back, and
+    // that is not a style choice. `AgentError::Request` is minted for a URI that would
+    // not build and for a connection that dropped mid-flight as well as for a timeout,
+    // and the REMOTE client does not mint it for a timeout at all — it maps every
+    // failure, timeouts included, to `AgentError::Connection`. So matching on the variant
+    // told fleet operators their agent was offline while the import ran fine, and told
+    // local operators an import was "still running" when nothing had ever been sent.
+    // `Elapsed` here is unambiguous on both transports. The inner budget is deliberately
+    // larger so the inner clock can never be the one that fires.
+    let budget = crate::services::agent::DB_RESTORE_TIMEOUT_SECS;
+    let agent_path = format!("/db-backups/{name}/restore/{filename}");
+    let call = agent.post_long(&agent_path, Some(agent_body), budget + 60);
+
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(budget), call).await {
+        Ok(inner) => inner.map_err(|e| agent_error("Database import", e))?,
+        Err(_elapsed) => {
+            tracing::warn!(
+                database = %name, filename = %filename,
+                "import outlasted the panel's request timeout; the agent is still running it"
+            );
+            // Deliberately NOT reported as a failure. The import is still running inside
+            // the container, and the operator's natural response to "failed" is to run it
+            // again — on top of a database that is mid-write, which is the one genuinely
+            // destructive thing this information could cause.
+            return Err(err(
+                StatusCode::GATEWAY_TIMEOUT,
+                &format!(
+                    "The import is still running on the server — it was NOT cancelled and \
+                     must not be started again. A dump that takes longer than {budget}s \
+                     outlasts the panel's request timeout, so there is nothing left here to \
+                     watch it with. Browse the tables in a few minutes to see it finish."
+                ),
+            ));
+        }
+    };
+
+    let ip = crate::routes::client_ip(&headers);
+    crate::services::activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "database.import",
+        Some("database"), Some(&name), Some(filename), ip.as_deref(), site_server_id, claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "database.import",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("database"),
+        Some(&name),
+        Some(filename),
+        None,
+        "info",
+        claims.key_id,
+    ).await;
+
+    crate::services::extensions::fire_event(&state.db, "database.imported", serde_json::json!({
+        "database": &name,
+        "database_id": id.to_string(),
+        "filename": filename,
+    }));
+
+    tracing::info!("Database import completed: {name} from {filename}");
+
+    Ok(Json(result))
 }
 
 #[cfg(test)]

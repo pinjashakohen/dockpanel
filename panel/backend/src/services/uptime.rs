@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 struct MonitorRow {
     id: uuid::Uuid,
     user_id: uuid::Uuid,
+    site_id: Option<uuid::Uuid>,
     url: String,
     name: String,
     status: String,
@@ -25,28 +26,7 @@ struct MonitorRow {
 pub async fn run(pool: PgPool, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
     tracing::info!("Uptime monitor started");
     crate::services::status_notices::start_worker(pool.clone());
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        // Follow up to 5 redirects (http->https etc.) but NEVER to an internal address —
-        // closes the redirect-to-internal SSRF/oracle bypass that a bare Policy::limited
-        // would follow. The target host is fully resolved (literal IPs AND hostnames that
-        // resolve to an internal IP are rejected); an over-limit chain surfaces as a
-        // network error (→ "down") rather than a spurious 3xx.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 5 {
-                return attempt.error("too many redirects");
-            }
-            let host = attempt.url().host_str().unwrap_or("").to_string();
-            let port = attempt.url().port_or_known_default().unwrap_or(80);
-            if crate::helpers::host_resolves_internal_blocking(&host, port) {
-                attempt.error("redirect to internal address blocked")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .danger_accept_invalid_certs(false)
-        .build()
-        .unwrap();
+    let client = http_check_client_builder().build().unwrap();
 
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     let mut tick_count: u64 = 0;
@@ -64,7 +44,7 @@ pub async fn run(pool: PgPool, mut shutdown_rx: tokio::sync::broadcast::Receiver
 
         // Get monitors due for checking (HTTP/TCP/ping) + all heartbeat monitors (checked separately)
         let monitors: Vec<MonitorRow> = match sqlx::query_as(
-            "SELECT id, user_id, url, name, status, alert_email, alert_slack_url, alert_discord_url, \
+            "SELECT id, user_id, site_id, url, name, status, alert_email, alert_slack_url, alert_discord_url, \
              monitor_type, port, keyword, keyword_must_contain, check_interval, last_checked_at, custom_headers \
              FROM monitors WHERE enabled = TRUE AND \
              (monitor_type = 'heartbeat' OR last_checked_at IS NULL OR last_checked_at < NOW() - (check_interval || ' seconds')::interval)",
@@ -172,19 +152,69 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
 
     // GAP 29: Response time degradation alerting
     // If the site is technically up but very slow (>5s), fire a warning alert
+    //
+    // This statement could not succeed in any database, and its error was
+    // discarded, so from the day it was written until it was rewritten no
+    // slow-response alert has ever existed: no Dashboard count, no row on the
+    // Alerts page, no Prometheus sample. Three independent faults — it named a
+    // column `subject` that the table does not have (the column is `title`),
+    // omitted `title` which is NOT NULL with no default, and bound a `$2` the
+    // SQL never referenced. It also attributed the alert to whichever server was
+    // created first on the panel rather than to the monitor's own site.
+    //
+    // The title is deliberately free of the measured value: it is what the
+    // NOT EXISTS clause dedupes on, so a site that is slow for an hour raises
+    // one alert rather than one per check. The varying figure lives in the
+    // message, which is not part of the key.
     if new_status == "up" && response_time > 5000 {
-        let _ = sqlx::query(
-            "INSERT INTO alerts (user_id, server_id, alert_type, subject, message, severity, status) \
-             SELECT $1, s.id, 'slow_response', $3, $4, 'warning', 'firing' \
-             FROM servers s ORDER BY s.created_at ASC LIMIT 1 \
-             ON CONFLICT DO NOTHING"
+        // Dedup keys on `state_key` (the monitor's id) rather than on the
+        // title, because the title carries the monitor's NAME: renaming a
+        // slow monitor used to raise a second firing alert for the same
+        // subject, and the rename made the first one unreachable.
+        //
+        // This guard-then-fire split replaced a single atomic
+        // `INSERT ... WHERE NOT EXISTS` — safe because `check_monitor` never
+        // runs twice concurrently for the same monitor (the tick's JoinSet is
+        // fully drained before the next monitor query), so there is no real
+        // TOCTOU window between the two statements below.
+        //
+        // Firing now goes through `notifications::try_fire_alert` instead of a
+        // raw INSERT: the raw form only ever wrote the `alerts` row, so a
+        // firing slow-response alert got no bell/SSE entry, no email/Slack/
+        // Discord delivery and no escalation paging — and could not honour the
+        // per-type mute either, even though "slow_response" has been listed in
+        // SUPPRESSIBLE_ALERT_TYPES as a mutable type since it was added. The
+        // recovery half below already went through `resolve_alert`; this
+        // brings the firing half to the same standard.
+        let state_key = monitor.id.to_string();
+        let already_firing: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM alerts \
+             WHERE alert_type = 'slow_response' AND status = 'firing' \
+               AND user_id = $1 AND state_key = $2)",
         )
         .bind(monitor.user_id)
-        .bind(monitor.id) // unused but keeps param numbering clean
-        .bind(format!("Slow response: {} ({}ms)", monitor.name, response_time))
-        .bind(format!("Response time {}ms exceeds 5000ms threshold for {}", response_time, monitor.url))
-        .execute(pool)
-        .await;
+        .bind(&state_key)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+
+        if !already_firing {
+            if let Err(e) = crate::services::notifications::try_fire_alert(
+                pool,
+                monitor.user_id,
+                None,
+                monitor.site_id,
+                "slow_response",
+                &state_key,
+                "warning",
+                &format!("Slow response: {}", monitor.name),
+                &format!("Response time {}ms exceeds 5000ms threshold for {}", response_time, monitor.url),
+            )
+            .await
+            {
+                tracing::error!("Failed to record slow-response alert for {}: {e}", monitor.name);
+            }
+        }
 
         tracing::warn!("Monitor {} ({}) slow response: {}ms", monitor.name, monitor.url, response_time);
         crate::services::system_log::log_event(
@@ -194,6 +224,34 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
             &format!("Slow response: {} ({}ms)", monitor.name, response_time),
             Some(&format!("URL: {}, threshold: 5000ms", monitor.url)),
         ).await;
+    } else if new_status == "up" {
+        // The recovery half, absent since the alert was first written.
+        //
+        // A firing row with no resolve path is worse than no alert at all: the
+        // dedup guard above reads it and suppresses every subsequent
+        // slow-response alert for this monitor, so the one stuck row also
+        // blinds the check that created it. Meanwhile it stays visible to
+        // `check_escalations` through `idx_alerts_escalation_sweep`
+        // (status = 'firing' AND acknowledged_at IS NULL), which keeps paging
+        // on-call about a site that got faster hours ago.
+        //
+        // `resolve_alert` no-ops when nothing was firing, so the common case —
+        // a fast site staying fast — costs one indexed UPDATE returning zero
+        // rows and sends nothing.
+        crate::services::notifications::resolve_alert(
+            pool,
+            monitor.user_id,
+            None,
+            monitor.site_id,
+            "slow_response",
+            &monitor.id.to_string(),
+            &format!("Slow response resolved: {}", monitor.name),
+            &format!(
+                "Response time is back to {}ms, under the 5000ms threshold, for {}",
+                response_time, monitor.url
+            ),
+        )
+        .await;
     }
 
     // Handle status transitions
@@ -218,13 +276,13 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
             &format!("Monitor down: {} ({})", monitor.name, monitor.url),
             Some(cause),
         ).await;
-        send_alerts(pool, monitor, &format!("{} is down: {cause}", monitor.name)).await;
+        send_alerts(pool, monitor, &format!("{} is down: {cause}", monitor.name), "critical").await;
 
         // GAP 3: Auto-create managed incident for status page
         let _ = create_auto_incident(pool, monitor, cause).await;
 
         // GAP 19: Notify status page subscribers
-        notify_status_subscribers(&monitor.name, "investigating", &format!("{} is experiencing issues: {cause}", monitor.name));
+        notify_status_subscribers(&monitor.name, "investigating", &format!("{} is experiencing issues: {cause}", monitor.name), monitor.user_id);
     } else if new_status == "up" && monitor.status == "down" {
         // Just recovered — resolve incident
         if let Err(e) = sqlx::query(
@@ -241,10 +299,10 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
         let _ = resolve_auto_incident(pool, monitor).await;
 
         // GAP 19: Notify subscribers of recovery
-        notify_status_subscribers(&monitor.name, "resolved", &format!("{} is back online", monitor.name));
+        notify_status_subscribers(&monitor.name, "resolved", &format!("{} is back online", monitor.name), monitor.user_id);
 
         tracing::info!("Monitor {} ({}) is back UP", monitor.name, monitor.url);
-        send_alerts(pool, monitor, &format!("{} is back up ({}ms)", monitor.name, response_time)).await;
+        send_alerts(pool, monitor, &format!("{} is back up ({}ms)", monitor.name, response_time), "info").await;
     }
 }
 
@@ -252,12 +310,24 @@ async fn check_monitor(monitor: &MonitorRow, client: &reqwest::Client, pool: &Pg
 async fn check_tcp(monitor: &MonitorRow) -> (Option<i32>, Option<String>, &'static str, i32) {
     let host = monitor.url.trim_start_matches("tcp://");
     let port = monitor.port.unwrap_or(80) as u16;
-    let addr = format!("{}:{}", host, port);
+    // SSRF re-validation at check time (parity with check_http): a low-TTL record can
+    // flip to an internal IP after write, and rows imported via /settings/import bypass
+    // the create-path guard. An internal target must not be probed.
+    //
+    // Resolved and pinned to the SAME address: dialing `host:port` again below
+    // would let the OS resolve it a second time, independently of the check
+    // just run against it — a rebinding DNS server (or simply a low TTL)
+    // could then answer this second lookup with an internal address the
+    // check above never saw.
+    let addr = match crate::helpers::resolve_validated(host, port).await {
+        Ok(addr) => addr,
+        Err(e) => return (None, Some(format!("Host blocked: {e}")), "down", 0),
+    };
 
     let start = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio::net::TcpStream::connect(&addr),
+        tokio::net::TcpStream::connect(addr),
     ).await;
     let response_time = start.elapsed().as_millis() as i32;
 
@@ -271,12 +341,23 @@ async fn check_tcp(monitor: &MonitorRow) -> (Option<i32>, Option<String>, &'stat
 /// Ping/ICMP check — uses system ping command.
 async fn check_ping(monitor: &MonitorRow) -> (Option<i32>, Option<String>, &'static str, i32) {
     let host = monitor.url.trim_start_matches("ping://");
+    // SSRF re-validation at check time (parity with check_http/check_tcp): reachability
+    // of an internal host is itself the disclosure a ping monitor would leak.
+    //
+    // Pinned to the checked address, same reasoning as check_tcp: `ping` would
+    // otherwise resolve `host` itself, a second and independent lookup from
+    // the one just validated.
+    let addr = match crate::helpers::resolve_validated(host, 0).await {
+        Ok(addr) => addr,
+        Err(e) => return (None, Some(format!("Host blocked: {e}")), "down", 0),
+    };
+    let target = addr.ip().to_string();
     let start = Instant::now();
 
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         safe_command("ping")
-            .args(["-c", "1", "-W", "5", host])
+            .args(["-c", "1", "-W", "5", &target])
             .output()
     ).await;
 
@@ -346,20 +427,160 @@ async fn check_heartbeat(monitor: &MonitorRow, pool: &PgPool) {
                 &format!("Heartbeat missed: {} ({})", monitor.name, monitor.url),
                 Some("No heartbeat received within expected interval"),
             ).await;
-            send_alerts(pool, monitor, &format!("{} heartbeat missed — no ping received", monitor.name)).await;
+            send_alerts(pool, monitor, &format!("{} heartbeat missed — no ping received", monitor.name), "critical").await;
         }
     }
 }
 
+/// Describe a failed HTTP check without republishing the monitor's own URL.
+///
+/// `reqwest::Error`'s `Display` ends with ` for url ({url})` whenever the URL is
+/// known, so `e.to_string()` on a connection failure carries the monitor's
+/// address, path and query string verbatim. That one string becomes three
+/// stored columns — `incidents.cause`, `managed_incidents.description`, and the
+/// `Auto-detected: …` timeline entry — and `/api/status-page/public` serves the
+/// first and third of them to anyone on the internet with no login. A monitor
+/// URL routinely carries a token in its query string, `docs/guides/status-page.md`
+/// states that URLs are not published, and the other public handler drops the
+/// URL deliberately (`routes/monitors.rs::status_page` destructures it to `_url`).
+///
+/// `Error::without_url()` alone is not the repair. For a request-kind error it
+/// leaves the four words `error sending request`, which is the whole message —
+/// every failed HTTP check would read identically and no test would notice.
+/// What an operator needs is the source chain (`Connection refused (os error
+/// 111)`, `invalid peer certificate`), so this keeps that and drops only the
+/// URL. The chain is walked rather than read one level down because the useful
+/// sentence is the operating system's, three or four layers in.
+///
+/// The final scrub is not redundant with `without_url`, and the case that makes
+/// it load-bearing was found by measurement rather than reasoning. Three failure
+/// classes were driven against reqwest 0.12.28 (2026-08-23):
+///
+/// - connection refused → `client error (Connect)` → `Connection refused (os
+///   error 111)`. No host anywhere. The scrub does not fire.
+/// - DNS failure → `dns error` → `failed to lookup address information: Name or
+///   service not known`. No host either — the obvious guess, and it is wrong.
+/// - **TLS hostname mismatch → `invalid peer certificate: certificate not valid
+///   for name "wrong.host.badssl.com"`.** The host, verbatim, in a source layer
+///   that `without_url()` never touches. This is the one that needs the scrub.
+///
+/// ⚠ Residual, measured and deliberate: that same message goes on to name the
+/// *certificate's* declared domains (`DnsName("*.badssl.com")`), which the scrub
+/// does not remove because they are a property of the certificate the target
+/// presented, not of the URL the operator configured. Truncating rustls's
+/// sentence would mean string-matching a dependency's prose, which is the class
+/// of mistake this whole function exists to undo.
+fn describe_check_error(e: reqwest::Error, url: &str) -> String {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    let mut depth = 0;
+    while let Some(cause) = source {
+        if depth >= 4 {
+            break;
+        }
+        let text = cause.to_string();
+        if !text.is_empty() && !msg.contains(&text) {
+            msg.push_str(": ");
+            msg.push_str(&text);
+        }
+        source = std::error::Error::source(cause);
+        depth += 1;
+    }
+
+    redact_monitor_target(msg, url)
+}
+
+/// Remove a monitor's own address from a message about that monitor.
+///
+/// Three needles, longest first: the URL as the operator wrote it, the URL as
+/// `url::Url` normalises it (a bare `http://host` is stored without the trailing
+/// slash and printed with one), and the bare host. Longest-first matters — the
+/// host is a substring of both URLs, so replacing it first would leave the path
+/// and query stranded beside a redaction marker.
+fn redact_monitor_target(mut msg: String, url: &str) -> String {
+    let parsed = url::Url::parse(url).ok();
+    let mut needles: Vec<String> = vec![url.trim().to_string()];
+    if let Some(u) = &parsed {
+        needles.push(u.to_string());
+        if let Some(host) = u.host_str() {
+            needles.push(host.to_string());
+        }
+    }
+    needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    for needle in needles {
+        // Four characters is the shortest thing worth calling an address. Below
+        // that a needle is likelier to be a fragment of an unrelated word, and
+        // redacting it would corrupt the sentence it appears in.
+        if needle.len() >= 4 && msg.contains(&needle) {
+            msg = msg.replace(&needle, "(url withheld)");
+        }
+    }
+    msg
+}
+
+/// The `reqwest::Client` settings every HTTP monitor check shares: a 30s
+/// timeout and a redirect policy that blocks a hop into an internal address.
+/// Extracted so `check_http` can build a FRESH client per call (below) with
+/// these same settings, rather than duplicating them.
+fn http_check_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        // Follow up to 5 redirects (http->https etc.) but NEVER to an internal address —
+        // closes the redirect-to-internal SSRF/oracle bypass that a bare Policy::limited
+        // would follow. The target host is fully resolved (literal IPs AND hostnames that
+        // resolve to an internal IP are rejected); an over-limit chain surfaces as a
+        // network error (→ "down") rather than a spurious 3xx.
+        //
+        // This blocking check catches a literal-IP redirect target outright (hyper's
+        // connector dials a literal IP directly — it never asks a resolver at all, so a
+        // resolver-level guard alone cannot see it) and gives hostname redirects a fast,
+        // synchronous first pass. It does NOT by itself close the TOCTOU between "this
+        // hostname checked clean" and "reqwest connects", which is why `.dns_resolver`
+        // below installs `ValidatingResolver` as well: for a hostname redirect, THAT is
+        // the lookup reqwest actually connects with, so there is nothing left to race.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 5 {
+                return attempt.error("too many redirects");
+            }
+            let host = attempt.url().host_str().unwrap_or("").to_string();
+            let port = attempt.url().port_or_known_default().unwrap_or(80);
+            if crate::helpers::host_resolves_internal_blocking(&host, port) {
+                attempt.error("redirect to internal address blocked")
+            } else {
+                attempt.follow()
+            }
+        }))
+        // Fallback resolver for every hostname reqwest resolves that ISN'T the initial
+        // request's (that one is pinned separately by `pinned_client`'s `.resolve()`
+        // override, checked first) — covers every redirect hop to a different host.
+        .dns_resolver(std::sync::Arc::new(crate::helpers::ValidatingResolver))
+        .danger_accept_invalid_certs(false)
+}
+
 /// HTTP check with optional keyword verification and custom headers.
-async fn check_http(monitor: &MonitorRow, client: &reqwest::Client) -> (Option<i32>, Option<String>, &'static str, i32) {
+///
+/// `_client` is the tick's shared, pooled client — kept as a parameter since
+/// `check_monitor` still threads it through for the other check kinds, but no
+/// longer used HERE for the actual request. A shared client's resolver would
+/// re-resolve `monitor.url`'s host independently of the SSRF check just run
+/// against it; this function instead pins the request to the EXACT address
+/// that check approved, via a fresh per-call client (`pinned_client`) built
+/// with the same settings (`http_check_client_builder`).
+async fn check_http(monitor: &MonitorRow, _client: &reqwest::Client) -> (Option<i32>, Option<String>, &'static str, i32) {
+    let (host, port) = match crate::helpers::url_authority(&monitor.url) {
+        Ok(hp) => hp,
+        Err(e) => return (None, Some(format!("URL blocked: {e}")), "down", 0),
+    };
     // SSRF re-validation at check time: the URL was vetted at write time, but a low-TTL
     // DNS record can flip to an internal IP before the check runs (rebind), and monitors
     // imported via /settings/import bypass the create-path guard entirely. Done BEFORE the
     // timing window so its DNS lookup does not inflate the recorded response_time.
-    if let Err(e) = crate::helpers::validate_url_not_internal(&monitor.url).await {
-        return (None, Some(format!("URL blocked: {e}")), "down", 0);
-    }
+    let client = match crate::helpers::pinned_client(&host, port, http_check_client_builder()).await {
+        Ok(c) => c,
+        Err(e) => return (None, Some(format!("URL blocked: {e}")), "down", 0),
+    };
     let start = Instant::now();
     let mut builder = client.get(&monitor.url);
 
@@ -425,11 +646,22 @@ async fn check_http(monitor: &MonitorRow, client: &reqwest::Client) -> (Option<i
 
             (Some(code), None, "up", response_time)
         }
-        Err(e) => (None, Some(e.to_string()), "down", response_time),
+        Err(e) => (None, Some(describe_check_error(e, &monitor.url)), "down", response_time),
     }
 }
 
-async fn send_alerts(pool: &PgPool, monitor: &MonitorRow, message: &str) {
+/// Deliver a monitor state change to the owner's external channels AND to the
+/// panel's own notification centre.
+///
+/// The panel half was missing entirely: this module had zero `notify_panel`
+/// calls, so a monitored site going down reached email, Slack, Discord and
+/// PagerDuty — every destination that lives outside the product — and never the
+/// bell inside it. An operator watching the panel while a site fell over saw
+/// nothing change. The external channels here are per-monitor (`alert_email`,
+/// `alert_slack_url`, `alert_discord_url`), so they are not subject to the
+/// missing-`alert_rules` gate that silences the security alerts; this is a
+/// straightforward omission rather than a fail-closed default.
+async fn send_alerts(pool: &PgPool, monitor: &MonitorRow, message: &str, severity: &str) {
     // Build notification channels from monitor's per-monitor settings
     let email = if monitor.alert_email {
         sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = $1")
@@ -449,10 +681,20 @@ async fn send_alerts(pool: &PgPool, monitor: &MonitorRow, message: &str) {
 
     let (pagerduty_key, webhook_url) = extra_channels.unwrap_or((None, None));
 
+    // All four of these are encrypted at rest (alert_rules.notify_pagerduty_key/
+    // notify_webhook_url in alerts.rs, monitors.alert_slack_url/alert_discord_url
+    // in monitors.rs). This function only has a PgPool, no AppState/jwt_secret,
+    // so it decrypts the same way notifications::get_user_channels does.
+    use crate::services::secrets_crypto::decrypt_credential_from_env as decrypt_env;
+    let pagerduty_key = pagerduty_key.as_deref().map(decrypt_env);
+    let webhook_url = webhook_url.as_deref().map(decrypt_env);
+    let slack_url = monitor.alert_slack_url.as_deref().map(decrypt_env);
+    let discord_url = monitor.alert_discord_url.as_deref().map(decrypt_env);
+
     let channels = crate::services::notifications::NotifyChannels {
         email,
-        slack_url: monitor.alert_slack_url.clone(),
-        discord_url: monitor.alert_discord_url.clone(),
+        slack_url,
+        discord_url,
         pagerduty_key,
         webhook_url,
         muted_types: String::new(),
@@ -471,6 +713,20 @@ async fn send_alerts(pool: &PgPool, monitor: &MonitorRow, message: &str) {
 
     crate::services::notifications::send_notification(pool, &channels, &subject, message, &html)
         .await;
+
+    // Addressed to the monitor's owner rather than broadcast to every admin:
+    // `monitors.user_id` is who asked to be told, and it is the same identity
+    // the external channels above are built from.
+    crate::services::notifications::notify_panel(
+        pool,
+        Some(monitor.user_id),
+        &subject,
+        message,
+        severity,
+        "monitor",
+        Some("/monitoring?tab=monitors"),
+    )
+    .await;
 }
 
 /// GAP 3: Auto-create a managed incident when a monitor goes down.
@@ -568,10 +824,105 @@ async fn resolve_auto_incident(pool: &PgPool, monitor: &MonitorRow) -> Result<()
 /// Hands off to the shared status-notice worker — see
 /// `services::status_notices` for why this must not run inline in the monitor
 /// check and must not be a detached per-event spawn.
-fn notify_status_subscribers(monitor_name: &str, status: &str, message: &str) {
+fn notify_status_subscribers(monitor_name: &str, status: &str, message: &str, owner_id: uuid::Uuid) {
     crate::services::status_notices::enqueue(
         monitor_name,
         format!("[Status Update] {} — {}", monitor_name, status),
         message.to_string(),
+        owner_id,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deliberately credential-shaped. The reason `describe_check_error` exists
+    /// is that a health endpoint's query string is where people put tokens.
+    const SECRET_URL: &str = "http://127.0.0.1:9/internal/health?api_key=SUPERSECRET123";
+
+    async fn refused_error() -> reqwest::Error {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client builds")
+            .get(SECRET_URL)
+            .send()
+            .await
+            .expect_err("port 9 on loopback must refuse the connection")
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_does_not_republish_the_monitor_url() {
+        let e = refused_error().await;
+
+        // POSITIVE CONTROL, and it is load-bearing: this is the exact string the
+        // panel used to store and publish. If a future reqwest stops printing
+        // the URL, this assertion fails loudly rather than letting the three
+        // below start passing for a reason that has nothing to do with the fix.
+        let raw = e.to_string();
+        assert!(
+            raw.contains("SUPERSECRET123"),
+            "control failed — reqwest no longer prints the URL, so this test proves nothing: {raw}"
+        );
+
+        let described = describe_check_error(e, SECRET_URL);
+        assert!(
+            !described.contains("SUPERSECRET123"),
+            "query string published: {described}"
+        );
+        assert!(
+            !described.contains("internal/health"),
+            "path published: {described}"
+        );
+        assert!(
+            !described.contains("127.0.0.1"),
+            "host published: {described}"
+        );
+
+        // ...and it still says something. `without_url()` on its own leaves the
+        // four words "error sending request" for every failure there is.
+        assert!(
+            described.len() > "error sending request".len(),
+            "message reduced to nothing an operator can act on: {described}"
+        );
+    }
+
+    /// The fixture is a MEASURED string, not an invented one. Driven against
+    /// reqwest 0.12.28 + rustls on 2026-08-23 with a real hostname-mismatch
+    /// target, this is the source-chain text verbatim — and it is the only one
+    /// of the three failure classes that names the host, which is the whole
+    /// reason the scrub exists. `without_url()` does not touch it, because the
+    /// host is inside a source layer rather than in the error's URL slot.
+    #[test]
+    fn the_scrub_removes_the_host_a_tls_mismatch_prints() {
+        let out = redact_monitor_target(
+            "error sending request: client error (Connect): invalid peer certificate: \
+             certificate not valid for name \"status.example.com\"; certificate is only \
+             valid for DnsName(\"*.other.example\")"
+                .to_string(),
+            "https://status.example.com/healthz?token=abc",
+        );
+        assert!(
+            !out.contains("status.example.com"),
+            "host survived the scrub: {out}"
+        );
+        assert!(
+            out.contains("invalid peer certificate"),
+            "the operator's half was destroyed: {out}"
+        );
+    }
+
+    #[test]
+    fn the_scrub_takes_the_whole_url_before_the_bare_host() {
+        // Longest-first is the whole point: the host is a substring of the URL,
+        // so redacting it first would strand the path and query beside the marker.
+        let out = redact_monitor_target(
+            "error sending request for url (https://status.example.com/healthz?token=abc)"
+                .to_string(),
+            "https://status.example.com/healthz?token=abc",
+        );
+        assert!(!out.contains("token=abc"), "query survived: {out}");
+        assert!(!out.contains("healthz"), "path survived: {out}");
+    }
 }

@@ -389,7 +389,7 @@ async fn scan_ssl_expiry() -> Vec<Finding> {
                 title: format!("SSL certificate expiring: {domain}"),
                 description: format!("Certificate expires {date_str}"),
                 file_path: Some(cert_path),
-                remediation: Some("Renew the SSL certificate via the Sites panel".into()),
+                remediation: Some("Renew the SSL certificate from the panel".into()),
             });
         }
     }
@@ -546,7 +546,7 @@ async fn scan_security_headers() -> Vec<Finding> {
     let mut findings = Vec::new();
 
     // Get list of nginx sites
-    let sites_dir = "/etc/nginx/sites-enabled";
+    let sites_dir = super::nginx::sites_dir();
     let mut entries = match tokio::fs::read_dir(sites_dir).await {
         Ok(e) => e,
         Err(_) => return findings,

@@ -234,14 +234,25 @@ fn owner_by_lines(path: &str, markers: &[String]) -> Owner {
 
 /// Does the systemd unit at `path` run `domain`'s app process?
 ///
-/// `create_app_service` writes `WorkingDirectory=/var/www/{domain}/public` and
+/// `create_app_service` writes a `WorkingDirectory` under `/var/www/{domain}` and
 /// `Description=DockPanel App: {domain}`; either identifies the owner, and a
 /// hand-edited description should not be able to make the unit undeletable, so
 /// both are accepted.
+///
+/// ⚠ BOTH working-directory forms are listed, and the `/public` one may not be
+/// dropped. Units written before v2.123.0 hardcoded `{domain}/public`; v2.123.0
+/// starts the process at the site root instead (the crash-loop fix in
+/// `app_process`). Recognising only the new form would hand every unit already on
+/// disk to the `Theirs` branch — `owned_service_name` refuses to stop, restart or
+/// delete one of those — so an upgrade would strand exactly the sites the release
+/// exists to repair. The `Description` marker happens to cover the same case, but
+/// this function's whole reason for accepting two markers is that either one alone
+/// can be edited away.
 pub fn systemd_unit(path: &str, domain: &str) -> Owner {
     owner_by_lines(
         path,
         &[
+            format!("WorkingDirectory=/var/www/{domain}"),
             format!("WorkingDirectory=/var/www/{domain}/public"),
             format!("Description=DockPanel App: {domain}"),
         ],
@@ -257,6 +268,23 @@ pub fn fail2ban_jail(path: &str, domain: &str) -> Owner {
     owner_by_lines(
         path,
         &[format!("logpath = /var/log/nginx/{domain}.access.log")],
+    )
+}
+
+/// Does the allocated SFTP uid `uid` actually belong to `domain`?
+///
+/// Unlike every other resource type in this file, the marker isn't read from
+/// the resource itself (a Linux account has nowhere safe to carry one — its
+/// own home directory is inside the chroot jail the account can write to) but
+/// from a dedicated file `services::sftp_accounts::provision` writes, once,
+/// only after every provisioning step has already succeeded. A caller-passed
+/// uid alone is not proof: `sites.sftp_uid` should always be right, but this
+/// is the same fail-closed shape every other `owned_*` function here uses
+/// rather than trusting a derived or passed-in identifier on its own.
+pub fn sftp_user(uid: i32, domain: &str) -> Owner {
+    owner_by_lines(
+        &crate::services::sftp_accounts::owner_marker_path(uid),
+        &[format!("Domain={domain}")],
     )
 }
 
@@ -309,7 +337,7 @@ pub fn app_vhost(path: &str, host_port: Option<u16>) -> Owner {
 pub fn cert_dir_in_use_elsewhere(domain: &str) -> bool {
     let needle = format!("/etc/dockpanel/ssl/{domain}/");
     let own = format!("{domain}.conf");
-    let Ok(entries) = std::fs::read_dir("/etc/nginx/sites-enabled") else {
+    let Ok(entries) = std::fs::read_dir(super::nginx::sites_dir()) else {
         // Cannot tell — assume shared. Refusing to delete a cert directory is
         // recoverable; deleting one another vhost still points at is not.
         return true;
@@ -327,6 +355,104 @@ pub fn cert_dir_in_use_elsewhere(domain: &str) -> bool {
         }
     }
     false
+}
+
+/// Is the registered certificate `alias` still referenced by any vhost on this
+/// box — in service or parked?
+///
+/// The same question as [`cert_dir_in_use_elsewhere`] asked of the other tree,
+/// with one difference: there is no "own" vhost to skip, because a registered
+/// certificate belongs to no domain. Any vhost naming its directory is a reason
+/// not to delete it — a parked one included, since enabling that site would put
+/// a vhost pointing at a missing file back into service, which fails the next
+/// `nginx -t` for every site on the box.
+///
+/// Answered from the vhosts rather than the panel's database for the reason the
+/// sibling gives: the agent has no database, and the vhosts are what nginx will
+/// actually parse. A vhost tree that cannot be read is assumed to reference it.
+pub fn registry_cert_in_use(alias: &str) -> bool {
+    let needle = format!("{}/{alias}/", super::ssl::SSL_REGISTRY_DIR);
+    registry_needle_in_use(
+        &needle,
+        std::path::Path::new(super::nginx::sites_dir()),
+        // The parent of the parked path `nginx::vhost_paths` spells — the SAME
+        // directory as the live one on the RHEL family, which has no second
+        // directory; `registry_needle_references` skips the double scan then.
+        std::path::Path::new(super::nginx::parked_dir()),
+    )
+}
+
+/// Every vhost file that names the registered certificate `alias`, in service
+/// or parked — so a refusal to delete it can say WHICH files, and the operator
+/// knows whether to move a domain or clear a parked configuration. `Err` means
+/// a tree could not be read, which the caller must treat as "in use".
+pub fn registry_cert_references(alias: &str) -> Result<Vec<String>, String> {
+    let needle = format!("{}/{alias}/", super::ssl::SSL_REGISTRY_DIR);
+    registry_needle_references(
+        &needle,
+        std::path::Path::new(super::nginx::sites_dir()),
+        std::path::Path::new(super::nginx::parked_dir()),
+    )
+}
+
+/// The directory walk behind [`registry_cert_in_use`], with the two roots as
+/// arguments so a test can point it at a scratch tree. `true` for any
+/// reference, and for a tree that could not be read.
+fn registry_needle_in_use(
+    needle: &str,
+    live_dir: &std::path::Path,
+    parked_dir: &std::path::Path,
+) -> bool {
+    match registry_needle_references(needle, live_dir, parked_dir) {
+        Ok(refs) => !refs.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// The files under the two roots whose text names `needle`.
+///
+/// Both trees are read whole — the parked one too, without filtering on the
+/// parked filename, which `nginx::vhost_paths` alone may spell. A hand-kept
+/// copy in that directory naming the pair is a reader nginx could be handed
+/// next, so it counts. An unreadable in-service tree is an error. A parked
+/// tree that does not exist holds nothing parked; any other failure to read
+/// it is an error for the same fail-closed reason as the sibling — refusing a
+/// delete is recoverable, deleting a referenced pair is not.
+fn registry_needle_references(
+    needle: &str,
+    live_dir: &std::path::Path,
+    parked_dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    let live = std::fs::read_dir(live_dir)
+        .map_err(|e| format!("cannot read {}: {e}", live_dir.display()))?;
+    for entry in live.flatten() {
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            if content.contains(needle) {
+                found.push(entry.path().display().to_string());
+            }
+        }
+    }
+    // The RHEL family has no separate parked directory (see `nginx::parked_dir`)
+    // — live and parked are the same path there, and the live scan above
+    // already covered it. Scanning again would list every match twice.
+    if parked_dir == live_dir {
+        return Ok(found);
+    }
+    let parked = match std::fs::read_dir(parked_dir) {
+        Ok(parked) => parked,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(e) => return Err(format!("cannot read {}: {e}", parked_dir.display())),
+    };
+    for entry in parked.flatten() {
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            if content.contains(needle) {
+                found.push(entry.path().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -368,6 +494,36 @@ mod tests {
         );
         assert_eq!(systemd_unit(&p, "a.b.com"), Owner::Ours);
         assert_eq!(systemd_unit(&p, "a-b.com"), Owner::Theirs);
+    }
+
+    /// v2.123.0 moved a managed process off `{domain}/public` and onto the site
+    /// root. Ownership is keyed on that very line, so BOTH spellings have to be
+    /// recognised — and the one that matters on an upgrade is the OLD one: every
+    /// unit already on disk carries it, and `owned_service_name` refuses to stop,
+    /// restart or delete anything this function calls `Theirs`. Dropping the
+    /// superseded marker would strand exactly the sites the release repairs.
+    ///
+    /// The description is deliberately omitted from both fixtures. With it
+    /// present either marker alone satisfies the check, and the arm would pass
+    /// without ever exercising the WorkingDirectory line it exists to pin.
+    #[test]
+    fn both_working_directory_forms_are_ours_and_neither_leaks_to_a_collision() {
+        let (_d1, new_form) =
+            tmpfile("[Service]\nWorkingDirectory=/var/www/a.b.com\nExecStart=node server.js\n");
+        assert_eq!(systemd_unit(&new_form, "a.b.com"), Owner::Ours);
+        assert_eq!(systemd_unit(&new_form, "a-b.com"), Owner::Theirs);
+
+        let (_d2, old_form) = tmpfile(
+            "[Service]\nWorkingDirectory=/var/www/a.b.com/public\nExecStart=node server.js\n",
+        );
+        assert_eq!(systemd_unit(&old_form, "a.b.com"), Owner::Ours);
+        assert_eq!(systemd_unit(&old_form, "a-b.com"), Owner::Theirs);
+
+        // The site-root marker is a strict PREFIX of the public one, so an
+        // unanchored comparison would let a unit for `a.b.com` answer for a
+        // sibling whose name merely starts the same way. `owner_by_lines` compares
+        // whole trimmed lines; this asserts it stays that way.
+        assert_eq!(systemd_unit(&new_form, "a.b.co"), Owner::Theirs);
     }
 
     #[test]
@@ -553,5 +709,81 @@ mod tests {
         // The legacy space addresses the OLD name, not the scoped one — that is
         // the entire reason it exists.
         assert_eq!(GitScope::PreviewLegacy.scoped("a-pr-b"), "a-pr-b");
+    }
+
+    /// A scratch vhost tree: an in-service directory and a parked one.
+    struct TmpTree(std::path::PathBuf);
+
+    impl Drop for TmpTree {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn tmptree() -> (TmpTree, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("dp-reg-{}", uuid::Uuid::new_v4()));
+        let live = root.join("sites-enabled");
+        let parked = root.join("sites-available");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&parked).unwrap();
+        (TmpTree(root), live, parked)
+    }
+
+    #[test]
+    fn a_registered_certificate_is_in_use_while_any_vhost_names_it() {
+        let needle = format!("{}/wild/", super::super::ssl::SSL_REGISTRY_DIR);
+        let (_t, live, parked) = tmptree();
+        assert!(!registry_needle_in_use(&needle, &live, &parked));
+
+        // An in-service vhost.
+        std::fs::write(
+            live.join("a.example.com.conf"),
+            format!("server {{\n    ssl_certificate {needle}fullchain.pem;\n}}\n"),
+        )
+        .unwrap();
+        assert!(registry_needle_in_use(&needle, &live, &parked));
+        // A DIFFERENT alias whose name merely shares a prefix is not this one.
+        assert!(!registry_needle_in_use(
+            &format!("{}/wil/", super::super::ssl::SSL_REGISTRY_DIR),
+            &live,
+            &parked
+        ));
+        std::fs::remove_file(live.join("a.example.com.conf")).unwrap();
+
+        // A parked vhost counts: enabling the site would bring the reference back.
+        std::fs::write(
+            parked.join("b.example.com.parked"),
+            format!("ssl_certificate_key {needle}privkey.pem;\n"),
+        )
+        .unwrap();
+        assert!(registry_needle_in_use(&needle, &live, &parked));
+        std::fs::remove_file(parked.join("b.example.com.parked")).unwrap();
+        assert!(!registry_needle_in_use(&needle, &live, &parked));
+    }
+
+    #[test]
+    fn a_single_shared_directory_is_not_scanned_twice() {
+        // The RHEL family has no separate parked directory — live and parked
+        // are the SAME path (see `nginx::parked_dir`). Scanning it twice would
+        // list a matching file twice, which is exactly what this pins against.
+        let needle = format!("{}/wild/", super::super::ssl::SSL_REGISTRY_DIR);
+        let (_t, live, _parked) = tmptree();
+        std::fs::write(
+            live.join("a.example.com.conf"),
+            format!("server {{\n    ssl_certificate {needle}fullchain.pem;\n}}\n"),
+        )
+        .unwrap();
+        let refs = registry_needle_references(&needle, &live, &live).unwrap();
+        assert_eq!(refs.len(), 1, "a shared live/parked directory must be scanned once, not twice: {refs:?}");
+    }
+
+    #[test]
+    fn an_unreadable_vhost_tree_is_assumed_to_reference_it() {
+        let needle = format!("{}/wild/", super::super::ssl::SSL_REGISTRY_DIR);
+        let (_t, live, parked) = tmptree();
+        let missing = live.join("nope");
+        assert!(registry_needle_in_use(&needle, &missing, &parked));
+        // A parked tree that has never existed holds nothing parked.
+        assert!(!registry_needle_in_use(&needle, &live, &parked.join("nope")));
     }
 }

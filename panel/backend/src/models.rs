@@ -18,13 +18,6 @@ pub struct User {
     #[serde(skip_serializing)]
     pub reset_expires: Option<DateTime<Utc>>,
     #[serde(skip_serializing)]
-    pub stripe_customer_id: Option<String>,
-    #[serde(skip_serializing)]
-    pub stripe_subscription_id: Option<String>,
-    pub plan: String,
-    pub plan_status: String,
-    pub plan_server_limit: i32,
-    #[serde(skip_serializing)]
     pub totp_secret: Option<String>,
     pub totp_enabled: bool,
     #[serde(skip_serializing)]
@@ -103,6 +96,25 @@ pub struct Site {
     pub ssl_profile: Option<String>,
     pub ssl_renewal_at: Option<DateTime<Utc>>,
     pub ssl_renewal_checked_at: Option<DateTime<Utc>>,
+    /// Which ACME challenge issued the installed certificate: `http-01` or
+    /// `dns-01`. NULL means "not recorded" — a row that predates the provenance
+    /// migration and that the activity-log backfill could not prove. Renewal
+    /// treats NULL as unknown and never as `http-01`; see
+    /// [`crate::helpers::renewal_plan`].
+    pub ssl_challenge: Option<String>,
+    /// The name the certificate was actually ORDERED for. Equal to `domain`
+    /// except for a wildcard, where it is the Cloudflare zone — the certificate
+    /// covers `{subject}` and `*.{subject}`, never `*.{domain}`.
+    pub ssl_cert_subject: Option<String>,
+    /// Three-state on purpose: `Some(true)` wildcard, `Some(false)` not, `None`
+    /// not recorded. A default `false` would assert "not a wildcard" over every
+    /// legacy apex wildcard, which is exactly the row that cannot be identified.
+    pub ssl_wildcard: Option<bool>,
+    /// The `dns_zones` row whose Cloudflare credential issued this certificate.
+    /// Renewal uses THIS row rather than re-deriving a zone from the subject, so
+    /// the credential that renews is provably the credential that issued and no
+    /// text match can select another tenant's token.
+    pub ssl_dns_zone_id: Option<Uuid>,
     pub rate_limit: Option<i32>,
     pub max_upload_mb: i32,
     pub php_memory_mb: i32,
@@ -121,6 +133,22 @@ pub struct Site {
     pub csp_policy: Option<String>,
     pub permissions_policy: Option<String>,
     pub bot_protection: String,
+    /// Monthly bandwidth cap in MB. NULL = unlimited (default). Read by
+    /// `traffic_accounting_scheduler` against the current month's
+    /// `site_traffic_usage` row.
+    pub bandwidth_quota_mb: Option<i32>,
+    /// Set the instant the scheduler auto-disables this site for exceeding
+    /// `bandwidth_quota_mb`; the only thing distinguishing that from a manual
+    /// disable. Cleared by a manual re-enable, a quota raise/removal, or a new
+    /// calendar month.
+    pub bandwidth_suspended_at: Option<DateTime<Utc>>,
+    /// Opt-in per site. Enabling it is the one moment DockPanel restructures an
+    /// existing site's docroot (content moves under a writable subdirectory so
+    /// the OpenSSH chroot boundary can stay root-owned) — see
+    /// `services::sftp_accounts` on the agent.
+    pub sftp_enabled: bool,
+    pub sftp_uid: Option<i32>,
+    pub sftp_gid: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

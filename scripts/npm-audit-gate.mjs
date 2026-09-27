@@ -12,8 +12,16 @@
 // written reason. An allowlist entry that no longer matches anything is reported
 // too — an entry nothing can hit is how an allowlist quietly turns into a blanket.
 //
-// Usage:  node scripts/npm-audit-gate.mjs [--input audit.json] [--level high]
+// Usage:  node scripts/npm-audit-gate.mjs [--input audit.json] [--level moderate]
 //         (run from the directory holding the package.json to audit)
+//
+// s467: the default was `high` from the day this gate was written, which meant
+// a MODERATE-severity advisory never even reached the waived/blocking split
+// below — not waived, just silently below threshold. GitHub's Dependabot has no
+// such floor, so it flagged two `qs` advisories (website/server, both moderate)
+// that this gate had never been able to see, on any manifest, since it existed.
+// Lowered to `moderate` to match what Dependabot actually reports; `low`/`info`
+// stay excluded as genuinely not worth a blocked push over.
 //
 // Exit codes, kept distinct because the pre-push hook treats them differently:
 //   0  clean, or everything at/above the level is waived
@@ -26,27 +34,23 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
 const ALLOWLIST = [
-  {
-    id: 'GHSA-qwww-vcr4-c8h2',
-    package: 'react-router',
-    reviewed: '2026-07-27',
-    reason:
-      'RSC-mode CSRF bypass. Requires the React Router server runtime — a request ' +
-      'handler executing server actions. Both of our frontends are Vite SPAs that ' +
-      'import BrowserRouter from react-router-dom and ship as static assets: no ' +
-      '@react-router/node|serve|dev, no createRequestHandler, no ssr config, no ' +
-      'server actions. The only fix npm offers is a downgrade to 7.11.0, which is ' +
-      'a breaking change to buy protection against a mode we do not run. ' +
-      'Upstream first_patched_version is 8.3.0 — a MAJOR, so no in-range bump ' +
-      'exists and clearing this advisory means migrating both frontends to v8. ' +
-      'Re-derived independently 2026-07-27 and the premises still hold. ' +
-      'BOTH halves of this waiver are now checked rather than trusted: the ' +
-      'upstream half daily by live-surfaces-check.sh section 4 (fails the moment a ' +
-      '7.x fix lands), and the half that is a fact about US — no server runtime ' +
-      'here — by ssl-correctness-pin-e2e.sh section A, which fails if any frontend ' +
-      'gains @react-router/*, a react-router.config.*, or a request handler. ' +
-      'Re-check when react-router ships a fix inside the ^7 range.',
-  },
+  // Empty on purpose, and that is the interesting state: nothing is currently
+  // being excused.
+  //
+  // It held GHSA-qwww-vcr4-c8h2 (react-router RSC-mode CSRF bypass) from
+  // 2026-07-27. The waiver's reason ended "re-check when react-router ships a fix
+  // inside the ^7 range", and `live-surfaces-check.sh` was given the job of
+  // watching for exactly that rather than trusting it. On 2026-08-07 it fired:
+  // 7.18.2 carries the fix. Both frontends were already on `^7.18.1`, so the fix
+  // was one `npm install` inside the range the waiver said would need a major
+  // migration — the waiver was accurate when written and stopped being accurate
+  // without any commit here changing.
+  //
+  // ⚠ Retiring a waiver is not just deleting the entry: two checks existed to
+  // police THIS waiver and both had to be re-pointed, or they would have gone on
+  // asserting that a waiver exists. See `ssl-correctness-pin-e2e.sh` §A and
+  // `live-surfaces-check.sh` §4, which now assert the opposite — that the
+  // advisory is NOT waived, and that the version we ship is at or above the fix.
 ];
 
 const RANK = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
@@ -56,7 +60,7 @@ const argOf = (flag) => {
   const i = args.indexOf(flag);
   return i === -1 ? null : args[i + 1];
 };
-const level = argOf('--level') ?? 'high';
+const level = argOf('--level') ?? 'moderate';
 const inputFile = argOf('--input');
 
 let raw;

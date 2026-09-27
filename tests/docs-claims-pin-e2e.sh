@@ -147,23 +147,26 @@ else
   # hypothetical: s288 shipped two new suites, neither was added here, and the
   # published total was wrong until s289 caught it from the other direction.
   # Count the tree and compare.
-  # Two deliberate exclusions, each named with its reason rather than absorbed
-  # into a fudge factor, so a THIRD unpublished suite still fails:
+  # ONE deliberate exclusion, named with its reason rather than absorbed into a
+  # fudge factor, so a second unpublished suite still fails:
   #
   #   docs-claims  — this suite. It re-runs the others; a row for itself would
   #                  recurse.
-  #   tier2        — despite the `-pin-e2e.sh` name it is a LIVE-BOX suite: it
-  #                  drives /api/agent/checkin against a running API and mints a
-  #                  JWT, so it reports no tally on a CI runner and its
-  #                  assertion count is not derivable here. The name is the trap
-  #                  — the glob says "source pin", the file is an e2e test.
+  #
+  # There were two until s346. The other was tier2, excluded because despite its
+  # `-pin-e2e.sh` name it is a LIVE-BOX suite — the arm below EXECUTES every
+  # suite it publishes, and tier2 needs a running API and a database, so on this
+  # runner it exits before printing any tally at all. That is still true, which
+  # is exactly why publishing a row for it would have been wrong: it was renamed
+  # out of the glob instead, and is described in prose on the page beside
+  # live-surfaces-check.sh, which is excluded for the same reason.
   on_disk=$(find tests -maxdepth 1 -name '*-pin-e2e.sh' \
-              ! -name 'docs-claims-pin-e2e.sh' ! -name 'tier2-pin-e2e.sh' | wc -l)
+              ! -name 'docs-claims-pin-e2e.sh' | wc -l)
   if [ "$on_disk" -eq "$rows" ]; then
     ok "every pin suite on disk has a row in the table ($on_disk)"
   else
     missing=$(comm -23 \
-      <(find tests -maxdepth 1 -name '*-pin-e2e.sh' ! -name 'docs-claims-pin-e2e.sh' ! -name 'tier2-pin-e2e.sh' -printf '%f\n' | sort) \
+      <(find tests -maxdepth 1 -name '*-pin-e2e.sh' ! -name 'docs-claims-pin-e2e.sh' -printf '%f\n' | sort) \
       <(grep -oE '^\| *`[a-z0-9-]+\.sh`' "$TESTING" | tr -d '|` ' | sort) | tr '\n' ' ')
     bad "$on_disk pin suites on disk but $rows rows in docs/testing.md — unpublished: ${missing:-?}"
   fi
@@ -195,7 +198,33 @@ else
            twenty-one twenty-two twenty-three twenty-four twenty-five twenty-six
            twenty-seven twenty-eight twenty-nine thirty thirty-one thirty-two
            thirty-three thirty-four thirty-five thirty-six thirty-seven
-           thirty-eight thirty-nine forty"
+           thirty-eight thirty-nine forty forty-one forty-two forty-three
+           forty-four forty-five forty-six forty-seven forty-eight forty-nine
+           fifty fifty-one fifty-two fifty-three fifty-four fifty-five
+           fifty-six fifty-seven fifty-eight fifty-nine sixty sixty-one
+           sixty-two sixty-three sixty-four sixty-five sixty-six sixty-seven
+           sixty-eight sixty-nine seventy seventy-one seventy-two seventy-three
+           seventy-four seventy-five seventy-six seventy-seven seventy-eight
+           seventy-nine eighty eighty-one eighty-two eighty-three eighty-four
+           eighty-five eighty-six eighty-seven eighty-eight eighty-nine ninety
+           ninety-one ninety-two ninety-three ninety-four ninety-five
+           ninety-six ninety-seven ninety-eight ninety-nine one-hundred
+           one-hundred-one one-hundred-two one-hundred-three one-hundred-four
+           one-hundred-five one-hundred-six one-hundred-seven one-hundred-eight
+           one-hundred-nine one-hundred-ten one-hundred-eleven one-hundred-twelve
+           one-hundred-thirteen one-hundred-fourteen one-hundred-fifteen
+           one-hundred-sixteen one-hundred-seventeen one-hundred-eighteen
+           one-hundred-nineteen one-hundred-twenty one-hundred-twenty-one
+           one-hundred-twenty-two one-hundred-twenty-three one-hundred-twenty-four
+           one-hundred-twenty-five one-hundred-twenty-six one-hundred-twenty-seven
+           one-hundred-twenty-eight one-hundred-twenty-nine one-hundred-thirty
+           one-hundred-thirty-one one-hundred-thirty-two one-hundred-thirty-three
+           one-hundred-thirty-four one-hundred-thirty-five one-hundred-thirty-six
+           one-hundred-thirty-seven one-hundred-thirty-eight one-hundred-thirty-nine
+           one-hundred-forty one-hundred-forty-one one-hundred-forty-two
+           one-hundred-forty-three one-hundred-forty-four one-hundred-forty-five
+           one-hundred-forty-six one-hundred-forty-seven one-hundred-forty-eight
+           one-hundred-forty-nine one-hundred-fifty"
     n=0; want_word=""
     for w in $words; do n=$((n+1)); [ "$n" -eq "$rows" ] && want_word="$w"; done
     if [ "$p_assert" != "$sum" ]; then
@@ -384,7 +413,7 @@ echo "── 6. Every published figure is quoted from the measurement register �
 REGISTER=FEATURES.md
 MEAS=website/client/src/measurements.ts
 
-declare -A REG REG_SRC
+declare -A REG REG_SRC REG_UNIT
 reg_rows=0
 while IFS='|' read -r _ metric value source _; do
   metric=$(sed -e 's/^ *//' -e 's/ *$//' -e 's/\*\*//g' <<<"$metric")
@@ -395,6 +424,14 @@ while IFS='|' read -r _ metric value source _; do
   [ -z "$metric" ] || [ -z "$num" ] && continue
   REG["$metric"]="$num"
   REG_SRC["$metric"]="$source"
+  # The unit comes from the register's own value cell, so §6c can demand it
+  # without a second hand-maintained structure to fall out of step. A bare
+  # number is a weak predicate: README publishes "14 categories" twice, which
+  # would satisfy a presence check for the 14 MB API footprint on its own.
+  case "$value" in
+    *MB*) REG_UNIT["$metric"]="MB" ;;
+    *)    REG_UNIT["$metric"]="" ;;
+  esac
   reg_rows=$((reg_rows+1))
 done < <(awk '/^## Verified Metrics/ {inside=1; next} inside && /^## / {exit} inside && /^\|/ {print}' "$REGISTER")
 
@@ -411,6 +448,29 @@ fi
 # below is a FAILURE rather than a skip: otherwise adding a metric would quietly
 # create the blind spot this suite exists to prevent.
 
+# Count axum route registrations under a source tree.
+#
+# ⚠ s354: this used to be `grep -oE '\.route\("[^"]+"'`, which requires the path
+# to sit on the SAME LINE as `.route(`. rustfmt is free to wrap a registration
+# whose path and handlers exceed 100 columns, and NINE routes in this tree are
+# wrapped that way — `/api/ssl/contact-email`, four nginx routes and four
+# wordpress routes. Every one was invisible, so the published figure read 813
+# against a real 821, and it drifted further every time a handler list grew long
+# enough to wrap. A line-anchored count of a construct the formatter may wrap is
+# not a count of that construct.
+#
+# Slurped per file with `perl -0777` so the newline between `.route(` and its
+# path stops mattering. Per FILE, never a concatenated stream: on one stream a
+# file ending in `.route(` could match the next file's opening string literal.
+route_count() {
+  local total=0 n f
+  while IFS= read -r f; do
+    n=$(perl -0777 -ne '$c++ while /\.route\(\s*"[^"]+"/gs; END{print $c+0}' "$f")
+    total=$((total + n))
+  done < <(find "$1" -name '*.rs')
+  echo "$total"
+}
+
 derive() {
   case "$1" in
     "App templates")
@@ -419,8 +479,7 @@ derive() {
       # Routes registered on the two axum routers. The published figure used to
       # be "776 API endpoints (496 backend + 280 agent)" — a decomposition that
       # summed correctly and matched source on neither side.
-      echo $(( $(grep -rhoE '\.route\("[^"]+"' panel/backend/src --include='*.rs' 2>/dev/null | wc -l) \
-              + $(grep -rhoE '\.route\("[^"]+"' panel/agent/src   --include='*.rs' 2>/dev/null | wc -l) )) ;;
+      echo $(( $(route_count panel/backend/src) + $(route_count panel/agent/src) )) ;;
     "Regression-pin assertions")
       # Re-summed from docs/testing.md's own table, independently of §3.
       awk -F'|' '/^\| *`[a-z0-9-]+\.sh` *\|/ { gsub(/ /,"",$3); s+=$3 } END { print s+0 }' docs/testing.md ;;
@@ -503,7 +562,8 @@ else
   check_spa "API binary"                               binary api
   check_spa "Agent binary"                             binary agent
   check_spa "CLI binary"                               binary cli
-  check_spa "Panel binaries, all three"                binary total
+  check_spa "MCP binary"                               binary mcp
+  check_spa "Panel binaries, all four"                 binary total
   check_spa "API RAM (RSS)"                            ram    api
   check_spa "Agent RAM (RSS)"                          ram    agent
   check_spa "Panel services RAM (agent + API)"         ram    services
@@ -523,14 +583,81 @@ fi
 # keeps finding elsewhere.
 
 declare -A SURFACES=(
-  ["Panel services RAM (agent + API)"]="README.md COMPARISON.md docs/getting-started.md"
-  ["Full-stack RAM (with bundled PostgreSQL)"]="COMPARISON.md docs/getting-started.md"
-  ["Panel binaries, all three"]="README.md COMPARISON.md"
-  ["App templates"]="README.md"
-  ["HTTP routes"]="README.md"
+  ["Panel services RAM (agent + API)"]="README.md COMPARISON.md docs/getting-started.md website/client/index.html"
+  ["Panel binaries, all four"]="README.md COMPARISON.md website/client/index.html"
+  # s354: the two agent metrics had NO row here at all, so `docs/guides` — the
+  # only surface that publishes them — could not have been checked even if it had
+  # been listed. It published ~20MB/~30MB against a register reading 21/~35 for
+  # 146 days, live on docs.dockpanel.dev, and no arm could see it.
+  # s377: `App templates` was mapped to README alone while THREE more surfaces
+  # publish it. Same shape as the s354 agent-metric gap and the s376
+  # api-reference gap — the third recurrence of "the map is a hand list, and
+  # what is missing from it is exactly what drifts".
+  # s412: a FOURTH surface was missing — measurements.ts's own `templates: N`.
+  # §1's CLAIM_RE above only matches "N templates" (number BEFORE the word),
+  # so it never saw `templates: 148,` (word before number, TypeScript object
+  # syntax); §1's own trailing comment claimed "§6 covers the site instead, by
+  # way of the register" — untrue until this line, since the site was not
+  # actually listed here. Nothing anywhere checked the one file every other
+  # surface derives its own count from.
+  ["App templates"]="README.md FEATURES.md docs/api-reference.md docs/cli-reference.md website/client/src/measurements.ts"
+  # s377: `API binary` and `CLI binary` had NO row at all, while README.md:245
+  # publishes both on the same line as `Agent binary`, which DID have one. So
+  # `a37e43c` re-measured the register from the published v2.103.0 assets, moved
+  # the README masthead, and left the README body quoting 22 MB against a
+  # register reading 23 — for seven days, invisible, because the only arm that
+  # could have seen it had no row for that metric. Its two line-mates moved
+  # because they were mapped. That is the whole mechanism.
+  ["API binary"]="README.md"
+  ["CLI binary"]="README.md"
+  ["MCP binary"]="README.md"
+  # s378: the s377 repair of README.md:245 mapped that line's API and CLI
+  # binaries and stopped there, while the SAME LINE also publishes the agent
+  # binary, both RAM figures and the full-stack total. Four of the five gaps
+  # below were on the one line the previous fix had open in front of it — the
+  # class reproduced one column over. `API RAM (RSS)` had no row at all, and the
+  # two s354 rows below covered one of their three publishers each.
+  ["Agent binary"]="README.md docs/guides/multi-server.md"
+  ["Agent RAM (RSS)"]="README.md COMPARISON.md docs/guides/multi-server.md"
+  ["API RAM (RSS)"]="README.md COMPARISON.md"
+  ["Full-stack RAM (with bundled PostgreSQL)"]="README.md COMPARISON.md docs/getting-started.md"
+  ["HTTP routes"]="README.md docs/api-reference.md"
   ["Regression-pin assertions"]="README.md docs/testing.md"
   ["Supervised background services"]="README.md"
+  # s412: both of these were declared REGISTER_ONLY below while
+  # CONTRIBUTING.md:61-70 published them the whole time, inside the ASCII repo
+  # tree under "Architecture" — "Frontend pages" as a stale 48 against a real
+  # 53, "DB migrations" as a stale 118 against a real 119 (five OTHER counts on
+  # the same tree, not register-tracked, had also drifted — fixed in the same
+  # commit but not pinned, since they are not `FEATURES.md` rows). A
+  # REGISTER_ONLY declaration is not verified against anything; it is trusted
+  # on the strength of the person who wrote it having actually checked. Neither
+  # had been.
+  ["Frontend pages"]="CONTRIBUTING.md"
+  ["DB migrations"]="CONTRIBUTING.md"
 )
+
+# Metrics the register is the ONLY publisher of. Declared rather than absent:
+# an unlisted metric used to be silently skipped by the loop below, which is
+# how four of the rows above went unguarded. Being register-only is a decision,
+# and this is where it is recorded.
+declare -A REGISTER_ONLY=(
+)
+
+# The map must be TOTAL over the register. §6a three sections up already rejects
+# a register row marked `derived` that has no derivation, and says why: adding a
+# metric would otherwise quietly create the blind spot this suite exists to
+# prevent. §6c stated the same rule and did not enforce it — an unmapped metric
+# was silently skipped, which is exactly how the s354, s376, s377 and s378 gaps
+# each survived. A new metric now has to be placed on one side or the other.
+for metric in "${!REG[@]}"; do
+  if [ -n "${SURFACES[$metric]+x}" ] && [ -n "${REGISTER_ONLY[$metric]+x}" ]; then
+    bad "'$metric' is both mapped to surfaces and declared register-only — one of the two is wrong"
+  elif [ -z "${SURFACES[$metric]+x}" ] && [ -z "${REGISTER_ONLY[$metric]+x}" ]; then
+    bad "the register publishes '$metric' but §6c neither maps it to a surface nor declares it register-only — no arm can see it drift"
+  fi
+done
+ok "every one of the $reg_rows register metrics is either mapped to its surfaces or declared register-only"
 
 surface_checks=0
 for metric in "${!SURFACES[@]}"; do
@@ -539,16 +666,25 @@ for metric in "${!SURFACES[@]}"; do
     bad "the register has no '$metric' row, but surfaces are mapped to it — the map and the register disagree"
     continue
   fi
+  # A bare number is a presence check a coincidence can satisfy: README carries
+  # "148 templates across 14 categories" twice, which would green the 14 MB API
+  # footprint on README no matter what :245 said. Where the register states a
+  # unit, demand it.
+  if [ -n "${REG_UNIT[$metric]}" ]; then
+    pat="(^|[^0-9.])${want} ?${REG_UNIT[$metric]}"
+  else
+    pat="(^|[^0-9.])${want}([^0-9.]|\$)"
+  fi
   for f in ${SURFACES[$metric]}; do
     if [ ! -f "$f" ]; then
       bad "$f is mapped as publishing '$metric' but does not exist"
       continue
     fi
     surface_checks=$((surface_checks+1))
-    if grep -qE "(^|[^0-9.])${want}([^0-9.]|\$)" "$f"; then
-      ok "$f carries the register's $metric ($want)"
+    if grep -qE "$pat" "$f"; then
+      ok "$f carries the register's $metric ($want${REG_UNIT[$metric]})"
     else
-      bad "$f publishes '$metric' but does not contain the register's value $want — it is quoting an older measurement"
+      bad "$f publishes '$metric' but does not contain the register's value $want${REG_UNIT[$metric]} — it is quoting an older measurement"
     fi
   done
 done
@@ -577,16 +713,26 @@ declare -A SUPERSEDED=(
   ["~19 MB"]="the panel's memory footprint, published for four months against a real reading of ~49MB"
   ["~85MB"]="full-stack memory; the real figure with PostgreSQL is ~109MB"
   ["~85 MB"]="full-stack memory; the real figure with PostgreSQL is ~109MB"
-  ["~41MB"]="binaries on disk; the published release totals ~45MB"
-  ["~41 MB"]="binaries on disk; the published release totals ~45MB"
+  ["~41MB"]="binaries on disk; the published release totals ~46MB"
+  ["~41 MB"]="binaries on disk; the published release totals ~46MB"
   ["776 API endpoints"]="a count whose own decomposition matched source on neither side; it is 809 routes"
   ["454 E2E tests"]="a total nothing derived; the derived figure is 302 regression assertions"
   ["11 background services"]="there are 15 supervised background services"
+  ["~20MB, ~30MB RAM"]="the agent's size and footprint, published on docs.dockpanel.dev for 146 days against a register reading 21 MB / ~35 MB"
+  ["22 MB on disk"]="binaries on disk in the site's meta tags; the register totals 46 MB, and the tags matched no register row in either figure"
+  ["~52 MB of memory"]="the panel's footprint in the site's meta tags; the two services measure ~49 MB"
+  ["API (~22MB)"]="the API binary in README's own 'Under the hood' line; the published asset is 23.2 MB and the register says 23"
 )
 
+# s354 added the last two. `index.html` was the sharpest gap in this list: it is
+# served on EVERY request to dockpanel.dev and is what a search engine and a
+# social preview render, it hardcodes figures instead of quoting
+# `measurements.ts` like the rest of the site, and it sat in neither this list
+# nor the surface map above while both of its neighbours were in both.
 STALE_SURFACES=(README.md COMPARISON.md FEATURES.md docs/getting-started.md
                 docs/testing.md website/client/src/measurements.ts
-                website/client/src/pages/Landing.tsx)
+                website/client/src/pages/Landing.tsx
+                website/client/index.html docs/guides/multi-server.md)
 
 stale_hits=0
 stale_checked=0
@@ -596,7 +742,7 @@ for phrase in "${!SUPERSEDED[@]}"; do
     stale_checked=$((stale_checked+1))
     # FEATURES.md explains the correction in prose, so it is allowed to name the
     # old figure inside a line that also says what replaced it.
-    if grep -nF -- "$phrase" "$f" 2>/dev/null | grep -qv 'against a real reading\|had been published at'; then
+    if grep -nF -- "$phrase" "$f" 2>/dev/null | grep -cv 'against a real reading\|had been published at' >/dev/null; then
       bad "$f has gone back to publishing '$phrase' — $(printf '%s' "${SUPERSEDED[$phrase]}")"
       stale_hits=$((stale_hits+1))
     fi
@@ -607,6 +753,120 @@ if [ "$stale_checked" -eq 0 ]; then
   bad "no surface was scanned for superseded figures — this arm proves nothing"
 elif [ "$stale_hits" -eq 0 ]; then
   ok "none of the ${#SUPERSEDED[@]} superseded figures has reappeared on any of the ${#STALE_SURFACES[@]} surfaces"
+fi
+
+
+# ── s309: the forecast the guide advertised and the query could not reach ──
+#
+# docs/guides/monitoring.md publishes a disk-full forecast ("full within 48
+# hours"). disk_full_forecast() refuses any window under 6 hours, and the caller
+# took `LIMIT 60` against a 30s collector cadence — a ~30-minute window, so the
+# alert could not fire for ANY input on ANY install. It never had: this box held
+# 20,159 metrics rows at a 30.0s mean gap and 0 disk_forecast alerts, against 7
+# for memory_leak, which runs the identical query WITHOUT the time gate.
+#
+# The unit test covering disk_full_forecast was green throughout — correctly, it
+# tests the pure function and supplies its own 8-hour trend. Nothing measured
+# the CALLER's window. That is what this arm exists for: a row-count bound here
+# is a dead feature with a live doc claim.
+echo
+echo "── s309: the disk-full forecast the guide promises must be reachable ──"
+
+DISK_Q=$(sed -n '/GAP 6: Disk-full forecast/,/fetch_all/p' panel/backend/src/services/alert_engine.rs)
+if [ -z "$DISK_Q" ]; then
+  bad "could not extract the disk-forecast query — this arm is measuring nothing"
+else
+  ok "extracted the disk-forecast query ($(wc -l <<< "$DISK_Q") lines)"
+  if grep -qE "created_at > NOW\(\) - INTERVAL" <<< "$DISK_Q"; then
+    ok "the disk trend is bounded by TIME, so the 6-hour minimum is reachable"
+  else
+    bad "the disk trend is bounded by ROW COUNT — at a 30s cadence the 6h minimum can never be met and the advertised forecast cannot fire"
+  fi
+fi
+
+if grep -q "Disk-Full Forecast" docs/guides/monitoring.md; then
+  ok "the guide still publishes the forecast (the claim this arm defends)"
+else
+  ok "the guide no longer publishes the forecast — claim withdrawn, arm moot"
+fi
+
+echo "── 7. The licence the project ships under is the one it claims ──"
+
+# Nothing has ever checked this, which is why it rotted twice from ONE commit.
+# `3274a8c` relicensed to AGPL: it rewrote LICENSE, updated five manifests and
+# the ToS — and missed `website/server/package.json`, which kept declaring ISC,
+# and `COMPARISON.md`, whose comparison table kept telling readers MIT. Both
+# survived every review since, because a licence claim looks like prose and
+# nothing derived it from the file that decides it.
+
+if grep -q "GNU AFFERO GENERAL PUBLIC LICENSE" LICENSE; then
+  ok "LICENSE is the AGPL text"
+else
+  bad "LICENSE is not the AGPL text — every claim below is measured against nothing"
+fi
+
+# Enumerated from disk, not listed by hand: a hand-written list cannot fail when
+# somebody adds a seventh manifest, which is the failure this arm exists for. And
+# the enumeration is asserted before it is trusted — an empty find would print a
+# clean green having examined nothing.
+mapfile -t MANIFESTS < <(find . -maxdepth 4 \( -name Cargo.toml -o -name package.json \) \
+  -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/dist/*' \
+  -not -path './.git/*' | sort)
+if [ "${#MANIFESTS[@]}" -lt 6 ]; then
+  bad "only ${#MANIFESTS[@]} first-party manifests enumerated — the sweep went blind"
+else
+  ok "${#MANIFESTS[@]} first-party manifests enumerated"
+  wrong=""
+  for m in "${MANIFESTS[@]}"; do
+    grep -qE '"?license"?[[:space:]]*[:=][[:space:]]*"AGPL-3.0-only"' "$m" \
+      || wrong="$wrong ${m#./}"
+  done
+  if [ -z "$wrong" ]; then
+    ok "every first-party manifest declares AGPL-3.0-only"
+  else
+    bad "manifest(s) not declaring AGPL-3.0-only:$wrong"
+  fi
+fi
+
+# The reader-facing half. Scoped to DockPanel's OWN column so a comparison table
+# may still say a competitor is MIT — the defect was a row asserting it about us.
+if grep -qE '^\|[^|]*[Oo]pen source[^|]*\|[[:space:]]*MIT' COMPARISON.md; then
+  bad "COMPARISON.md still tells readers DockPanel is MIT"
+else
+  ok "COMPARISON.md does not claim MIT for DockPanel"
+fi
+
+# --- 9. FEATURES.md's Source columns must name files that exist ------------
+#
+# The register's numbers are checked in six ways above. Its SOURCE columns —
+# the "where does this live" citation on every feature row — were checked in
+# none, and that is not hypothetical: `**Credential Encryption**` cited
+# `services/credential_crypto.rs`, a file that has never existed in this tree
+# (the real one is `services/secrets_crypto.rs`). A reader chasing the one row
+# that names the project's encryption implementation was sent to nothing.
+#
+# The population is DERIVED from the tables rather than listed, and the offenders
+# are reported in ONE assertion naming them, so the arm cannot pass by measuring
+# an empty set and cannot flood the log with one line per row.
+FEAT_PATHS=$(awk '/^\|/ {print}' FEATURES.md \
+  | grep -oE '`[a-z_]+(/[a-z_.]+)+\.(rs|tsx|ts)`' \
+  | tr -d '`' | sort -u)
+feat_total=0; feat_missing=""
+for rel in $FEAT_PATHS; do
+  feat_total=$((feat_total+1))
+  # The columns are relative to different crates (backend, agent, frontend), so
+  # the path is resolved by SUFFIX anywhere under panel/ rather than by guessing
+  # which column a token came from.
+  if [ -z "$(find panel -path "*/$rel" -print -quit 2>/dev/null)" ]; then
+    feat_missing="$feat_missing $rel"
+  fi
+done
+if [ "$feat_total" -lt 30 ]; then
+  bad "extracted only $feat_total source citations from FEATURES.md — the table shape changed and this arm proves nothing"
+elif [ -n "$feat_missing" ]; then
+  bad "FEATURES.md cites source file(s) that do not exist:$feat_missing"
+else
+  ok "all $feat_total source citations in FEATURES.md resolve to real files"
 fi
 
 echo

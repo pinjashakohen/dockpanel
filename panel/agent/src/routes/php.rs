@@ -65,24 +65,11 @@ async fn is_installed(version: &str) -> bool {
 
 /// Check if a PHP-FPM socket file exists for THIS version.
 ///
-/// The two families put it in different places, and only the Debian one was
-/// ever checked: RHEL's php-fpm listens on `/run/php-fpm/www.sock` — one
-/// socket, unversioned, like the package and the unit.
-///
-/// That unversioned path is why this takes the trouble to confirm the version
-/// first. A bare `exists()` on it would answer `true` for every version in the
-/// list the moment any PHP was running — the same collapse the caller above
-/// just had to undo, one layer down.
+/// Delegates to [`crate::services::pkg::resolve_php_fpm_socket`], the shared
+/// resolver that also backs `nginx.rs::put_site()` — so this route and site
+/// creation can never again disagree about which family's socket is real.
 async fn socket_exists(version: &str) -> bool {
-    if std::path::Path::new(&format!("/run/php/php{version}-fpm.sock")).exists() {
-        return true;
-    }
-    match crate::services::pkg::installed_php_version().await {
-        Some(actual) => {
-            actual == version && std::path::Path::new("/run/php-fpm/www.sock").exists()
-        }
-        None => false,
-    }
+    crate::services::pkg::resolve_php_fpm_socket(version).await.is_some()
 }
 
 /// Check if PHP-FPM service is active.
@@ -102,17 +89,20 @@ async fn list_versions() -> Json<PhpListResponse> {
 
     for &v in ALLOWED_VERSIONS {
         let installed = is_installed(v).await;
-        let fpm_running = if installed {
-            is_fpm_running(v).await || socket_exists(v).await
+        let real_socket = if installed {
+            crate::services::pkg::resolve_php_fpm_socket(v).await
         } else {
-            false
+            None
         };
+        let fpm_running = installed && (is_fpm_running(v).await || real_socket.is_some());
 
         versions.push(PhpVersion {
             version: v.to_string(),
             installed,
             fpm_running,
-            socket: format!("/run/php/php{v}-fpm.sock"),
+            // Falls back to the Debian-shaped guess when nothing real was found yet
+            // (not installed, or FPM hasn't opened its socket) — same as before.
+            socket: real_socket.unwrap_or_else(|| format!("/run/php/php{v}-fpm.sock")),
         });
     }
 
@@ -396,32 +386,25 @@ async fn install_version(
 
     tracing::info!("Installing PHP {version} (core + available extensions)");
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        safe_command_unsandboxed("bash", &[])
-            .args(["-c", &install_cmd])
-            .output(),
-    )
-    .await;
+    // `output_with_timeout` (not a caller-side `tokio::time::timeout` around
+    // plain `.output()`) is load-bearing here: on expiry it also stops the
+    // transient systemd unit the privileged apt transaction actually runs
+    // in, which a caller-side timeout alone cannot reach (see safe_cmd.rs's
+    // own doc comment) — the exact orphaned-transaction class v2.213.0
+    // fixed for every pkg.rs call site, extended here.
+    let output = safe_command_unsandboxed("bash", &[])
+        .args(["-c", &install_cmd])
+        .output_with_timeout(std::time::Duration::from_secs(300))
+        .await;
 
     let output = match output {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
+        Ok(o) => o,
+        Err(e) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(InstallResponse {
                     success: false,
-                    message: format!("Install command failed: {e}"),
-                    version: version.to_string(),
-                }),
-            ));
-        }
-        Err(_) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(InstallResponse {
-                    success: false,
-                    message: "Installation timed out (5 min limit)".into(),
+                    message: e,
                     version: version.to_string(),
                 }),
             ));
@@ -594,32 +577,22 @@ async fn uninstall_version(
     } else {
         format!("apt-get purge -y php{version}-* 2>&1")
     };
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        safe_command_unsandboxed("bash", &[])
-            .args(["-c", &purge_cmd])
-            .output(),
-    )
-    .await;
+    // See install_version above: output_with_timeout also stops the
+    // transient unit the purge actually runs in, which a caller-side
+    // timeout cannot reach.
+    let output = safe_command_unsandboxed("bash", &[])
+        .args(["-c", &purge_cmd])
+        .output_with_timeout(std::time::Duration::from_secs(300))
+        .await;
 
     let output = match output {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
+        Ok(o) => o,
+        Err(e) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(InstallResponse {
                     success: false,
-                    message: format!("Purge command failed: {e}"),
-                    version: version.to_string(),
-                }),
-            ));
-        }
-        Err(_) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(InstallResponse {
-                    success: false,
-                    message: "Uninstall timed out (5 min limit)".into(),
+                    message: e,
                     version: version.to_string(),
                 }),
             ));
@@ -642,13 +615,10 @@ async fn uninstall_version(
     // 3. Autoremove. apt leaves orphans behind after a purge; dnf's `remove`
     // already takes unused dependencies with it, so there is nothing to call.
     if crate::services::pkg::manager().await != crate::services::pkg::PkgMgr::Rpm {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            safe_command_unsandboxed("bash", &[])
-                .args(["-c", "apt-get autoremove -y 2>&1"])
-                .output(),
-        )
-        .await;
+        let _ = safe_command_unsandboxed("bash", &[])
+            .args(["-c", "apt-get autoremove -y 2>&1"])
+            .output_with_timeout(std::time::Duration::from_secs(300))
+            .await;
     }
 
     tracing::info!("PHP {version} uninstalled");

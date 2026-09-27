@@ -168,10 +168,14 @@ echo "§2 no route can serve the map's contents to a client"
 
 # The capability arm. A provisioning stream is a broadcast Receiver, and the only
 # way to obtain one is `.subscribe()`. `open_provision_log` is the sole place
-# that may. The one legitimate exception is the notifications SSE, a different
-# channel entirely (state.notif_tx) that never touches provision_logs.
+# that may. Two legitimate exceptions exist, neither of which ever touches
+# provision_logs: the notifications SSE (state.notif_tx) and, since s466, the
+# panel-wide graceful-shutdown signal (state.shutdown_tx, broadcast::Sender<()>)
+# that ws_metrics.rs and notifications.rs subscribe to directly — it carries no
+# payload and is ownerless by construction (every subscriber gets the identical
+# "shutting down" signal), so there is no ownership question for it to bypass.
 subs=$(grep -ohE "[a-zA-Z_.]*\.subscribe\(\)" <<< "$SRC_ROUTES" | sort -u)
-rogue=$(grep -vE "^state\.notif_tx\.subscribe\(\)$" <<< "$subs" || true)
+rogue=$(grep -vE "^state\.(notif_tx|shutdown_tx)\.subscribe\(\)$" <<< "$subs" || true)
 if [ -z "$rogue" ]; then
   ok "the only subscribe() in routes/ is the notifications channel"
 else
@@ -191,7 +195,7 @@ echo "§3 every creation site records an owner"
 # file, so git_deploys could lose 3 of its 4 and stay green — which is how the
 # pre-change ratio (3 of 16) could be re-established one site at a time. Adding a
 # provisioning log to a feature is expected to change the number here.
-census="backups:2 deploy:1 sites:1 migration:1 git_deploys:4 mail:2 system:3 docker_apps:2"
+census="backups:2 deploy:1 sites:1 migration:1 git_deploys:4 mail:2 system:4 docker_apps:2"
 total=0
 for e in $census; do
   f=${e%%:*}; want=${e##*:}
@@ -203,10 +207,10 @@ for e in $census; do
     bad "$f.rs registers $got owners, expected $want — a creation site lost its owner, or a new one needs adding here"
   fi
 done
-if [ "$total" -eq 16 ]; then
-  ok "16 creation sites, all owned"
+if [ "$total" -eq 17 ]; then
+  ok "17 creation sites, all owned"
 else
-  bad "$total registrations across the census, expected 16"
+  bad "$total registrations across the census, expected 17"
 fi
 
 echo

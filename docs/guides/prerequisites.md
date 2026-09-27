@@ -159,7 +159,7 @@ This check verifies **correctness, not existence**, which is the whole point of 
 
 | | What DockPanel says | What to do |
 |---|---|---|
-| Not checked | **Couldn't determine this server's public address** — DockPanel could not detect its own public IP, so it can't tell you which records this domain needs. | Nothing to do at the registrar. Confirm the server can reach the internet. |
+| Not checked | **Couldn't determine this server's public address** — DockPanel could not determine the public address of the server this domain is on, so it can't tell you which records the domain needs. | Nothing to do at the registrar. If the domain is on this server, confirm it can reach the internet; if it is on another server in the fleet, confirm that server's agent is online — its address is recorded when the agent checks in. |
 | Not checked | **Couldn't check DNS** — DockPanel couldn't run DNS lookups on this server, so it can't verify these records. Create them if you haven't already. | Create the records shown. They are correct whether or not the lookup ran. |
 | OK | **example.com's mail records are published** — MX, SPF, DKIM and DMARC all resolve and point at this server. Mail from this domain can be authenticated. | Nothing. |
 | Warns | **example.com has no mail DNS records yet** — 5 of 5 records for example.com are missing or point somewhere else: A example.com, MX example.com, TXT example.com.  Until they are correct, receiving servers can't verify that this server may send mail for example.com — messages are likely to be filed as spam or rejected. Create the records below at whoever manages this domain's DNS; DockPanel re-checks automatically. | Create every record shown. Each card says whether that record is published or missing, so you never have to re-do the ones already correct. |
@@ -260,7 +260,7 @@ Checked by `apps.resource_headroom`.
 
 **Destination** — Where a copy is uploaded after each backup. Leave empty and backups stay on this server's own disk.
 
-A backup on the disk it protects covers a bad deploy or a dropped table, and nothing worse. Destinations are S3-compatible storage or any SFTP server.
+A backup on the disk it protects covers a bad deploy or a dropped table, and nothing worse. Destinations are S3-compatible storage or any SFTP server. SFTP destinations that authenticate by PASSWORD need sshpass on the server the backup runs from: fresh installs and servers added through the agent installer get it automatically, but a panel upgraded in place does not, because update.sh upgrades binaries and installs no packages. When it is missing, Test Connection now says so in those words and Settings can install it onto that server for you — you are no longer asked to run a package manager by hand. Key-authenticated SFTP and every S3 destination are unaffected.
 
 Checked by `backups.destination_configured`.
 

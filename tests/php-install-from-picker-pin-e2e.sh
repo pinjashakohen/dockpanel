@@ -54,7 +54,8 @@ SYSTEM_RS=panel/backend/src/routes/system.rs
 PHP_RS=panel/agent/src/routes/php.rs
 NGINX_RS=panel/agent/src/routes/nginx.rs
 PKG_RS=panel/agent/src/services/pkg.rs
-for f in "$PICKER" "$SITES_TSX" "$DETAIL_TSX" "$SITES_RS" "$SYSTEM_RS" "$PHP_RS" "$NGINX_RS" "$PKG_RS"; do
+MOD_RS=panel/backend/src/routes/mod.rs
+for f in "$PICKER" "$SITES_TSX" "$DETAIL_TSX" "$SITES_RS" "$SYSTEM_RS" "$PHP_RS" "$NGINX_RS" "$PKG_RS" "$MOD_RS"; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
 
@@ -79,6 +80,7 @@ SRC_SITES_RS=$(strip "$SITES_RS")
 SRC_SYSTEM_RS=$(strip "$SYSTEM_RS")
 SRC_PHP_RS=$(strip "$PHP_RS")
 SRC_NGINX_RS=$(strip "$NGINX_RS")
+SRC_MOD_RS=$(strip "$MOD_RS")
 
 # Here-strings, never pipelines: `grep -q` closing a pipe kills the upstream sed
 # with SIGPIPE and `pipefail` turns that into a failed arm, non-deterministically.
@@ -315,6 +317,187 @@ if [ "$inline" -le 1 ]; then
   ok "the literal appears $inline time(s) — the declaration itself"
 else
   bad "the version literal is written out $inline times in one file"
+fi
+
+echo
+echo "§7 the runtime switch the picker exists to serve (#99, s310)"
+
+# HybridRCG, 2026-08-05: "I cant seem to find a way to change a site from html to
+# php?" — his workaround was deleting the site and adding it back. Nothing in the
+# tree issued `UPDATE sites SET runtime` while fourteen other site columns were
+# updatable, so the answer was that there was no button, not that he had missed it.
+# These arms pin the half that was promised in the thread that same morning.
+
+if has "$SRC_MOD_RS" 'sites/{id}/runtime'; then
+  ok "the runtime switch is registered as a route"
+else
+  bad "no /api/sites/{id}/runtime route — #99 is unreachable again"
+fi
+
+if has "$SRC_SITES_RS" 'const SWITCHABLE_RUNTIMES'; then
+  ok "the switchable runtimes are declared once, as a closed list"
+else
+  bad "no SWITCHABLE_RUNTIMES declaration — the target runtime is unbounded"
+fi
+
+# The closed list is the whole safety argument. `document_root_for` maps proxy,
+# node and python to the site directory while static and php both map to
+# {site_dir}/public — so admitting a proxying runtime here turns a vhost rebuild
+# into a document-root move, silently, on somebody's live site.
+switchable=$(grep -A2 'const SWITCHABLE_RUNTIMES' <<< "$SRC_SITES_RS")
+if [ -z "$switchable" ]; then
+  bad "could not extract SWITCHABLE_RUNTIMES — the next two arms would read nothing"
+elif hasE "$switchable" '"(proxy|node|python)"'; then
+  bad "SWITCHABLE_RUNTIMES admits a proxying runtime — that moves the document root"
+else
+  ok "SWITCHABLE_RUNTIMES excludes every runtime whose document root differs"
+fi
+
+RUNTIME_FN=$(fnbody "$SRC_SITES_RS" switch_runtime)
+if [ -z "$RUNTIME_FN" ]; then
+  bad "switch_runtime not found — every arm below reads an empty window"
+else
+  if has "$RUNTIME_FN" 'php_version is required'; then
+    ok "switching to php demands an explicit version"
+  else
+    bad "no explicit-version guard — a stale php_version column gets silently reused"
+  fi
+
+  # The ordering invariant, and the only one here that is about correctness
+  # rather than reach: the vhost is written FIRST, so a refused agent write
+  # leaves the row describing what is actually being served. Reversed, a site
+  # whose nginx write failed would read as switched in the panel and in the API.
+  put_at=$(grep -n 'agent$' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
+  [ -z "$put_at" ] && put_at=$(grep -n '\.put(' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
+  upd_at=$(grep -n 'UPDATE sites SET runtime' <<< "$RUNTIME_FN" | head -1 | cut -d: -f1)
+  if [ -z "$put_at" ] || [ -z "$upd_at" ]; then
+    bad "could not locate both the agent write and the UPDATE — ordering unverified"
+  elif [ "$put_at" -lt "$upd_at" ]; then
+    ok "the vhost is written before the row is updated (line $put_at before $upd_at)"
+  else
+    bad "the row is updated before the vhost — a failed nginx write reads as a switch"
+  fi
+fi
+
+if has "$SRC_DETAIL_TSX" '/runtime`'; then
+  ok "the site page actually calls the switch — the button #99 asked for exists"
+else
+  bad "no frontend caller: the endpoint is built and unreachable, which was the original complaint"
+fi
+
+# The picker reports whether a version is installed AND its FPM socket is up.
+# Firing the switch anyway is what surprises29 hit at s288 in the sibling control.
+if has "$SRC_DETAIL_TSX" 'runtimePhpReady'; then
+  ok "the switch is held back until the chosen PHP version is really usable"
+else
+  bad "the switch ignores the picker's readiness — it can fire at an uninstalled version"
+fi
+
+echo
+echo "§8 the direction §7 made reachable — php -> static (s311)"
+
+# §7 pins static -> php. Every one of its arms is about that direction, and the
+# defect was in the other one: v2.67.0 made `UPDATE sites SET runtime` reachable
+# for the first time, and `document_root_for` maps static and php to the SAME
+# {site_dir}/public — the property the switch's own reasoning cites as making it
+# safe. So a docroot full of application source keeps being served, by a vhost
+# that has just lost every protection.
+#
+# All twelve `deny all` blocks in each template live inside php preset branches.
+# The static branch had root + index + try_files and nothing else, so the switch
+# published wp-config.php and .git/config as plain text — verified by rendering
+# both configs and serving them through a real nginx: 403 under php, 200 with the
+# database password in the body under static.
+#
+# These arms are scoped to the STATIC BRANCH ONLY. An arm grepping either whole
+# file would have been green throughout the defect's entire life, because the
+# denies it looks for were present twelve times over, in the branch that was not
+# broken. Strip full-line comments first: the fix carries a comment naming the
+# very files it protects (lesson #149 — an arm matching the prose that narrates
+# the check).
+tstrip() { sed 's/^[[:space:]]*#.*//' <<< "$1"; }
+hasF() { grep -qF -- "$2" <<< "$1"; }
+
+for tpl in panel/agent/src/templates/nginx/http.conf panel/agent/src/templates/nginx/https.conf; do
+  [ -f "$tpl" ] || { bad "missing $tpl — the arms below would read nothing"; continue; }
+
+  # Bound the window on the branch's own terminator, never a fixed -A count
+  # (lesson #172): the php branch below it contains all twelve denies, so a
+  # window that overruns turns this section permanently, silently green.
+  win=$(tstrip "$(awk '/index index\.html index\.htm/,/\{% (elif|endif)/' "$tpl")")
+  base=$(basename "$tpl")
+
+  if [ -z "$win" ] || ! hasF "$win" 'try_files'; then
+    bad "$base: could not extract the static branch — every arm below is meaningless"
+    continue
+  fi
+
+  # CONTROL, and it is the load-bearing one: the same window must NOT contain
+  # the php handler. If it does, the extraction has bled into the php branch and
+  # the two arms after it are reading the wrong code.
+  if hasF "$win" 'fastcgi_pass'; then
+    bad "$base: the static window bled into the php branch — its greens prove nothing"
+    continue
+  fi
+
+  if hasF "$win" 'location ~ /\.(?!well-known)'; then
+    ok "$base: the static branch denies dotfiles — .env and .git/ survive the switch"
+  else
+    bad "$base: static branch serves dotfiles — switching to static publishes .env and .git/config"
+  fi
+
+  if hasF "$win" 'location ~ \.php$'; then
+    ok "$base: the static branch refuses .php source rather than serving it"
+  else
+    bad "$base: static branch serves .php as plain text — wp-config.php becomes readable"
+  fi
+done
+
+# A template fix reaches a site only when something RE-RENDERS its vhost — a
+# runtime switch, an SSL issuance, a settings change. Nothing re-renders on
+# upgrade. So the site that most needs this fix, one already switched to static
+# under v2.67.0, would keep serving its source after the operator updated and was
+# told it was fixed. v2.68.1 retrofits the denies onto existing static vhosts in
+# update.sh, the same shape as the v2.47.1 index.html migration. Without this arm
+# the two template arms above are green while the field is still exposed.
+UPD=scripts/update.sh
+if [ ! -f "$UPD" ]; then
+  bad "MISSING SUBJECT FILE: $UPD"
+elif ! grep -q 'sites-enabled' "$UPD"; then
+  bad "$UPD no longer touches site vhosts at all — this arm is measuring nothing"
+elif grep -qF 'location ~ /\\.(?!well-known)' "$UPD" && grep -q 'nginx -t' "$UPD"; then
+  ok "update.sh retrofits the denies onto existing static vhosts, validated by nginx -t"
+else
+  bad "nothing retrofits the denies onto vhosts already on disk — the fix reaches new renders only"
+fi
+
+# …and update.sh reaches the PANEL HOST ONLY. Its own header records why: an
+# agent-only box has no repo, no postgres container and no frontend, so the panel
+# updater was replaced there by agent-self-update.sh, which fetches one binary.
+# A fleet member's static vhosts therefore need the retrofit inside the AGENT,
+# which is the process that owns /etc/nginx/sites-enabled on every box. Keyed on
+# the function AND its call site: a migration nothing invokes is the s310 shape.
+AG_NGINX=panel/agent/src/services/nginx.rs
+AG_MAIN=panel/agent/src/main.rs
+if [ ! -f "$AG_NGINX" ] || [ ! -f "$AG_MAIN" ]; then
+  bad "MISSING agent subject file — the fleet-side arm is measuring nothing"
+elif ! grep -q 'fn retrofit_static_denies' "$AG_NGINX"; then
+  bad "the agent has no vhost retrofit — a fleet member's switched site stays exposed after update"
+elif ! grep -q 'retrofit_static_denies()' "$AG_MAIN"; then
+  bad "the agent's retrofit exists and nothing calls it at startup"
+elif ! grep -q 'fn patch_static_vhost' "$AG_NGINX"; then
+  bad "the retrofit decision is not a testable pure function — it cannot be exercised without a box"
+else
+  ok "the agent retrofits its own static vhosts at startup, so the fix reaches fleet members"
+fi
+
+# Second control, on the other side: the php branches must still carry the denies
+# these arms were modelled on. A zero here would mean the greps above are matching
+# a pattern this codebase no longer writes.
+if [ "$(grep -cF 'deny all' panel/agent/src/templates/nginx/http.conf)" -ge 12 ]; then
+  ok "the php preset branches still carry their own denies (the arms are non-vacuous)"
+else
+  bad "fewer denies than expected in http.conf — re-derive what this section is matching"
 fi
 
 echo

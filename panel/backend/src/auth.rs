@@ -4,11 +4,28 @@ use axum::{
 };
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::error::{err, ApiError};
+use crate::error::{err, err_coded, ApiError, CODE_SESSION_INVALID};
 use crate::services::agent::AgentHandle;
 use crate::AppState;
+
+/// The caller has no usable session — the only refusal in this codebase that
+/// entitles the frontend to navigate someone to `/login`.
+///
+/// Every such refusal is minted here rather than inline, so that "which 401s
+/// mean *log in again*" is a question with one answer in one place instead of a
+/// property to be re-derived from seven call sites. A handler's own 401 must
+/// never use this: by the time a handler runs, this extractor has already
+/// accepted the session, so the thing being refused there is a credential the
+/// caller just presented, not the session itself.
+///
+/// The agent-token refusals at the bottom of this file are deliberately NOT
+/// minted here — an agent is not a browser and has no session to lose.
+fn session_invalid(msg: &str) -> ApiError {
+    err_coded(StatusCode::UNAUTHORIZED, msg, CODE_SESSION_INVALID)
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -20,6 +37,13 @@ pub struct Claims {
     /// JWT ID for token blacklisting on logout.
     #[serde(default)]
     pub jti: Option<String>,
+    /// The `api_keys.id` this session authenticated with, so a request made
+    /// through a `dp_` key (an MCP tool call, a CLI invocation) is attributable
+    /// in the audit trail instead of looking identical to a browser session.
+    /// `None` on the JWT path (`#[serde(default)]` so tokens issued before this
+    /// field existed still decode). See `log_activity`/`audit_log` call sites.
+    #[serde(default)]
+    pub key_id: Option<Uuid>,
 }
 
 /// JWT extractor — reads token from Authorization header or `token` cookie.
@@ -40,6 +64,16 @@ impl FromRequestParts<AppState> for AuthUser {
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(|t| t.to_string());
 
+        // A `dp_`-prefixed bearer token is a long-lived API key (routes/api_keys.rs),
+        // not a session JWT — authenticate it against `api_keys` directly. Trying to
+        // `decode::<Claims>` it below would always fail, so without this branch every
+        // API key request would 401 as "Invalid or expired token" for the wrong
+        // reason and this scaffold would stay unwired, exactly as FEATURES.md's
+        // "Withdrawn Claims" section already documents it.
+        if let Some(key) = bearer_token.as_deref().filter(|t| t.starts_with("dp_")) {
+            return authenticate_api_key(state, key).await.map(AuthUser);
+        }
+
         let token = bearer_token.clone().or_else(|| {
                 // Fall back to cookie
                 parts
@@ -52,7 +86,7 @@ impl FromRequestParts<AppState> for AuthUser {
                             .find_map(|s| s.trim().strip_prefix("token=").map(|v| v.to_string()))
                     })
             })
-            .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Authentication required"))?;
+            .ok_or_else(|| session_invalid("Authentication required"))?;
 
         // CSRF protection: cookie-based auth on mutating methods requires X-Requested-With header.
         // Bearer token auth (API keys) is exempt since it cannot be sent by cross-origin forms.
@@ -78,14 +112,14 @@ impl FromRequestParts<AppState> for AuthUser {
             &DecodingKey::from_secret(state.config.jwt_secret.as_bytes()),
             &validation,
         )
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, "Invalid or expired token"))?
+        .map_err(|_| session_invalid("Invalid or expired token"))?
         .claims;
 
         // Check token blacklist (revoked JTIs)
         if let Some(ref jti) = claims.jti {
             let blacklist = state.token_blacklist.read().await;
             if blacklist.contains(jti) {
-                return Err(err(StatusCode::UNAUTHORIZED, "Token has been revoked"));
+                return Err(session_invalid("Token has been revoked"));
             }
         }
 
@@ -94,7 +128,7 @@ impl FromRequestParts<AppState> for AuthUser {
             let revoked_at = state.sessions_revoked_at.read().await;
             if let Some(ts) = *revoked_at {
                 if (claims.iat as i64) < ts {
-                    return Err(err(StatusCode::UNAUTHORIZED, "Session revoked. Please log in again."));
+                    return Err(session_invalid("Session revoked. Please log in again."));
                 }
             }
         }
@@ -109,6 +143,88 @@ impl FromRequestParts<AppState> for AuthUser {
 
         Ok(AuthUser(claims))
     }
+}
+
+/// Authenticate a `dp_`-prefixed API key (routes/api_keys.rs) and build the same
+/// `Claims` shape a JWT would, so it works for free on every `AuthUser`-gated
+/// handler. Unlike a JWT, a key has no `jti` of its own and is never on the
+/// per-token blacklist — it is revoked by deleting the `api_keys` row (or, for
+/// the global "revoke all sessions" / Panic Button controls below, by having
+/// been minted before that revocation fired: see the `created_at` check).
+///
+/// Failures here deliberately do NOT use `session_invalid()` — that marker
+/// means "the caller has no usable *session*" and its own doc comment says the
+/// same of the agent-token refusals below: a key is not a browser session that
+/// can be lost, so a bad key gets a plain 401 like `authenticate_agent` does,
+/// not the marker that tells a frontend to redirect to `/login`.
+async fn authenticate_api_key(state: &AppState, key: &str) -> Result<Claims, ApiError> {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+
+    let row: Option<(Uuid, Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, user_id, created_at FROM api_keys WHERE key_hash = $1",
+    )
+    .bind(&key_hash)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| crate::error::internal_error("api_key lookup", e))?;
+
+    let (key_id, user_id, created_at) =
+        row.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
+
+    // Parity with the JWT path's own revocation check (above) — "Revoke all
+    // sessions" and the Panic Button both promise a total logout, and a key
+    // minted before that moment fired is exactly the credential class an
+    // incident responder reaching for either control means to kill. A key
+    // rotated (or newly minted) AFTER the revocation naturally has a fresh
+    // `created_at` and keeps working, same as a JWT from a fresh login would.
+    {
+        let revoked_at = state.sessions_revoked_at.read().await;
+        if revoked_at.is_some_and(|ts| created_at.timestamp() < ts) {
+            return Err(err(StatusCode::UNAUTHORIZED, "Key revoked. Mint a new one."));
+        }
+    }
+
+    let user: Option<(String, String)> =
+        sqlx::query_as("SELECT email, role FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| crate::error::internal_error("api_key user lookup", e))?;
+
+    let (email, role) =
+        user.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
+
+    // Parity with the JWT path's own post-decode check (this file, below) — an
+    // account suspended after a key was minted must not keep authenticating.
+    if role == "suspended" {
+        return Err(err(StatusCode::FORBIDDEN, "Account suspended"));
+    }
+
+    // Best-effort bookkeeping — a failed UPDATE must not fail the request that
+    // is itself proof the key still works.
+    let _ = sqlx::query("UPDATE api_keys SET last_used_at = NOW() WHERE id = $1")
+        .bind(key_id)
+        .execute(&state.db)
+        .await;
+
+    let now = chrono::Utc::now().timestamp() as usize;
+    Ok(Claims {
+        sub: user_id,
+        email,
+        role,
+        key_id: Some(key_id),
+        // An API key has no session lifetime of its own — it lives until its
+        // `api_keys` row is deleted (or the revocation check above fires).
+        // `exp` still has to be a value in the future because nothing
+        // downstream re-checks how this Claims was built; it is never
+        // re-validated against a signature, so this is not a forgeable
+        // expiry, just a field every consumer of `Claims` expects.
+        exp: now + 315_360_000, // ~10 years
+        iat: now,
+        jti: None,
+    })
 }
 
 /// Admin-only JWT extractor — extracts Claims then verifies role == "admin".
@@ -218,7 +334,7 @@ impl FromRequestParts<AppState> for ServerScope {
             Some(sid) => {
                 // Verify server belongs to the authenticated user
                 let uid = user_id.ok_or_else(|| {
-                    err(StatusCode::UNAUTHORIZED, "Authentication required when X-Server-Id is provided")
+                    session_invalid("Authentication required when X-Server-Id is provided")
                 })?;
 
                 let owns: Option<(Uuid,)> = sqlx::query_as(
@@ -326,4 +442,38 @@ pub fn agent_rate_limit(state: &AppState, server_id: Uuid) -> Result<(), ApiErro
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod session_marker_tests {
+    use super::*;
+
+    fn body(e: &ApiError) -> serde_json::Value {
+        e.1 .0.clone()
+    }
+
+    #[test]
+    fn session_invalid_is_a_401_carrying_the_marker() {
+        let e = session_invalid("Invalid or expired token");
+        assert_eq!(e.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(body(&e)["code"], CODE_SESSION_INVALID);
+        assert_eq!(body(&e)["error"], "Invalid or expired token");
+    }
+
+    /// The sentence must survive alongside the marker. The whole defect being
+    /// repaired is a client that had the status and threw the sentence away.
+    #[test]
+    fn the_sentence_is_not_replaced_by_the_marker() {
+        let e = session_invalid("Session revoked. Please log in again.");
+        assert_eq!(body(&e)["error"], "Session revoked. Please log in again.");
+    }
+
+    /// An agent presenting a bad token is not a browser losing a session, and
+    /// must not be able to make the client navigate a human to /login.
+    #[test]
+    fn a_plain_401_carries_no_marker() {
+        let e = err(StatusCode::UNAUTHORIZED, "Invalid token");
+        assert_eq!(e.0, StatusCode::UNAUTHORIZED);
+        assert!(body(&e).get("code").is_none());
+    }
 }

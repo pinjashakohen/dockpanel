@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { api } from "../api";
 import { formatDate } from "../utils/format";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 interface CdnZone {
   id: string;
@@ -26,6 +27,16 @@ interface CdnStats {
   page_views?: number;
 }
 
+interface CdnPullZone {
+  id?: number | string;
+  name?: string;
+  origin_url?: string;
+  hostnames?: string[];
+  bandwidth_used?: number;
+  enabled?: boolean;
+  status?: string;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const k = 1024;
@@ -38,6 +49,9 @@ export default function Cdn() {
   const [zones, setZones] = useState<CdnZone[]>([]);
   const [selectedZone, setSelectedZone] = useState<CdnZone | null>(null);
   const [stats, setStats] = useState<CdnStats | null>(null);
+  const [pullZones, setPullZones] = useState<CdnPullZone[]>([]);
+  const [loadingPullZones, setLoadingPullZones] = useState(false);
+  const [pullZonesError, setPullZonesError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState({ text: "", type: "" });
   const [pendingDelete, setPendingDelete] = useState(false);
@@ -72,8 +86,8 @@ export default function Cdn() {
         const updated = data.find(z => z.id === selectedZone.id);
         if (updated) setSelectedZone(updated);
       }
-    } catch {
-      // empty
+    } catch (err) {
+      setMessage({ text: err instanceof Error ? err.message : "Failed to load CDN zones", type: "error" });
     } finally {
       setLoading(false);
     }
@@ -86,6 +100,7 @@ export default function Cdn() {
       setEditCacheTtl(selectedZone.cache_ttl);
       setEditEnabled(selectedZone.enabled);
       loadStats(selectedZone.id);
+      loadPullZones(selectedZone.id);
     }
   }, [selectedZone?.id]);
 
@@ -99,6 +114,20 @@ export default function Cdn() {
       // Stats may not be available yet
     } finally {
       setLoadingStats(false);
+    }
+  };
+
+  const loadPullZones = async (zoneId: string) => {
+    setLoadingPullZones(true);
+    setPullZonesError(false);
+    setPullZones([]);
+    try {
+      const data = await api.get<{ pull_zones: CdnPullZone[] }>(`/cdn/zones/${zoneId}/pull-zones`);
+      setPullZones(data.pull_zones || []);
+    } catch {
+      setPullZonesError(true);
+    } finally {
+      setLoadingPullZones(false);
     }
   };
 
@@ -244,15 +273,15 @@ export default function Cdn() {
         </div>
       )}
 
-      {/* Confirm delete bar */}
+      {/* Confirm delete — portalled via ConfirmDialog (issue #120) so the prompt
+          cannot render off-screen from the trigger that armed it. */}
       {pendingDelete && selectedZone && (
-        <div className="border border-danger-500/30 bg-danger-500/5 rounded-lg px-4 py-3 flex items-center justify-between">
-          <span className="text-xs text-danger-400 font-mono">Remove CDN zone for {selectedZone.domain}?</span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeDelete} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">Confirm</button>
-            <button onClick={() => setPendingDelete(false)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">Cancel</button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={`Remove CDN zone for ${selectedZone.domain}?`}
+          tone="danger"
+          onConfirm={executeDelete}
+          onCancel={() => setPendingDelete(false)}
+        />
       )}
 
       {/* Add Zone Form */}
@@ -380,12 +409,12 @@ export default function Cdn() {
                     <div className="flex items-center gap-2 mt-1">
                       <span className={`inline-flex px-1.5 py-0.5 rounded text-xs font-medium ${
                         zone.provider === "bunnycdn"
-                          ? "bg-amber-500/15 text-amber-400"
-                          : "bg-orange-500/15 text-orange-400"
+                          ? "bg-warn-500/15 text-warn-400"
+                          : "bg-accent-500/15 text-accent-400"
                       }`}>
                         {zone.provider === "bunnycdn" ? "Bunny" : "CF"}
                       </span>
-                      <span className={`w-1.5 h-1.5 rounded-full ${zone.enabled ? "bg-green-400" : "bg-dark-400"}`} />
+                      <span className={`w-1.5 h-1.5 rounded-full ${zone.enabled ? "bg-rust-500" : "bg-dark-400"}`} />
                     </div>
                   </button>
                 ))}
@@ -506,7 +535,7 @@ export default function Cdn() {
                         onChange={(e) => setEditEnabled(e.target.checked)}
                         className="sr-only peer"
                       />
-                      <div className="w-11 h-6 bg-dark-600 peer-focus:ring-2 peer-focus:ring-accent-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-rust-500" />
+                      <div className="w-11 h-6 bg-dark-600 peer-focus:ring-2 peer-focus:ring-accent-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-dark-500 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-rust-500" />
                     </label>
                   </div>
                   <div>
@@ -538,6 +567,52 @@ export default function Cdn() {
                   >
                     {updatingSettings ? "Saving..." : "Save Settings"}
                   </button>
+                </div>
+              </div>
+
+              {/* Pull Zones — discovery list from the provider, not editable here */}
+              <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+                <div className="px-5 py-4 border-b border-dark-600">
+                  <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Pull Zones</h2>
+                </div>
+                <div className="p-5">
+                  {loadingPullZones ? (
+                    <div className="animate-pulse space-y-2">
+                      <div className="h-4 bg-dark-700 rounded w-full" />
+                      <div className="h-4 bg-dark-700 rounded w-3/4" />
+                    </div>
+                  ) : pullZonesError ? (
+                    <p className="text-sm text-danger-400">Could not load pull zones from the provider.</p>
+                  ) : pullZones.length === 0 ? (
+                    <p className="text-sm text-dark-300">No pull zones found on this account.</p>
+                  ) : (
+                    <div className="divide-y divide-dark-600">
+                      {pullZones.map((pz, i) => (
+                        <div key={pz.id ?? i} className="py-2 first:pt-0 last:pb-0 flex items-center justify-between gap-4">
+                          <div className="min-w-0">
+                            <p className="text-sm text-dark-50 font-medium truncate">{pz.name || `Zone ${pz.id ?? i}`}</p>
+                            <p className="text-xs text-dark-300 font-mono truncate">
+                              {pz.origin_url || (pz.hostnames && pz.hostnames.join(", ")) || "—"}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            {pz.bandwidth_used !== undefined && (
+                              <span className="text-xs text-dark-300">{formatBytes(pz.bandwidth_used)}</span>
+                            )}
+                            {(pz.enabled !== undefined || pz.status) && (
+                              <span className={`inline-flex px-1.5 py-0.5 rounded text-xs font-medium ${
+                                (pz.enabled === true || pz.status === "active")
+                                  ? "bg-rust-500/15 text-rust-400"
+                                  : "bg-dark-600 text-dark-300"
+                              }`}>
+                                {pz.status || (pz.enabled ? "Enabled" : "Disabled")}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
 

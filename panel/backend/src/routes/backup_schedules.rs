@@ -6,6 +6,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::auth::Claims;
 use crate::error::{internal_error, err, ApiError};
 use crate::services::activity;
 use crate::AppState;
@@ -33,17 +34,13 @@ pub struct SetScheduleRequest {
     pub enabled: Option<bool>,
 }
 
-/// Verify site ownership, return domain.
-async fn get_site_domain(state: &AppState, site_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(site_id)
-            .bind(user_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("unknown", e))?;
-    row.map(|(d,)| d)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))
+/// Helper: resolve a site this caller may act on, and return its domain.
+///
+/// One line over [`crate::helpers::site_domain_for_caller`], which is shared with
+/// the five other modules that each carried their own copy of this query. The
+/// rules — including why only the admin arm is scoped by server — live there.
+async fn get_site_domain(state: &AppState, site_id: Uuid, claims: &Claims) -> Result<String, ApiError> {
+    crate::helpers::site_domain_for_caller(state, site_id, claims).await
 }
 
 /// GET /api/sites/{id}/backup-schedule — Get the backup schedule for a site.
@@ -52,7 +49,7 @@ pub async fn get_schedule(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Option<BackupSchedule>>, ApiError> {
-    get_site_domain(&state, id, claims.sub).await?;
+    get_site_domain(&state, id, &claims).await?;
 
     let schedule: Option<BackupSchedule> = sqlx::query_as(
         "SELECT * FROM backup_schedules WHERE site_id = $1",
@@ -72,7 +69,7 @@ pub async fn set_schedule(
     Path(id): Path<Uuid>,
     Json(body): Json<SetScheduleRequest>,
 ) -> Result<Json<BackupSchedule>, ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
+    let domain = get_site_domain(&state, id, &claims).await?;
 
     // Validate schedule format
     let parts: Vec<&str> = body.schedule.split_whitespace().collect();
@@ -95,13 +92,19 @@ pub async fn set_schedule(
     // routes, so the operator choosing them is the same person who owns the bucket,
     // and a site owner can upload to it but never read it. A destination that IS
     // pinned to a server still has to belong to this user.
-    let dest_check: Option<(Uuid,)> = sqlx::query_as(
+    //
+    // The rule now lives once, next to the route that LISTS the same set, because
+    // granting a caller a choice it cannot enumerate is the defect this pairing
+    // closes: for four months the picker feeding this check could not be filled
+    // for the very callers the paragraph above deliberately admits.
+    let dest_check: Option<(Uuid,)> = sqlx::query_as(&format!(
         "SELECT bd.id FROM backup_destinations bd \
          LEFT JOIN servers s ON bd.server_id = s.id \
-         WHERE bd.id = $1 AND (bd.server_id IS NULL OR s.user_id = $2)",
-    )
-    .bind(&body.destination_id)
+         WHERE {} AND bd.id = $2",
+        crate::routes::backup_destinations::DESTINATION_CALLER_PREDICATE
+    ))
     .bind(claims.sub)
+    .bind(&body.destination_id)
     .fetch_optional(&state.db)
     .await
     .ok()
@@ -133,7 +136,7 @@ pub async fn set_schedule(
     tracing::info!("Backup schedule set for {domain}: {}", schedule.schedule);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "backup.schedule",
-        Some("backup"), Some(&domain), Some(&schedule.schedule), None,
+        Some("backup"), Some(&domain), Some(&schedule.schedule), None, claims.key_id,
     ).await;
 
     Ok(Json(schedule))
@@ -145,7 +148,7 @@ pub async fn remove_schedule(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = get_site_domain(&state, id, claims.sub).await?;
+    let domain = get_site_domain(&state, id, &claims).await?;
 
     let deleted = sqlx::query("DELETE FROM backup_schedules WHERE site_id = $1")
         .bind(id)

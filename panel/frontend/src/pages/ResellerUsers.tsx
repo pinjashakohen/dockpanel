@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
+import { Navigate } from "react-router-dom";
 import { api, ApiError } from "../api";
+import { useAuth } from "../context/AuthContext";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 interface UserItem {
   id: string;
@@ -10,6 +13,14 @@ interface UserItem {
 }
 
 export default function ResellerUsers() {
+  const { user } = useAuth();
+  // Half-broken for an admin rather than wholly: `list_users` branches on the
+  // role and hands an admin every reseller's sub-accounts, so the page LOADS —
+  // but "+ Create User" 403s (`create_user` is reseller-only) and deleting from
+  // here skips the quota decrement, leaving the reseller's counter inflated. A
+  // screen that renders fine and misreports on two of its three controls is
+  // worse than one that redirects. /users is the admin's account surface.
+  if (user && user.role === "admin") return <Navigate to="/users" replace />;
   const [users, setUsers] = useState<UserItem[]>([]);
   const [creating, setCreating] = useState(false);
   const [email, setEmail] = useState("");
@@ -105,14 +116,17 @@ export default function ResellerUsers() {
         <div className="px-4 py-3 bg-rust-500/10 border border-rust-500/30 rounded-lg text-sm text-rust-400">{success}</div>
       )}
 
+      {/* Issue #120: this used to be an inline bar rendered here, above the user
+          table. The Delete buttons that arm it sit in the rows below, so on a
+          long list the prompt appeared off-screen. It is a portalled dialog now
+          — see components/ConfirmDialog. */}
       {pendingDelete && (
-        <div className="border border-danger-500/30 bg-danger-500/5 rounded-lg px-4 py-3 flex items-center justify-between">
-          <span className="text-xs text-danger-400 font-mono">Delete user "{pendingDelete.email}"? Their sites and databases will also be deleted.</span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeDelete} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">Confirm</button>
-            <button onClick={() => setPendingDelete(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">Cancel</button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={`Delete user "${pendingDelete.email}"? Their sites and databases will also be deleted.`}
+          tone="danger"
+          onConfirm={executeDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
       )}
 
       {creating && (
@@ -141,7 +155,7 @@ export default function ResellerUsers() {
             </div>
           </div>
           <div className="flex gap-3">
-            <button onClick={handleCreate} className="px-4 py-2 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors">
+            <button onClick={handleCreate} disabled={!email.trim() || !password} className="px-4 py-2 bg-rust-500 text-dark-950 rounded-lg text-sm font-bold hover:bg-rust-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
               Create
             </button>
             <button onClick={() => setCreating(false)} className="px-4 py-2 bg-dark-700 text-dark-200 rounded-lg text-sm hover:bg-dark-600 transition-colors">

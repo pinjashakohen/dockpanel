@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -47,6 +47,11 @@ pub async fn get_config(
             } else {
                 "*".repeat(ident.len())
             };
+            // Integrations.tsx builds the webhook URL to paste into WHMCS from
+            // this field on every load, so it must decrypt, not stay masked.
+            let webhook = webhook.map(|w| {
+                crate::services::secrets_crypto::decrypt_credential_or_legacy(&w, &state.config.jwt_secret)
+            });
             Ok(Json(serde_json::json!({
                 "configured": true,
                 "api_url": url,
@@ -65,6 +70,7 @@ pub async fn get_config(
 pub async fn update_config(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<WhmcsConfigRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
@@ -83,30 +89,87 @@ pub async fn update_config(
     let encrypted_secret = crate::services::secrets_crypto::encrypt_credential(&body.api_secret, &state.config.jwt_secret)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
-    // Generate webhook secret for incoming hooks
-    let webhook_secret = uuid::Uuid::new_v4().to_string().replace('-', "");
+    // An omitted flag means "leave it as it is", not "true"; and the webhook
+    // secret an operator has already wired into WHMCS must survive a save.
+    //
+    // The panel's own WHMCS form posts only the three API fields, so a save that
+    // defaulted the flags would silently re-enable billing-driven suspension for
+    // an operator who had turned it off through the API. A setting that will not
+    // stay set is worse than one that does not exist, and it would make the
+    // `auto_suspend` gate on the webhook's suspend/unsuspend arms unreliable in
+    // exactly the case it was added for.
+    //
+    // ⚠ Both halves of that reasoning were UNOBSERVABLE until now, and the note
+    // that used to stand here described the reset as something operators had
+    // seen. They had not: the statement below could never execute (no arbiter
+    // matched its ON CONFLICT target), so no save ever succeeded and no row ever
+    // existed. `20260809120000_whmcs_config_singleton.sql` supplies the missing
+    // constraint; this read is what makes the first real save preserve rather
+    // than clobber.
+    //
+    // The read is REQUIRED to succeed. Falling back to defaults when the
+    // database is merely unreachable would reintroduce the clobber it exists to
+    // prevent, at the one moment we cannot tell a fresh install from a blip.
+    let current: Option<(bool, bool, bool, Option<String>)> = sqlx::query_as(
+        "SELECT auto_provision, auto_suspend, auto_terminate, webhook_secret \
+         FROM whmcs_config LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("read current whmcs config", e))?;
+
+    let (cur_provision, cur_suspend, cur_terminate, cur_secret) = match current {
+        Some((p, s, t, secret)) => (p, s, t, secret),
+        None => (true, true, false, None),
+    };
+    // The column now holds ciphertext; decrypt what "already have one" reads
+    // back so the preserve-vs-mint decision below compares plaintext, and so
+    // an operator's already-configured WHMCS hook keeps matching.
+    let cur_secret = cur_secret
+        .map(|s| crate::services::secrets_crypto::decrypt_credential_or_legacy(&s, &state.config.jwt_secret));
+
+    // Mint a webhook secret only when there is not one already. Regenerating it
+    // on every save would silently break the hook the operator had configured in
+    // WHMCS — and the old statement did exactly that in its VALUES list while
+    // omitting the column from its DO UPDATE SET, so it would have returned a
+    // secret it never stored.
+    let webhook_secret =
+        cur_secret.unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let encrypted_webhook_secret = crate::services::secrets_crypto::encrypt_credential(
+        &webhook_secret,
+        &state.config.jwt_secret,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
     sqlx::query(
         "INSERT INTO whmcs_config (id, api_url, api_identifier, api_secret_encrypted, auto_provision, auto_suspend, auto_terminate, webhook_secret) \
          VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT ((true)) DO UPDATE SET \
          api_url = $1, api_identifier = $2, api_secret_encrypted = $3, \
-         auto_provision = $4, auto_suspend = $5, auto_terminate = $6, updated_at = NOW()"
+         auto_provision = $4, auto_suspend = $5, auto_terminate = $6, \
+         webhook_secret = $7, updated_at = NOW()"
     )
     .bind(&body.api_url)
     .bind(&body.api_identifier)
     .bind(&encrypted_secret)
-    .bind(body.auto_provision.unwrap_or(true))
-    .bind(body.auto_suspend.unwrap_or(true))
-    .bind(body.auto_terminate.unwrap_or(false))
-    .bind(&webhook_secret)
+    .bind(body.auto_provision.unwrap_or(cur_provision))
+    .bind(body.auto_suspend.unwrap_or(cur_suspend))
+    .bind(body.auto_terminate.unwrap_or(cur_terminate))
+    .bind(&encrypted_webhook_secret)
     .execute(&state.db)
     .await
     .map_err(|e| internal_error("save whmcs config", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "whmcs.configured",
-        Some("settings"), None, None, None,
+        Some("settings"), None, None, ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db, "whmcs.configured", Some(&claims.email), ip.as_deref(),
+        Some("settings"), None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "webhook_secret": webhook_secret })))
@@ -116,14 +179,22 @@ pub async fn update_config(
 pub async fn delete_config(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
 
     sqlx::query("DELETE FROM whmcs_config").execute(&state.db).await.ok();
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "whmcs.removed",
-        Some("settings"), None, None, None,
+        Some("settings"), None, None, ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db, "whmcs.removed", Some(&claims.email), ip.as_deref(),
+        Some("settings"), None, None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -141,9 +212,26 @@ pub struct WhmcsWebhookPayload {
     pub secret: Option<String>,
 }
 
+/// The secret may also arrive in the query string.
+///
+/// The panel has always PRINTED the hook URL with the secret as a query
+/// parameter (`Integrations.tsx`), but this handler only ever read it from the
+/// JSON body — so the address the operator was told to paste into WHMCS
+/// authenticated nothing and answered 401. Accepting both makes the advertised
+/// URL work without dropping the body form, which is what a caller that can
+/// shape its own payload should still prefer.
+#[derive(Deserialize)]
+pub struct WhmcsWebhookQuery {
+    pub secret: Option<String>,
+}
+
 /// POST /api/whmcs/webhook — Receive provisioning hooks from WHMCS.
+///
+/// ⚠ `Json` consumes the request body, so it must stay LAST in this argument
+/// list; `Query` has to precede it.
 pub async fn webhook(
     State(state): State<AppState>,
+    Query(q): Query<WhmcsWebhookQuery>,
     Json(body): Json<WhmcsWebhookPayload>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify webhook secret
@@ -156,10 +244,18 @@ pub async fn webhook(
 
     let (secret, auto_provision, auto_suspend, auto_terminate) = config
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "WHMCS not configured"))?;
+    let secret = secret.map(|s| {
+        crate::services::secrets_crypto::decrypt_credential_or_legacy(&s, &state.config.jwt_secret)
+    });
 
     match secret {
         Some(ref expected) => {
-            let provided = body.secret.as_deref().unwrap_or("");
+            // Body first, query string second — see `WhmcsWebhookQuery`.
+            let provided = body
+                .secret
+                .as_deref()
+                .or(q.secret.as_deref())
+                .unwrap_or("");
             // Constant-time comparison to prevent timing attacks
             use subtle::ConstantTimeEq;
             if provided.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
@@ -198,26 +294,28 @@ pub async fn webhook(
                     .to_string();
 
                 let row: (uuid::Uuid,) = sqlx::query_as(
-                    "INSERT INTO users (email, password_hash, role, email_verified, approved, plan) \
-                     VALUES ($1, $2, 'user', true, true, $3) RETURNING id"
+                    "INSERT INTO users (email, password_hash, role, email_verified, approved) \
+                     VALUES ($1, $2, 'user', true, true) RETURNING id"
                 )
                 .bind(email)
                 .bind(&hash)
-                .bind(plan)
                 .fetch_one(&state.db)
                 .await
                 .map_err(|e| internal_error("whmcs create user", e))?;
                 row.0
             };
 
-            // Map service
+            // Map service. `users.plan` was withdrawn with the Stripe billing
+            // routes it existed to serve (routes/billing.rs) — the WHMCS plan
+            // name lives only here, in `whmcs_service_map.plan`, which is what
+            // Integrations.tsx actually reads.
             sqlx::query(
                 "INSERT INTO whmcs_service_map (whmcs_service_id, user_id, plan, status) \
                  VALUES ($1, $2, $3, 'active') ON CONFLICT (whmcs_service_id) DO UPDATE SET status = 'active'"
             )
             .bind(service_id)
             .bind(user_id)
-            .bind(body.plan.as_deref().unwrap_or("basic"))
+            .bind(plan)
             .execute(&state.db)
             .await
             .ok();
@@ -233,28 +331,84 @@ pub async fn webhook(
             ).bind(service_id).fetch_optional(&state.db).await.ok().flatten();
 
             if let Some((Some(user_id),)) = mapping {
-                sqlx::query("UPDATE users SET role = 'suspended' WHERE id = $1")
-                    .bind(user_id).execute(&state.db).await.ok();
+                // `role` doubles as the status column, so suspending OVERWRITES the only
+                // record of what the account was. This path used to have no stash at all,
+                // and the unsuspend arm below restored everyone to 'user' — so an account
+                // round-tripped through billing came back a plain user whatever it had
+                // been. It compensated with the deny-list below, which was complete when
+                // written and then silently holed: it names roles one by one, so it did
+                // not grow when `client` was added to ASSIGNABLE_ROLES, and a `client`
+                // round trip escalated into the `user` that may claim new domains.
+                //
+                // Now it stashes, through the same helper the panel uses, so the deny-list
+                // no longer has to carry that weight alone. It is KEPT regardless, because
+                // it guards a different hazard the stash does not touch: a lapsed invoice
+                // must never suspend the operator out of their own panel. Reachable — the
+                // provision arm above adopts an EXISTING user by email with no role filter,
+                // so the operator's own account maps here the moment their address is also
+                // a billing contact.
+                let changed = crate::helpers::suspend_account(
+                    &state,
+                    user_id,
+                    " AND role NOT IN ('admin', 'reseller')",
+                )
+                .await
+                .unwrap_or(0);
 
                 sqlx::query("UPDATE whmcs_service_map SET status = 'suspended' WHERE whmcs_service_id = $1")
                     .bind(service_id).execute(&state.db).await.ok();
 
-                tracing::info!("WHMCS suspended service {service_id}");
+                if changed == 0 {
+                    tracing::warn!(
+                        "WHMCS suspend for service {service_id} changed no user row — the mapped \
+                         account is already suspended or holds a privileged role"
+                    );
+                } else {
+                    tracing::info!("WHMCS suspended service {service_id}");
+                }
             }
             Ok(Json(serde_json::json!({ "ok": true, "action": "suspended" })))
         }
 
-        "unsuspend" | "UnsuspendAccount" => {
+        // Gated on `auto_suspend`, like its twin above. It was the only arm of the
+        // three with no flag test, so an operator who deliberately turned
+        // billing-driven suspension OFF still got billing-driven UN-suspension —
+        // and since un-suspending rewrites the role, that was the half that could
+        // change a privilege. Suspend and unsuspend are one setting's two
+        // directions; honouring one and not the other is not a safe default.
+        "unsuspend" | "UnsuspendAccount" if auto_suspend => {
             let mapping: Option<(Option<uuid::Uuid>,)> = sqlx::query_as(
                 "SELECT user_id FROM whmcs_service_map WHERE whmcs_service_id = $1"
             ).bind(service_id).fetch_optional(&state.db).await.ok().flatten();
 
             if let Some((Some(user_id),)) = mapping {
-                sqlx::query("UPDATE users SET role = 'user' WHERE id = $1 AND role = 'suspended'")
-                    .bind(user_id).execute(&state.db).await.ok();
-
-                sqlx::query("UPDATE whmcs_service_map SET status = 'active' WHERE whmcs_service_id = $1")
-                    .bind(service_id).execute(&state.db).await.ok();
+                // Gives back the role recorded when the account was suspended,
+                // instead of the hardcoded 'user' that used to promote a `client`
+                // and demote an `admin` in the same statement.
+                //
+                // ⚠ The deny-list is not symmetry for its own sake. The suspend arm
+                // above refuses to touch a privileged account — but the panel can
+                // suspend one, and then this arm would have handed `admin` straight
+                // back, turning a webhook secret into a privilege-restoration
+                // primitive that leaves no activity-log row. Billing may return an
+                // ordinary account to service; it may not re-grant an operator role.
+                match crate::helpers::unsuspend_account(&state, user_id, &["admin", "reseller"]).await {
+                    Ok(Some(role)) => {
+                        sqlx::query("UPDATE whmcs_service_map SET status = 'active' WHERE whmcs_service_id = $1")
+                            .bind(service_id).execute(&state.db).await.ok();
+                        tracing::info!("WHMCS unsuspended service {service_id} as {role}");
+                    }
+                    // The service map is deliberately NOT marked active here: the
+                    // account is still suspended, and saying otherwise would leave
+                    // billing and the panel disagreeing with nothing to reconcile them.
+                    Ok(None) => tracing::warn!(
+                        "WHMCS unsuspend for service {service_id} left the account suspended — \
+                         either no previous role was recorded, or it is one billing may not restore"
+                    ),
+                    Err(_) => tracing::warn!(
+                        "WHMCS unsuspend for service {service_id} failed to read or write the role"
+                    ),
+                }
             }
             Ok(Json(serde_json::json!({ "ok": true, "action": "unsuspended" })))
         }
@@ -378,17 +532,16 @@ pub async fn start_migration(
     .await
     .map_err(|e| internal_error("create migration", e))?;
 
-    // The actual migration would be handled by a background task that:
-    // 1. Exports container (docker export) on source
-    // 2. Transfers image to target server
-    // 3. Imports and starts on target
-    // 4. Updates DNS if needed
-    // For now, we create the migration record and the background task processes it.
+    // No background task exists anywhere in the tree to do the actual container
+    // export/transfer/import this would need — the row above is written once
+    // and never updated again (confirmed by the loose-ends audit: zero writers
+    // touch `app_migrations` besides this INSERT). It is permanently stuck at
+    // `status='in_progress'`. See FEATURES.md §Withdrawn Claims ("App Migration").
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "migration.started",
         Some("container"), Some(&body.container_name),
-        Some(&format!("to server {}", body.target_server_id)), None,
+        Some(&format!("to server {}", body.target_server_id)), None, claims.key_id,
     ).await;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({

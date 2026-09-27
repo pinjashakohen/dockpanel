@@ -1,6 +1,334 @@
 /// Shared helper functions used across multiple route modules.
 use sha2::{Sha256, Digest};
 
+/// Resolve a site the caller is allowed to act on, and return its domain.
+///
+/// Ownership decides whose a site is; the caller's role decides what may be
+/// reached. A site still belongs to exactly one account and a transfer still
+/// moves it — but an administrator may act on any site on the server in front of
+/// them, because an operator who runs a box has to be able to repair anything
+/// running on it. That is the same boundary the admin all-sites read already
+/// draws: what that view lists, its owner may now also act on. It stops at the
+/// server in scope and does not reach a machine somebody else registered.
+///
+/// This replaces six separately-named private copies of one query — two called
+/// `site_domain`, four called `get_site_domain` — plus the inline repeats beside
+/// them. They had drifted: exactly one of the set was also server-scoped. A
+/// guard duplicated per module is a guard that gets widened in one module.
+///
+/// ⚠ The non-admin arm is deliberately left as it was, predicate for predicate,
+/// and must NOT also become server-scoped. No non-admin can own a `servers` row
+/// — the only INSERT is admin-gated — so their scope always resolves to the
+/// local machine. Adding `server_id` on this arm would hide a client's own site
+/// whenever it lives on any other server, and it would do it by returning an
+/// empty list rather than an error, which is the direction nobody checks.
+///
+/// ⚠ That paragraph is true and its conclusion — do not filter this predicate by
+/// server — is still the right call. But it was read for years as though it also
+/// said the SITE is always local, and it does not say that. A caller's scope being
+/// local is a fact about the CALLER; the site's row names its own host and the two
+/// part company as soon as a fleet exists. Resolving WHICH SITE from here and WHICH
+/// HOST from the caller's selection is the actual defect, and filtering cannot fix
+/// it — the row has to choose the host. Use `site_agent_for_caller` below for
+/// anything that then talks to an agent.
+pub async fn site_domain_for_caller(
+    state: &crate::AppState,
+    site_id: uuid::Uuid,
+    claims: &crate::auth::Claims,
+) -> Result<String, crate::error::ApiError> {
+    let row: Option<(String,)> =
+        sqlx::query_as(&format!("SELECT s.domain FROM sites s WHERE {SITE_CALLER_PREDICATE}"))
+            .bind(site_id)
+            .bind(claims.sub)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| crate::error::internal_error("resolve site for caller", e))?;
+
+    row.map(|(d,)| d)
+        .ok_or_else(|| crate::error::err(axum::http::StatusCode::NOT_FOUND, "Site not found"))
+}
+
+/// Resolve a site the caller may act on, AND the agent for the host it actually runs on.
+///
+/// "Which server did the caller select" and "which server is this site on" are different
+/// questions. They agree on a single-box install and whenever an operator happens to have
+/// the right server selected, which is why the difference stayed invisible. They disagree
+/// silently the rest of the time: the header-derived scope falls back to the local agent
+/// when a caller owns no server row, while the site's row may name a fleet member — so the
+/// panel resolves the right domain and then asks the wrong machine about it.
+///
+/// The row is the authority. That rule is already stated and followed by the webhook deploy
+/// path, by the git-deploy update path, and by every background service that walks these
+/// tables; the authenticated HTTP handlers are the layer that never adopted it. A host that
+/// will not resolve is REFUSED — never quietly replaced with this one, because the failure
+/// mode of substituting is writing one tenant's files onto another machine.
+pub async fn site_agent_for_caller(
+    state: &crate::AppState,
+    site_id: uuid::Uuid,
+    claims: &crate::auth::Claims,
+) -> Result<(String, crate::services::agent::AgentHandle), crate::error::ApiError> {
+    let row: Option<(String, Option<uuid::Uuid>)> = sqlx::query_as(&format!(
+        "SELECT s.domain, s.server_id FROM sites s WHERE {SITE_CALLER_PREDICATE}"
+    ))
+    .bind(site_id)
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| crate::error::internal_error("resolve site agent for caller", e))?;
+
+    let (domain, server_id) = row
+        .ok_or_else(|| crate::error::err(axum::http::StatusCode::NOT_FOUND, "Site not found"))?;
+
+    let agent = agent_for_site_server(state, server_id, &domain).await?;
+    Ok((domain, agent))
+}
+
+/// Resolve the agent for the server a row names, refusing rather than substituting.
+///
+/// Split out because several handlers have already loaded the row (and so already hold its
+/// server id) and only need this half. The column is `NOT NULL` in the schema but optional
+/// in the structs that predate the fleet work, so the `None` arm is a real branch: it means
+/// a row older than the backfill, and guessing a host for it is exactly what must not happen.
+pub async fn agent_for_site_server(
+    state: &crate::AppState,
+    server_id: Option<uuid::Uuid>,
+    domain: &str,
+) -> Result<crate::services::agent::AgentHandle, crate::error::ApiError> {
+    let server_id = server_id.ok_or_else(|| {
+        tracing::warn!("Refusing to act on {domain}: its row names no server");
+        crate::error::err(
+            axum::http::StatusCode::CONFLICT,
+            "This site is not associated with a server",
+        )
+    })?;
+
+    state.agents.for_server(server_id).await.map_err(|e| {
+        tracing::warn!(
+            "Refusing to act on {domain}: its server {server_id} is unreachable ({e}) — \
+             acting through a different host would touch another machine's files"
+        );
+        crate::error::err(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "The server this site lives on is unreachable",
+        )
+    })
+}
+
+/// Which of the caller's own sites carries this domain, if any.
+///
+/// ⚠ NOT a claim check, and must never be used as one. `domain_claim::
+/// ensure_claimable` is the single answer to "may this domain be taken", and
+/// `tests/domain-claim-pin-e2e.sh` §B2 exists because paths that answered it
+/// privately drifted apart. This answers a different question — "which existing
+/// site of mine is this" — for a caller that needs to attach something to a site
+/// the operator names by domain. It lives here, once, so it cannot become the
+/// per-path copy that pin forbids.
+///
+/// Owner-scoped rather than using [`SITE_CALLER_PREDICATE`]: the callers write a
+/// row onto the site they get back, and an administrator resolving another
+/// account's domain by name is not a capability anything needs.
+pub async fn site_id_for_owned_domain(
+    db: &sqlx::PgPool,
+    domain: &str,
+    user_id: uuid::Uuid,
+) -> Option<uuid::Uuid> {
+    let wanted = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    sqlx::query_as::<_, (uuid::Uuid,)>(
+        "SELECT id FROM sites WHERE lower(domain) = $1 AND user_id = $2",
+    )
+    .bind(&wanted)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id,)| id)
+}
+
+/// The one predicate that decides whether a caller may act on a site.
+///
+/// Binds `$1` = site id, `$2` = the caller's own id — the same two parameters the
+/// owner-only predicate it replaces took, which is what let every call site adopt
+/// it without touching its binds.
+///
+/// Two ways to satisfy it: own the row, or be an administrator of the machine the
+/// row runs on. `is_local` is this box; `sv.user_id` is a member this same
+/// administrator registered. So it stops at the hardware the reader operates and
+/// does not reach a server somebody else added.
+///
+/// ⚠ The admin arm reads `users.role` from the DATABASE, deliberately, and not
+/// `claims.role` from the token. A JWT keeps asserting whatever role it was minted
+/// with until it expires, so trusting the claim would leave a demoted account
+/// acting as an administrator for the rest of its session. This costs one indexed
+/// lookup inside a query that was already running.
+pub const SITE_CALLER_PREDICATE: &str = "s.id = $1 AND (s.user_id = $2 OR EXISTS (\
+    SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+    AND sv.id = s.server_id AND (sv.is_local OR sv.user_id = u.id)))";
+
+/// Same shape as [`SITE_CALLER_PREDICATE`], for `docker_stacks` — a database can now be
+/// owned by a stack instead of a site (GH #64: standalone DB provisioning for Docker Apps).
+pub const STACK_CALLER_PREDICATE: &str = "st.id = $1 AND (st.user_id = $2 OR EXISTS (\
+    SELECT 1 FROM users u, servers sv WHERE u.id = $2 AND u.role = 'admin' \
+    AND sv.id = st.server_id AND (sv.is_local OR sv.user_id = u.id)))";
+
+// ── Suspension: the role an account gets back ───────────────────────────────
+//
+// Suspending overwrites `users.role`, which is the only record of what the
+// account was, so something has to hold the previous value until the account is
+// un-suspended. That used to be `users.reset_token` — a column the public
+// password-reset flow also writes, from an endpoint that checked no role at
+// all. A suspended account could therefore erase its own stash by asking for a
+// password reset, and the restore then handed back whatever the fallback said.
+//
+// The stash now has a column of its own, and both places that suspend an
+// account go through the two functions below rather than keeping a private copy
+// of the query. There were eight private copies of the last query that decided
+// an authorisation question in this codebase, under three different names, and
+// exactly one of them had quietly drifted (v2.72.0). Two is how that starts.
+
+/// Suspend an account, recording the role it held, and cut its live sessions.
+///
+/// The write is ONE statement, deliberately. The stash and the status change
+/// cannot come apart — there is no window in which `role` has been overwritten
+/// but nothing remembers what it was, which is what a read-then-write pair would
+/// leave open if the process died between them. Postgres evaluates every SET
+/// right-hand side against the OLD row, so `prior_role = role` takes the
+/// pre-update value.
+///
+/// `AND role <> 'suspended'` matters for the same reason: without it, suspending
+/// an already-suspended account would overwrite a perfectly good stash with the
+/// word `suspended`, and the account could then never be given its role back.
+///
+/// **Revoking the sessions is part of suspending, not a step callers remember.**
+/// The JWT middleware only refuses a token whose *claim* says `suspended`, and a
+/// token minted while the account was a `user` keeps saying `user` until it
+/// expires two hours later. The panel had always revoked; the billing webhook
+/// never had, so a billing suspension did nothing at all for up to two hours.
+/// Putting it here is the only way the two paths are actually the same rules,
+/// which is what the guide claims.
+///
+/// `extra_predicate` is appended to the WHERE clause for callers that may only
+/// suspend some accounts — the billing webhook refuses to touch a privileged
+/// one. It is `&'static str` so it cannot carry anything caller-supplied into
+/// the SQL. Returns the number of rows changed, so a caller can tell "suspended"
+/// from "declined".
+pub async fn suspend_account(
+    state: &crate::AppState,
+    id: uuid::Uuid,
+    extra_predicate: &'static str,
+) -> Result<u64, crate::error::ApiError> {
+    let sql = format!(
+        "UPDATE users SET prior_role = role, role = 'suspended', updated_at = NOW() \
+         WHERE id = $1 AND role <> 'suspended'{extra_predicate}"
+    );
+    let changed = sqlx::query(&sql)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| crate::error::internal_error("suspend account", e))?;
+
+    if changed > 0 {
+        crate::routes::auth::revoke_all_user_sessions(state, id).await;
+    }
+    Ok(changed)
+}
+
+/// Which role an un-suspend may restore, given what was recorded.
+///
+/// Pure, and deliberately separated from the query it serves: this single
+/// expression IS the authorisation decision, and everything around it is I/O.
+/// Kept apart so it can be exercised exhaustively in-process — the async
+/// DB-bound wrapper cannot be, and a decision no test can reach is a decision
+/// that drifts. `None` means *leave the account suspended and say so*; it is
+/// never a default, and there is deliberately no branch here that invents a role.
+///
+/// An unrecognised stash — a role since retired, or a leftover from the old
+/// shared column — is treated exactly like no stash at all. It is never handed
+/// back verbatim: `users.role` carries a CHECK constraint, and a rejected write
+/// is a 500 on the button an administrator presses to undo their own action.
+pub fn role_to_restore(stashed: Option<&str>, deny: &[&str]) -> Option<String> {
+    let role = stashed?;
+    if !crate::routes::users::ASSIGNABLE_ROLES.contains(&role) {
+        return None;
+    }
+    if deny.contains(&role) {
+        return None;
+    }
+    Some(role.to_string())
+}
+
+/// Give back the role an account held before it was suspended.
+///
+/// Returns the restored role, or `None` when the account was left suspended —
+/// which happens in exactly two cases, both deliberate:
+///
+///   * **the prior role is unknown**, and
+///   * **the prior role is one `deny` forbids this caller to restore.**
+///
+/// **It never guesses, and that is the whole design.** An earlier draft fell back
+/// to the least-privileged role on an unknown stash, on the reasoning that
+/// `client` is strictly weaker than `user`. That reasoning was wrong: reseller
+/// management is scoped `AND role = 'user'`
+/// (`routes/reseller_dashboard.rs:243`, `:317`), so an account handed `client`
+/// is still listed by its reseller and can no longer be managed by them — the
+/// fallback would not withhold one capability, it would strand the account in a
+/// state no operator asked for. There is no ordering of these roles that makes a
+/// guess safe, so the caller is told instead.
+///
+/// `deny` is the same idea as `suspend_account`'s predicate, in the other
+/// direction. The billing webhook must not RESTORE a privileged role either: its
+/// suspend arm refuses to touch an `admin`, but before this it would happily hand
+/// `admin` back to an account the *panel* had suspended, which turned a webhook
+/// secret into a privilege-restoration primitive.
+///
+/// Reads `prior_role` with a narrow `SELECT` naming the column, never
+/// `SELECT *`. That is not style: `models::User` derives `FromRow` and thirteen
+/// queries load it that way, including the ones that authenticate a login. Keeping
+/// the new column out of that struct means a database restored from a snapshot
+/// older than this migration degrades THIS call alone instead of failing
+/// every login.
+pub async fn unsuspend_account(
+    state: &crate::AppState,
+    id: uuid::Uuid,
+    deny: &[&str],
+) -> Result<Option<String>, crate::error::ApiError> {
+    let stashed: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT prior_role FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| crate::error::internal_error("read prior role", e))?;
+
+    let stashed = stashed.and_then(|(r,)| r);
+    let Some(role) = role_to_restore(stashed.as_deref(), deny) else {
+        return Ok(None);
+    };
+
+    // Clear the stash in the same statement that consumes it. A stash left behind
+    // would be applied again by a later un-suspend, silently overriding whatever
+    // role an administrator had chosen in between.
+    //
+    // `AND role = 'suspended'` makes this idempotent and safe for a caller that
+    // has not already checked — the billing webhook receives an unsuspend hook for
+    // whatever state the account happens to be in, and must not rewrite the role
+    // of an account that was never suspended.
+    sqlx::query(
+        "UPDATE users SET role = $1, prior_role = NULL, updated_at = NOW() \
+         WHERE id = $2 AND role = 'suspended'",
+    )
+    .bind(&role)
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| crate::error::internal_error("unsuspend account", e))?;
+
+    Ok(Some(role))
+}
+
 /// Hash an agent token using SHA-256. Agent tokens are high-entropy (UUIDs)
 /// so SHA-256 is sufficient — no need for slow hashing (argon2/bcrypt).
 pub fn hash_agent_token(token: &str) -> String {
@@ -30,6 +358,85 @@ pub fn cf_headers(token: &str, email: Option<&str>) -> reqwest::header::HeaderMa
         headers.insert("Authorization", bearer);
     }
     headers
+}
+
+#[cfg(test)]
+mod suspend_restore_tests {
+    use super::role_to_restore;
+
+    /// The sentence the whole change exists to make true: what comes back is what
+    /// was recorded, for every role that can be recorded — never something else.
+    #[test]
+    fn every_recorded_role_comes_back_as_itself() {
+        for role in crate::routes::users::ASSIGNABLE_ROLES {
+            assert_eq!(
+                role_to_restore(Some(role), &[]).as_deref(),
+                Some(role),
+                "un-suspending must return the role that was recorded, not a substitute"
+            );
+        }
+    }
+
+    /// ⚠ THE ARM THIS MODULE EXISTS FOR. An un-suspend must never invent a role.
+    /// The first draft of this change fell back to the least-privileged role on an
+    /// unknown stash; that was wrong, because there is no total ordering of these
+    /// roles — reseller management is scoped `AND role = 'user'`, so handing an
+    /// account `client` strands it outside its own reseller's reach rather than
+    /// merely withholding something. Any future `unwrap_or` here reintroduces a
+    /// silent role change on the one path nobody watches.
+    #[test]
+    fn an_unknown_prior_role_is_never_guessed() {
+        assert_eq!(role_to_restore(None, &[]), None, "no stash must not mean a default role");
+        assert_eq!(
+            role_to_restore(Some(""), &[]),
+            None,
+            "an empty stash must not mean a default role"
+        );
+    }
+
+    /// The old shared column held a 64-character SHA-256 digest. If one is still
+    /// sitting in a stash, it must be refused, not written into a
+    /// CHECK-constrained column where it becomes a 500 on the Unsuspend button.
+    ///
+    /// ⚠ Named around the digest rather than around the column, deliberately.
+    /// `tests/suspend-restore-pin-e2e.sh` §B asserts that the password-reset
+    /// column is named ONLY by the reset flow and the model, and a pin greps raw
+    /// source — so an identifier here spelling that column would have to be
+    /// excused in the arm, weakening the one census that would catch the stash
+    /// moving back. Keep the name clear of it.
+    #[test]
+    fn a_leftover_password_digest_is_refused_not_restored() {
+        // Synthetic, but the right SHAPE — 64 hex characters, which is what
+        // `auth::hash_token` produces and what would actually be sitting there.
+        let token = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        assert_eq!(token.len(), 64, "the fixture must be the length a real digest is");
+        assert_eq!(role_to_restore(Some(token), &[]), None);
+        assert_eq!(
+            role_to_restore(Some("suspended"), &[]),
+            None,
+            "'suspended' is a status, never a role to restore"
+        );
+    }
+
+    /// The billing webhook may not hand back a privileged role. Its suspend arm
+    /// already refuses to touch one; without this the same secret could RESTORE
+    /// `admin` to an account the panel had deliberately suspended.
+    #[test]
+    fn a_denied_role_is_not_restored_and_the_account_stays_suspended() {
+        let deny = ["admin", "reseller"];
+        assert_eq!(role_to_restore(Some("admin"), &deny), None);
+        assert_eq!(role_to_restore(Some("reseller"), &deny), None);
+    }
+
+    /// The control that keeps the test above from passing vacuously: the same
+    /// deny-list must still let the ordinary roles through, or billing
+    /// un-suspension would be broken for everybody rather than guarded.
+    #[test]
+    fn the_deny_list_still_lets_ordinary_roles_through() {
+        let deny = ["admin", "reseller"];
+        assert_eq!(role_to_restore(Some("user"), &deny).as_deref(), Some("user"));
+        assert_eq!(role_to_restore(Some("client"), &deny).as_deref(), Some("client"));
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +481,190 @@ mod tests {
         let hash = hash_agent_token("");
         assert_eq!(hash.len(), 64);
     }
+
+    // ---- SSRF validator (validate_url_not_internal) ----
+    //
+    // These arms exist to make ONE mutation impossible to reintroduce silently: the
+    // hand-rolled "strip scheme, split on '/' then ':'" host extraction, which for
+    // `http://example.com:x@169.254.169.254/` tested `example.com` (public → passed)
+    // while every HTTP client connects to the userinfo host `169.254.169.254`.
+    //
+    // No network is touched by the cases below: every rejection here is decided from
+    // the URL structure alone (a literal-IP host or a credentialed authority), before
+    // the resolver. A future rewrite that returns to substring parsing would read the
+    // wrong host and let these through — so each is RED under exactly that mutation.
+
+    use super::url_authority;
+
+    /// ⭐ THE ARM THIS MODULE EXISTS FOR, and it is deterministic OFFLINE in both
+    /// directions. `url_authority` names the host a client would dial; the retired
+    /// hand-rolled parser named the userinfo label instead. Every label here is a
+    /// PUBLIC numeric literal and every true host an INTERNAL numeric literal, so
+    /// `getaddrinfo` never runs — a DNS-free runner gives the same verdict, which the
+    /// earlier `example.com` version did not (it went green under the mutation whenever
+    /// the runner had no DNS). Restoring `split('/').next().split(':').next()` returns
+    /// the left literal and turns every assert below red.
+    #[test]
+    fn the_validated_host_is_the_host_a_client_would_connect_to() {
+        // Host AND port come from the real authority, never a substring + hardcoded :80.
+        // No resolver runs, so this is deterministic on an air-gapped runner and RED
+        // against the retired parser, which returned ("[2001", 80) / ("example.com", 80).
+        assert_eq!(
+            url_authority("http://[2001:db8::1]:8443/").unwrap(),
+            ("[2001:db8::1]".to_string(), 8443),
+            "a bracketed IPv6 literal and its real port, not the string '2001' and port 80"
+        );
+        assert_eq!(
+            url_authority("http://example.com:8443/path").unwrap(),
+            ("example.com".to_string(), 8443),
+            "the real port survives; the old parser hardcoded 80"
+        );
+        assert_eq!(
+            url_authority("https://198.51.100.7:9000/admin").unwrap(),
+            ("198.51.100.7".to_string(), 9000),
+            "host and port both from the authority"
+        );
+        // The userinfo construct — the exact host/validator disagreement — is REFUSED,
+        // not host-extracted. A substring parser reads the public left label and returns
+        // Ok, so each of these is red under the mutation.
+        assert!(
+            url_authority("http://192.0.2.1:x@127.0.0.1/").is_err(),
+            "a credentialed authority must be refused, not resolved to its userinfo label"
+        );
+        assert!(url_authority("https://198.51.100.7:tok@10.0.0.5:8080/admin").is_err());
+    }
+
+    async fn v(u: &str) -> Result<(), String> {
+        super::validate_url_not_internal(u).await
+    }
+
+    #[tokio::test]
+    async fn userinfo_spoofed_internal_host_is_rejected() {
+        // Same numeric-literal shape so no DNS is needed even under the mutation: the
+        // public label on the left, the internal host on the right, and the metadata
+        // address among them. RED against the substring parser on any runner.
+        for u in [
+            "http://192.0.2.1:x@127.0.0.1/",
+            "http://192.0.2.1:80@169.254.169.254/latest/meta-data/",
+            "https://198.51.100.7:tok@10.0.0.5:8080/admin",
+        ] {
+            assert!(
+                v(u).await.is_err(),
+                "userinfo-spoofed URL must be rejected, true host is internal: {u}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alternate_ip_encodings_and_v6_embeddings_of_internal_are_rejected() {
+        // `url` normalises the IPv4 encodings; `v6_is_internal` extracts the embedded v4
+        // from the transition prefixes. The last two are the gap the parser fix alone
+        // left open (NAT64 well-known + 6to4, both embedding 127.0.0.1).
+        for u in [
+            "http://2130706433/",               // decimal 127.0.0.1
+            "http://0x7f000001/",               // hex
+            "http://0177.0.0.1/",               // octal
+            "http://[::1]/",                    // v6 loopback
+            "http://[::ffff:169.254.169.254]/", // v4-mapped metadata
+            "http://[64:ff9b::7f00:1]/",        // NAT64 well-known, 127.0.0.1
+            "http://[2002:7f00:1::]/",          // 6to4, 127.0.0.1
+        ] {
+            assert!(v(u).await.is_err(), "internal literal host must be rejected: {u}");
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_in_a_public_authority_are_still_refused() {
+        assert!(
+            v("https://user:tok@example.com/hook").await.is_err(),
+            "a URL with credentials must be refused regardless of the host"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_scheme_or_non_http_scheme_is_refused() {
+        assert!(v("").await.is_err());
+        assert!(v("ftp://example.com/").await.is_err());
+        assert!(v("file:///etc/passwd").await.is_err());
+        assert!(v("not a url").await.is_err());
+    }
+
+    // ---- SSRF validator (validate_repo_url_not_internal) ----
+    //
+    // `git_deploys.repo_url` cannot reuse `validate_url_not_internal` unmodified: a
+    // legitimate repo URL routinely carries an access token as userinfo
+    // (`https://x-access-token:TOKEN@github.com/...`), which that guard refuses
+    // outright, and `is_valid_repo_url` (agent-side, the actual clone gate) also
+    // accepts `ssh://` and the scp-like `git@host:path` shorthand — neither of which
+    // `url::Url` parses as an ordinary authority. These pins exist so tolerance for
+    // credentials never quietly widens into tolerance for an internal HOST.
+
+    #[test]
+    fn repo_url_authority_host_matches_what_a_client_would_dial() {
+        assert_eq!(
+            super::repo_url_authority("https://github.com/owner/repo.git").unwrap(),
+            ("github.com".to_string(), 443),
+            "plain https behaves like url_authority"
+        );
+        assert_eq!(
+            super::repo_url_authority("https://x-access-token:ghp_abc@github.com/owner/repo.git")
+                .unwrap(),
+            ("github.com".to_string(), 443),
+            "a legitimate embedded PAT is tolerated, and the host extracted is still \
+             the one a client actually dials"
+        );
+        assert_eq!(
+            super::repo_url_authority("ssh://git@10.0.0.1:2222/owner/repo.git").unwrap(),
+            ("10.0.0.1".to_string(), 2222),
+            "ssh:// with an explicit port"
+        );
+        assert_eq!(
+            super::repo_url_authority("git@github.com:owner/repo.git").unwrap(),
+            ("github.com".to_string(), 22),
+            "scp-like shorthand has no scheme delimiter at all, and defaults to port 22"
+        );
+        assert!(
+            super::repo_url_authority("ftp://example.com/repo.git").is_err(),
+            "a scheme neither this guard nor is_valid_repo_url recognises is refused up front"
+        );
+        assert!(super::repo_url_authority("").is_err());
+    }
+
+    async fn vr(u: &str) -> Result<(), String> {
+        super::validate_repo_url_not_internal(u).await
+    }
+
+    #[tokio::test]
+    async fn repo_url_internal_targets_rejected_across_every_shape() {
+        // No DNS needed: every host below is a literal IP, one per shape this guard
+        // has to parse. If credential-tolerance were implemented as "skip the SSRF
+        // check" rather than "skip only the credential rejection", every one of these
+        // would wrongly pass.
+        for u in [
+            "https://TOKEN@10.0.0.5/owner/repo.git",    // credentialed https, RFC 1918
+            "ssh://git@169.254.169.254/owner/repo.git", // ssh, metadata address
+            "git@127.0.0.1:owner/repo.git",             // scp-like, loopback
+            "git@100.64.0.1:owner/repo.git",            // scp-like, CGNAT
+        ] {
+            assert!(vr(u).await.is_err(), "internal repo_url target must be rejected: {u}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_url_credentials_alone_do_not_trigger_the_refusal_url_authority_would() {
+        // A TEST-NET literal stands in for a real public host, so this needs no DNS.
+        // The point: credentials alone must NOT refuse here, unlike
+        // `credentials_in_a_public_authority_are_still_refused` above — that is the
+        // entire reason this guard exists instead of reusing `validate_url_not_internal`.
+        assert!(vr("https://x-access-token:ghp_abc@198.51.100.7/owner/repo.git").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn repo_url_disallowed_scheme_is_refused_before_any_resolution() {
+        assert!(vr("ftp://example.com/repo.git").await.is_err());
+        assert!(vr("file:///etc/passwd").await.is_err());
+        assert!(vr("").await.is_err());
+    }
 }
 
 /// True if an IPv4 address is loopback / private / link-local / CGNAT / unspecified
@@ -90,20 +681,49 @@ fn v4_is_internal(v4: std::net::Ipv4Addr) -> bool {
 }
 
 /// True if an IPv6 address is loopback / unspecified / ULA (fc00::/7) /
-/// link-local (fe80::/10), OR is an IPv4-mapped address whose embedded v4 is
-/// internal (`::ffff:127.0.0.1`, `::ffff:169.254.169.254`, …). Rust's
-/// `Ipv6Addr::is_loopback()` is false for the mapped forms, so those must be
-/// normalized explicitly — that was the SSRF-validator gap.
+/// link-local (fe80::/10), OR embeds an internal IPv4 via a transition mechanism.
+///
+/// Four embeddings reach the same internal v4 through a v6 literal, and only one of
+/// them (`::ffff:a.b.c.d`) is normalized by `Ipv6Addr::to_ipv4_mapped()`. The other
+/// three had no rule, so `http://[64:ff9b::7f00:1]/` (NAT64, embedding 127.0.0.1)
+/// passed even the rewritten validator until this was added:
+///   * `::ffff:a.b.c.d`  IPv4-mapped   — low 32 bits (handled by `to_ipv4_mapped`)
+///   * `64:ff9b::a.b.c.d` NAT64 WKP     — low 32 bits
+///   * `::a.b.c.d`        IPv4-compat   — low 32 bits (deprecated, still routed by some stacks)
+///   * `2002:a.b.c.d::/16` 6to4         — bits [16..48]
+/// In every case the embedded v4 is classified by `v4_is_internal`, so one change to
+/// the v4 ranges covers all forms at once.
 fn v6_is_internal(v6: std::net::Ipv6Addr) -> bool {
     if v6.is_loopback() || v6.is_unspecified() {
         return true;
     }
-    if let Some(v4) = v6.to_ipv4_mapped() {
+    let seg = v6.segments();
+    let low_v4 = std::net::Ipv4Addr::new(
+        (seg[6] >> 8) as u8,
+        (seg[6] & 0xff) as u8,
+        (seg[7] >> 8) as u8,
+        (seg[7] & 0xff) as u8,
+    );
+    // IPv4-mapped (::ffff:0:0/96), NAT64 well-known (64:ff9b::/96), and IPv4-compatible
+    // (::/96) all carry the embedded v4 in the low 32 bits.
+    let is_mapped = seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0xffff;
+    let is_nat64 = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0;
+    let is_v4compat = seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0;
+    if (is_mapped || is_nat64 || is_v4compat) && v4_is_internal(low_v4) {
+        return true;
+    }
+    // 6to4 (2002::/16) carries the embedded v4 in bits [16..48].
+    if seg[0] == 0x2002 {
+        let v4 = std::net::Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
         if v4_is_internal(v4) {
             return true;
         }
     }
-    let seg = v6.segments();
     (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
         || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
 }
@@ -204,47 +824,54 @@ pub fn host_resolves_internal_blocking(host: &str, port: u16) -> bool {
     }
 }
 
-/// SSRF protection: validate that a URL does not resolve to an internal/private address.
+/// SSRF protection: reject a URL whose host is (or resolves to) an internal address.
 ///
-/// Checks loopback, private (RFC 1918), link-local, ULA, CGNAT, IPv4-mapped-IPv6,
-/// and unspecified addresses. Resolves DNS to catch bypass via hostnames that map
-/// to internal IPs.
+/// Parsed with `url::Url` rather than by hand. The previous "strip the scheme, take up
+/// to the first `/`, then up to the first `:`" logic extracted the WRONG host for a
+/// userinfo authority: for `http://example.com:x@169.254.169.254/` it tested
+/// `example.com` (public, so it passed) while every HTTP client here connects to the
+/// real host, `169.254.169.254`. A real parser also normalises alternate IPv4 encodings
+/// (`http://2130706433/`, `0x7f000001`, octal) back to dotted-decimal, so a literal-IP
+/// host is authoritative and never depends on the resolver agreeing.
+///
+/// Rejects: any credentials in the authority (the userinfo-spoof vector), and a host
+/// that is or resolves to loopback / private (RFC 1918) / link-local & metadata
+/// (169.254/16) / CGNAT (100.64/10) / ULA / IPv4-mapped-internal / unspecified /
+/// broadcast — the set `ip_is_internal` covers.
 pub async fn validate_url_not_internal(url: &str) -> Result<(), String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("URL is required".to_string());
-    }
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("URL must use http or https".to_string());
-    }
+    // `url_authority` decides WHAT host to check — the one a client would dial, not the
+    // userinfo label the old string-surgery mistook for it. Everything below only
+    // decides whether that host is internal, so the two concerns can be pinned apart.
+    let (host, port) = url_authority(url)?;
 
-    // Extract host from URL (strip scheme, take up to next / or :)
-    let after_scheme = if url.starts_with("https://") { &url[8..] } else { &url[7..] };
-    let host = after_scheme
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-
-    if host.is_empty() {
-        return Err("URL has no hostname".to_string());
+    // A literal IP host (in any encoding — `url` has already normalised it) is
+    // authoritative; check it directly and never resolve.
+    let bare = host.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip_is_internal(ip) {
+            return Err("URL points to a private/internal address".to_string());
+        }
+        return Ok(());
     }
 
-    // Block obvious internal hostnames
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0" {
+    // Obvious internal names, before paying for a DNS lookup.
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
         return Err("URL points to a local address".to_string());
     }
 
-    // Resolve hostname to IP addresses and check each one
-    let lookup_host = format!("{}:80", host.trim_matches(|c| c == '[' || c == ']'));
-    match tokio::net::lookup_host(&lookup_host).await {
+    // Resolve and reject if ANY resolved address is internal (split-horizon / rebind).
+    match tokio::net::lookup_host((host.as_str(), port)).await {
         Ok(addrs) => {
+            let mut resolved_any = false;
             for addr in addrs {
+                resolved_any = true;
                 if ip_is_internal(addr.ip()) {
                     return Err("URL resolves to a private/internal address".to_string());
                 }
+            }
+            if !resolved_any {
+                return Err("URL hostname could not be resolved".to_string());
             }
         }
         Err(_) => {
@@ -253,6 +880,250 @@ pub async fn validate_url_not_internal(url: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// SSRF guard for a BARE host — the tcp/ping monitor lane stores a host, not a URL, and
+/// `check_tcp`/`check_ping` dial it directly. Without this a non-suspended account could
+/// point a tcp monitor at `10.0.0.1:3306` or `127.0.0.1:22` and read connect/refused/
+/// filtered back as the check status: an internal port scanner the HTTP lane already
+/// forbids. Rejects the same address set as [`validate_url_not_internal`], so the two
+/// lanes agree on what "internal" means. `port` is used only for the resolver call.
+pub async fn validate_host_not_internal(host: &str, port: u16) -> Result<(), String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("Host is required".to_string());
+    }
+    let bare = host.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip_is_internal(ip) {
+            return Err("Host points to a private/internal address".to_string());
+        }
+        return Ok(());
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return Err("Host points to a local address".to_string());
+    }
+    match tokio::net::lookup_host((bare, port)).await {
+        Ok(addrs) => {
+            let mut resolved_any = false;
+            for addr in addrs {
+                resolved_any = true;
+                if ip_is_internal(addr.ip()) {
+                    return Err("Host resolves to a private/internal address".to_string());
+                }
+            }
+            if !resolved_any {
+                return Err("Host could not be resolved".to_string());
+            }
+        }
+        Err(_) => {
+            return Err("Host could not be resolved".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `host` and return EVERY address DNS answers, after rejecting the
+/// whole name if any resolved address is internal (split-horizon DNS) — the
+/// shared core `resolve_validated` and [`ValidatingResolver`] both build on,
+/// so the internal-address rule lives in exactly one place. Port-agnostic:
+/// hostname→address resolution never depends on the port, so this always
+/// looks up port 0 and lets callers attach the port that matters to them —
+/// `resolve_validated` reattaches the real one; `ValidatingResolver` cannot,
+/// since `reqwest::dns::Resolve::resolve` receives a bare `Name`, and per its
+/// own contract a `SocketAddr` with port 0 is fixed up to the request's real
+/// port before anything connects.
+async fn resolve_all_validated(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    let bare = host.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if ip_is_internal(ip) {
+            return Err("points to a private/internal address".to_string());
+        }
+        return Ok(vec![std::net::SocketAddr::new(ip, 0)]);
+    }
+    let lower = bare.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return Err("points to a local address".to_string());
+    }
+    let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((bare, 0)).await {
+        Ok(iter) => iter.collect(),
+        Err(_) => return Err("hostname could not be resolved".to_string()),
+    };
+    if addrs.is_empty() {
+        return Err("hostname could not be resolved".to_string());
+    }
+    if addrs.iter().any(|a| ip_is_internal(a.ip())) {
+        return Err("resolves to a private/internal address".to_string());
+    }
+    Ok(addrs)
+}
+
+/// Resolve `host:port`, checked the same way `validate_url_not_internal`/
+/// `validate_host_not_internal` already check it, and return the ONE address
+/// that check approved — so a caller can dial THAT address instead of asking
+/// the OS to resolve `host` a second time.
+///
+/// Every caller of the two validators above used to check-then-reconnect: a
+/// hostname passed the guard by resolving to a public address, and the actual
+/// HTTP client / `TcpStream::connect` / `ping` binary then resolved the SAME
+/// hostname AGAIN, independently, to make the real connection. A DNS server
+/// that answers differently between those two lookups (a classic rebind, or
+/// simply a very low TTL) sails straight through — the guard and the
+/// connection were never provably looking at the same address. Pinning here
+/// closes that gap: whatever this function approves is what gets dialed.
+///
+/// Preserves the existing "reject if ANY resolved address is internal"
+/// semantics (split-horizon DNS) before picking one to hand back — narrowing
+/// to the first address ONLY happens after every address has been cleared.
+pub async fn resolve_validated(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let addrs = resolve_all_validated(host).await?;
+    Ok(std::net::SocketAddr::new(addrs[0].ip(), port))
+}
+
+/// A `reqwest::dns::Resolve` impl that closes the check-then-reconnect gap
+/// [`resolve_validated`]/[`pinned_client`] cannot: those pin ONE hostname (the
+/// initial request's), so a redirect to a DIFFERENT host still falls through to
+/// reqwest's own resolver, which re-resolves independently of whatever guard
+/// decided to follow the redirect — a rebind between that decision and the
+/// actual connect sails through unseen, because the two never shared a lookup.
+///
+/// Installed via `ClientBuilder::dns_resolver`, this becomes the resolver
+/// reqwest calls to make EVERY connection, including a redirect hop — the
+/// per-domain `.resolve()` override `pinned_client` also applies is checked
+/// first and this is the fallback for every other name, so validation and
+/// resolution are now the same lookup for every hop, not just the first.
+///
+/// Does NOT replace `host_resolves_internal_blocking` in a redirect-policy
+/// closure: a `Location` that is already a literal IP never reaches a `Resolve`
+/// impl at all (hyper's connector dials a literal IP directly), so the
+/// synchronous host check is still what catches that case. This closes the
+/// narrower gap the other cannot — the TOCTOU on a hostname-based hop.
+pub struct ValidatingResolver;
+
+impl reqwest::dns::Resolve for ValidatingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            match resolve_all_validated(&host).await {
+                Ok(addrs) => {
+                    let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+                    Ok(iter)
+                }
+                Err(e) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+                    as Box<dyn std::error::Error + Send + Sync>),
+            }
+        })
+    }
+}
+
+/// Build a `reqwest::Client` whose DNS resolution for `host` is hard-pinned to
+/// the one address [`resolve_validated`] just approved. `builder.resolve`
+/// overrides reqwest's own resolver for that exact hostname — the request
+/// still uses the original URL for the Host header, SNI and certificate
+/// validation, so this changes ONLY which address the TCP connection opens
+/// to, not what the request or the TLS handshake say. Build a fresh client
+/// per call rather than reusing a shared one: the whole point is that this
+/// client's resolver answer is fixed to an address checked moments earlier.
+pub async fn pinned_client(
+    host: &str,
+    port: u16,
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, String> {
+    let addr = resolve_validated(host, port).await?;
+    builder
+        .resolve(host, addr)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// Parse a URL and return the (host, port) a client would actually connect to.
+///
+/// Pure and synchronous, so it can be pinned by equality without a resolver: for
+/// `http://192.0.2.1:x@127.0.0.1/` this returns `("127.0.0.1", 80)`, the host the HTTP
+/// client dials — where the retired hand-rolled parser returned the userinfo label
+/// `192.0.2.1` and the hardcoded port 80. `host_str()` keeps the brackets on an IPv6
+/// literal (`"[2001:db8::1]"`); the caller strips them before parsing an `IpAddr`.
+///
+/// Rejects: a parse failure, a non-http(s) scheme, and any credentials in the authority
+/// — the userinfo construct is the only thing that let the client and a validator
+/// disagree about the host, and nothing this guard protects legitimately carries one.
+pub fn url_authority(url: &str) -> Result<(String, u16), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is required".to_string());
+    }
+
+    let parsed = url::Url::parse(url).map_err(|_| "URL is not valid".to_string())?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("URL must use http or https".to_string());
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not contain credentials".to_string());
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no hostname".to_string())?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Ok((host, port))
+}
+
+/// SSRF-guard host/port extraction for `git_deploys.repo_url`, tolerant of the two
+/// shapes `url_authority` cannot handle: the scp-like `git@host:path` shorthand (no
+/// `://` at all, so `url::Url` can't parse it) and a userinfo-bearing `https://`/
+/// `ssh://` authority carrying a legitimate access token
+/// (`https://x-access-token:TOKEN@github.com/owner/repo.git`) — `url_authority`
+/// refuses ANY credentials outright, which would refuse that exact legitimate shape.
+/// Scheme set mirrors what the agent's `is_valid_repo_url` accepts.
+fn repo_url_authority(url: &str) -> Result<(String, u16), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("Repository URL is required".to_string());
+    }
+
+    // scp-like syntax is always `git@host:path` (never a port, and always user
+    // "git" — the one literal `is_valid_repo_url` accepts), so a colon-and-slash
+    // split gets the host without needing a URI parser at all.
+    if let Some(rest) = url.strip_prefix("git@") {
+        let host = rest.split(':').next().unwrap_or("");
+        let host = host.split('/').next().unwrap_or(host);
+        return if host.is_empty() {
+            Err("Repository URL has no hostname".to_string())
+        } else {
+            Ok((host.to_string(), 22))
+        };
+    }
+
+    let parsed = url::Url::parse(url).map_err(|_| "Repository URL is not valid".to_string())?;
+
+    if !matches!(parsed.scheme(), "http" | "https" | "ssh") {
+        return Err("Repository URL must use https, http, ssh, or git@host:path".to_string());
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Repository URL has no hostname".to_string())?
+        .to_string();
+    // Credentials are deliberately NOT rejected here, unlike `url_authority` — that
+    // guard protects operator-supplied webhook/monitor URLs, where a userinfo
+    // authority is a pure spoofing vector with no legitimate use. A repo_url
+    // legitimately carries a PAT this way, and the host extracted above is what the
+    // agent's `git clone` dials either way, credentials or not.
+    let port = parsed.port_or_known_default().unwrap_or(22); // url crate has no ssh default
+    Ok((host, port))
+}
+
+/// SSRF guard for `git_deploys.repo_url` — see [`repo_url_authority`] for why this
+/// can't just be `validate_url_not_internal`. Reuses [`validate_host_not_internal`]
+/// for the actual internal-address check, so the two guards agree on what "internal"
+/// means.
+pub async fn validate_repo_url_not_internal(url: &str) -> Result<(), String> {
+    let (host, port) = repo_url_authority(url)?;
+    validate_host_not_internal(&host, port).await
 }
 
 /// Detect the server's public IPv4 address.
@@ -315,6 +1186,68 @@ pub async fn detect_public_ip_cached() -> String {
     ip
 }
 
+/// The public address to PUBLISH IN DNS for a resource that lives on `server_id`.
+///
+/// [`detect_public_ip`] answers "what is *this process's* public address", which is
+/// the panel's. That is the right answer only when the resource in question is on
+/// the panel's own box, and every auto-DNS path used it unconditionally: creating a
+/// site on a fleet member published an A record pointing at the PANEL, so the site
+/// was unreachable at the name it was just given. The delete path was worse in the
+/// quieter direction — it removes the record only when `content == server_ip`, so a
+/// member's record never matched and survived the site's deletion as a dangling A
+/// record aimed at a host that no longer serves it, which is a stale-DNS and
+/// subdomain-takeover surface rather than a cosmetic leftover.
+///
+/// `servers.ip_address` is the authoritative answer and was already being kept
+/// current — `agent_checkin` refreshes it on every check-in — but nothing consulted
+/// it when publishing. It was read only to draw dashboards.
+///
+/// Returns `None` rather than falling back to the panel's address when the host
+/// cannot be resolved. Publishing DNS is exactly the operation where substituting a
+/// different machine's address produces a confidently wrong, externally-visible
+/// result, so the callers skip the record and say so instead — the same
+/// refuse-rather-than-substitute rule [`agent_for_site_server`] applies to agents.
+pub async fn public_ip_for_server(
+    db: &sqlx::PgPool,
+    server_id: Option<uuid::Uuid>,
+) -> Option<String> {
+    let Some(server_id) = server_id else {
+        tracing::warn!("Auto-DNS: no server recorded for this resource — refusing to publish a record rather than guessing a host");
+        return None;
+    };
+
+    let row: Option<(Option<String>, bool)> =
+        sqlx::query_as("SELECT ip_address, is_local FROM servers WHERE id = $1")
+            .bind(server_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+    match row {
+        // The local box: detect it outbound exactly as before. The `servers` row for
+        // the local agent often carries a LAN address (it is whatever the agent saw
+        // of itself), so the stored column is the wrong source here even though it
+        // is the right one for every other member.
+        Some((_, true)) => {
+            let ip = detect_public_ip_cached().await;
+            if ip.is_empty() { None } else { Some(ip) }
+        }
+        Some((Some(ip), false)) if !ip.trim().is_empty() => Some(ip.trim().to_string()),
+        Some((_, false)) => {
+            tracing::warn!(
+                "Auto-DNS: server {server_id} has no recorded ip_address — refusing to publish \
+                 a record. The panel's own address would point this name at the wrong machine."
+            );
+            None
+        }
+        None => {
+            tracing::warn!("Auto-DNS: server {server_id} no longer exists — refusing to publish a record");
+            None
+        }
+    }
+}
+
 /// Parse the certificate expiry string the agent returns for SSL
 /// provision / renew / DNS-01 responses.
 ///
@@ -360,6 +1293,265 @@ fn strip_zero_offset_seconds(s: &str) -> Option<String> {
     }
 }
 
+/// Days before expiry at which a DNS-01 certificate we cannot re-order over
+/// DNS-01 stops being refused and is deliberately downgraded instead.
+///
+/// Refusing is the right answer while there is still time to fix the cause, and
+/// the WRONG answer at the end. For a zone-apex wildcard, today's silent
+/// downgrade at least leaves the apex serving a valid certificate and breaks
+/// only the siblings — visibly, in a browser, each two clicks from a repair.
+/// Refusing all the way to expiry takes the apex AND every sibling down at the
+/// same moment, so a pure refusal would ENLARGE the blast radius of the very
+/// defect it was written to remove.
+///
+/// Seven days sits under the `tlsserver` and `classic` fallback margins
+/// (`auto_healer::fallback_renewal_margin`: 15 / 30), so for those the ladder
+/// has already been climbed by the time this rung is reached.
+///
+/// ⚠ It does NOT sit under `shortlived`'s margin of two days, and that sentence
+/// used to claim it did while citing the very number that refutes it. See
+/// [`dns01_last_resort_days`] — this constant is the DEFAULT, not the rung.
+pub const DNS01_LAST_RESORT_DAYS: i64 = 7;
+
+/// The last-resort rung for one site, which depends on its ACME profile.
+///
+/// ⚠ A single constant was not merely imprecise here, it was arithmetically
+/// unreachable. `days_remaining` is `num_days()` of what is left, and a
+/// `shortlived` certificate is ~160 hours — so that value is at most SIX from
+/// the instant of issuance and can never exceed seven. The `Refuse` rung was
+/// therefore dead code for the entire profile: every DNS-01 renewal for a
+/// shortlived site whose zone had gone took the silent single-name downgrade,
+/// and the operator was never told while the zone was still repairable.
+///
+/// The rung must sit STRICTLY BELOW the profile's renewal margin, or the door
+/// never runs in a window where `Refuse` can be returned — renewal begins at
+/// the margin, so a rung at or above it is unreachable by construction. That
+/// invariant, not the number, is what `dns01-renewal` §D pins.
+///
+/// Mirrors the shape of `auto_healer::fallback_renewal_margin` on purpose: the
+/// two are read together and must stay in step.
+pub fn dns01_last_resort_days(profile: Option<&str>) -> i64 {
+    match profile {
+        Some("shortlived") => 1,
+        _ => DNS01_LAST_RESORT_DAYS,
+    }
+}
+
+/// What a renewal door should DO with a site, decided before any ACME order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RenewalPlan {
+    /// Renew over HTTP-01 against the site's own domain.
+    ///
+    /// `record_challenge` is true when nothing was recorded and this pass is the
+    /// one degraded attempt that also writes the provenance down. That is what
+    /// makes the rule CONVERGE: an unrecorded row behaves exactly as it does
+    /// today once more, and is correct for ever after. Requiring positive
+    /// evidence of `http-01` rather than absence-of-wildcard-evidence is the
+    /// only formulation that terminates — absence is also what a non-wildcard
+    /// DNS-01 certificate looks like, and that certificate is byte-identical to
+    /// an HTTP-01 one in every field the panel or the agent can read.
+    Http01 { record_challenge: bool },
+    /// Renew over DNS-01, against the name actually ordered.
+    Dns01 {
+        subject: String,
+        wildcard: bool,
+        zone_id: uuid::Uuid,
+    },
+    /// A DNS-01 certificate whose zone we cannot reach, with time still on the
+    /// clock. Refuse and say why; the operator can add the zone or the token.
+    Refuse { reason: String },
+    /// The same certificate, inside [`DNS01_LAST_RESORT_DAYS`]. Downgrade on
+    /// purpose, record it, and say exactly what was lost — never silently.
+    LastResortHttp01 { losing: String },
+}
+
+/// Decide how `site` must be renewed, from what was RECORDED at issuance.
+///
+/// ⚠ This deliberately does not consult the stored certificate path. An earlier
+/// draft used "the certificate directory is not the site's own domain" as proof
+/// of a shared zone certificate. It is not proof — but the reason first written
+/// here has since STOPPED BEING TRUE, and a guard defended by a dead reason is
+/// one refactor from being removed as obsolete.
+///
+/// ⛔ THE OLD REASON, REPEALED BY THE SAME RELEASE THAT WROTE IT: *"`rename_domain`
+/// writes only the domain while the agent MOVES the certificate directory."* Since
+/// v2.145.0 the rename rewrites that column itself (`routes/sites.rs`, the
+/// `CASE WHEN … LIKE` in the rename statement), so a renamed site's path is
+/// correct from that release on.
+///
+/// ⭐ THE REASON THAT STILL HOLDS, and it is two reasons, not one:
+///   1. That rewrite is deliberately SCOPED to the site's own old directory, so a
+///      wildcard child renamed out of its zone keeps naming the zone for ever —
+///      correctly, because the zone is where its certificate really lives.
+///   2. Any row renamed on a build at or below v2.144.x still carries the stale
+///      pre-rewrite path, and the name it points at can be handed to the NEXT
+///      site that claims it.
+/// Both shapes make a row that names a directory belonging to somebody else, and
+/// neither is distinguishable in SQL from a genuine wildcard child. Acting on it
+/// would refuse to renew healthy sites for ever.
+pub async fn renewal_plan(
+    pool: &sqlx::PgPool,
+    site: &crate::models::Site,
+    days_remaining: Option<i64>,
+) -> RenewalPlan {
+    // Positive evidence of HTTP-01, or nothing recorded at all.
+    match site.ssl_challenge.as_deref() {
+        Some("http-01") => return RenewalPlan::Http01 { record_challenge: false },
+        None => return RenewalPlan::Http01 { record_challenge: true },
+        _ => {}
+    }
+
+    let subject = site
+        .ssl_cert_subject
+        .clone()
+        .unwrap_or_else(|| site.domain.clone());
+    let wildcard = site.ssl_wildcard.unwrap_or(false);
+    let names = if wildcard {
+        format!("{subject} and *.{subject}")
+    } else {
+        subject.clone()
+    };
+
+    // The zone that ISSUED it, never a zone re-derived from a text subject.
+    // Re-deriving would let a stale string select a different tenant's
+    // Cloudflare token, and there is no caller-free zone resolver in this tree:
+    // every other `dns_zones` read is scoped `WHERE domain = $1 AND user_id = $2`.
+    let zone_id: Option<uuid::Uuid> = match site.ssl_dns_zone_id {
+        Some(id) => sqlx::query_scalar(
+            "SELECT id FROM dns_zones WHERE id = $1 AND provider = 'cloudflare' \
+             AND cf_zone_id IS NOT NULL AND cf_api_token IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten(),
+        // Legacy row: fall back to the SITE OWNER's zones — never the actor's,
+        // never the first admin's, never an unscoped match by domain. An
+        // unattended loop has no actor, and handing one admin's Cloudflare token
+        // to a job renewing another account's site is a credential disclosure,
+        // not a convenience.
+        None => sqlx::query_scalar(
+            "SELECT id FROM dns_zones WHERE user_id = $1 AND provider = 'cloudflare' \
+             AND cf_zone_id IS NOT NULL AND cf_api_token IS NOT NULL AND domain = $2",
+        )
+        .bind(site.user_id)
+        .bind(&subject)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten(),
+    };
+
+    if let Some(zone_id) = zone_id {
+        return RenewalPlan::Dns01 { subject, wildcard, zone_id };
+    }
+
+    // No reachable zone. Refuse while that is still repairable; downgrade
+    // deliberately once it is not.
+    let last_resort = dns01_last_resort_days(site.ssl_profile.as_deref());
+    if days_remaining.is_some_and(|d| d <= last_resort) {
+        RenewalPlan::LastResortHttp01 { losing: names }
+    } else {
+        RenewalPlan::Refuse {
+            reason: format!(
+                "The certificate for {} was issued over DNS-01 and covers {}. Renewing it \
+                 needs the Cloudflare zone it was issued against, and this site's owner has \
+                 no Cloudflare zone for {} with an API token. Add it under DNS management, \
+                 or install a replacement certificate under the site's SSL tab.",
+                site.domain, names, subject
+            ),
+        }
+    }
+}
+
+/// The issuer of the certificate installed for `domain`, but ONLY when that
+/// issuer proves DockPanel did not put it there.
+///
+/// The agent's ACME client is pinned to `LetsEncrypt::Production`
+/// (`panel/agent/src/services/ssl.rs`, the only directory URL in the crate), so
+/// every certificate this product issues carries a Let's Encrypt issuer. A
+/// certificate issued by anyone else therefore came from somewhere else — an
+/// operator upload, a corporate PKI, a Cloudflare Origin CA, a commercial OV or
+/// wildcard purchase. That is a PROOF, not a heuristic, and it is what lets the
+/// renewal paths tell "ours to renew" from "someone else's to protect" without a
+/// provenance column, a migration, or a backfill that could only guess.
+///
+/// ⚠ Returns `None` for "we do not know" as well as for "ours" — a missing
+/// agent, an unreadable certificate, an issuer field the parser could not
+/// produce. Every caller must treat `None` as PERMISSION TO PROCEED, because the
+/// alternative is refusing to renew a real Let's Encrypt certificate because a
+/// socket flapped, and that ends in an expired certificate and a dark site. We
+/// act only on a positive identification.
+pub async fn foreign_cert_issuer(
+    agent: &crate::services::agent::AgentHandle,
+    domain: &str,
+) -> Option<String> {
+    let status = agent.get(&format!("/ssl/status/{domain}")).await.ok()?;
+    match cert_provenance(&status) {
+        CertProvenance::Foreign(issuer) => Some(issuer),
+        CertProvenance::DockPanelIssued | CertProvenance::Unknown => None,
+    }
+}
+
+/// What the installed certificate's issuer proves about who put it there.
+///
+/// ⛔ THIS IS THE SAME DECISION `foreign_cert_issuer` HAS ALWAYS MADE — it is
+/// split out, not reimplemented, because it has TWO callers that must collapse
+/// its middle state in OPPOSITE directions, and folding them together is how the
+/// panel came to assert "Let's Encrypt" over a certificate it had never seen.
+///
+/// For RENEWAL, `Unknown` must read as "ours": an unreachable agent or an
+/// unreadable certificate is not evidence of a foreign one, and refusing on
+/// doubt ends in a real Let's Encrypt certificate lapsing on a dark site. That
+/// is why `foreign_cert_issuer` maps both `Unknown` and `DockPanelIssued` to
+/// `None`, and why every renewal caller may keep treating `None` as PERMISSION
+/// TO PROCEED — this split changes none of their behaviour.
+///
+/// For a BADGE, `Unknown` reading as "ours" is exactly the lie: it re-emits
+/// "Enabled (Let's Encrypt)" every time the agent hiccups, and it will look
+/// correct in testing because the agent is up. A display caller must render the
+/// middle state as the neutral "we did not ask, or could not tell", never as a
+/// CA name. Hence three states rather than an `Option`, which cannot carry the
+/// distinction at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertProvenance {
+    /// A positive identification that somebody else issued this certificate:
+    /// an operator upload, a corporate PKI, a Cloudflare Origin CA, a commercial
+    /// OV or wildcard purchase. Carries the issuer string as the agent read it.
+    Foreign(String),
+    /// A Let's Encrypt issuer, which the agent's pinned directory URL makes a
+    /// proof that this product issued it.
+    DockPanelIssued,
+    /// No answer to act on — the agent did not reply, reported `has_cert:false`
+    /// (which a zone-WILDCARD child does for its own name, while holding a
+    /// perfectly good certificate under the zone's), or produced no issuer.
+    Unknown,
+}
+
+/// Read the provenance out of an agent `/ssl/status/{domain}` payload.
+///
+/// Takes the JSON the caller already holds rather than fetching it, so a caller
+/// that needs both this and the raw status pays one round trip, not two.
+pub fn cert_provenance(status: &serde_json::Value) -> CertProvenance {
+    if !status.get("has_cert").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return CertProvenance::Unknown;
+    }
+    let Some(issuer) = status.get("issuer").and_then(|v| v.as_str()).map(str::trim) else {
+        return CertProvenance::Unknown;
+    };
+    if issuer.is_empty() {
+        return CertProvenance::Unknown;
+    }
+    let lowered = issuer.to_ascii_lowercase();
+    // Both spellings: the apostrophe is a typographic hazard, not a fact about
+    // the CA, and an issuer string that lost it must not read as foreign.
+    if lowered.contains("let's encrypt") || lowered.contains("lets encrypt") {
+        return CertProvenance::DockPanelIssued;
+    }
+    CertProvenance::Foreign(issuer.to_string())
+}
+
 pub fn parse_agent_cert_expiry(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let s = raw.trim();
     if s.is_empty() {
@@ -389,6 +1581,119 @@ pub fn parse_agent_cert_expiry(raw: &str) -> Option<chrono::DateTime<chrono::Utc
     }
 
     None
+}
+
+#[cfg(test)]
+mod cert_provenance_tests {
+    use super::{cert_provenance, CertProvenance};
+    use serde_json::json;
+
+    /// ⚠ EVERY issuer string below is a full RDN sequence, because that is what
+    /// the agent actually sends: `panel/agent/src/services/ssl.rs` builds the
+    /// field as `cert.issuer().to_string()` over an `x509_parser` certificate,
+    /// which renders the whole name, not one component. Measured against a live
+    /// Let's Encrypt certificate: `CN=YR2, O=Let's Encrypt, C=US`.
+    ///
+    /// ⛔ THE FIRST DRAFT OF THIS TEST ASSERTED A BARE `"R3"` AND FAILED, and the
+    /// failure is worth keeping in mind rather than editing away: the guard
+    /// recognises Let's Encrypt through the **`O=` component**, so a bare
+    /// common name reads as FOREIGN. If the agent's rendering ever narrows to
+    /// the CN, this guard inverts — every certificate this product issued would
+    /// be classed as somebody else's and every renewal door would refuse, which
+    /// is the failure mode that ends in expired certificates on live sites.
+    /// These cases pin that dependency; they are not decoration.
+    #[test]
+    fn a_full_lets_encrypt_rdn_is_ours_in_both_spellings() {
+        for issuer in [
+            "CN=YR2, O=Let's Encrypt, C=US",
+            "CN=R3, O=Let's Encrypt, C=US",
+            "CN=R11, O=LET'S ENCRYPT, C=US",
+            // The apostrophe is a typographic hazard, not a fact about the CA.
+            "CN=R10, O=Lets Encrypt, C=US",
+        ] {
+            assert_eq!(
+                cert_provenance(&json!({ "has_cert": true, "issuer": issuer })),
+                CertProvenance::DockPanelIssued,
+                "issuer {issuer:?} must read as DockPanel-issued"
+            );
+        }
+    }
+
+    /// The intermediate's common name ALONE is not enough, and that is the
+    /// documented behaviour rather than an accident — see the note above.
+    #[test]
+    fn a_bare_common_name_does_not_prove_lets_encrypt() {
+        assert_eq!(
+            cert_provenance(&json!({ "has_cert": true, "issuer": "YR2" })),
+            CertProvenance::Foreign("YR2".to_string()),
+            "recognition runs on the O= component; a bare CN carries no such proof"
+        );
+    }
+
+    #[test]
+    fn every_other_ca_is_a_positive_foreign_identification() {
+        for issuer in [
+            "CN=ZeroSSL RSA Domain Secure Site CA, O=ZeroSSL, C=AT",
+            "CN=Cloudflare Origin Certificate, O=CloudFlare, Inc., C=US",
+            "CN=DigiCert TLS RSA SHA256 2020 CA1, O=DigiCert Inc, C=US",
+            "CN=Acme Corp Internal Issuing CA, O=Acme Corp",
+        ] {
+            assert_eq!(
+                cert_provenance(&json!({ "has_cert": true, "issuer": issuer })),
+                CertProvenance::Foreign(issuer.to_string()),
+                "issuer {issuer:?} must read as foreign, carrying its own name"
+            );
+        }
+    }
+
+    /// The three shapes that mean "no answer to act on". A badge that renders
+    /// any of these as a CA name is the defect this enum exists to prevent, and
+    /// the agent being UP in every manual test is why it survives review.
+    #[test]
+    fn no_answer_is_unknown_and_never_collapses_to_ours() {
+        // A zone-WILDCARD child answers this for its own name while holding a
+        // perfectly good certificate under the zone's name.
+        assert_eq!(
+            cert_provenance(&json!({ "has_cert": false })),
+            CertProvenance::Unknown
+        );
+        assert_eq!(
+            cert_provenance(&json!({ "has_cert": true })),
+            CertProvenance::Unknown,
+            "an absent issuer field is not evidence of anything"
+        );
+        assert_eq!(
+            cert_provenance(&json!({ "has_cert": true, "issuer": "   " })),
+            CertProvenance::Unknown,
+            "a whitespace-only issuer is not evidence of anything"
+        );
+        // The whole payload missing, which is what an unreachable agent yields
+        // once the caller's `.ok()` has turned the error into a null.
+        assert_eq!(cert_provenance(&json!(null)), CertProvenance::Unknown);
+    }
+
+    /// The renewal collapse must stay byte-identical to what
+    /// `foreign_cert_issuer` returned before the split: BOTH non-Foreign states
+    /// mean PERMISSION TO PROCEED. If this ever fails, a socket flap starts
+    /// refusing to renew real certificates.
+    #[test]
+    fn the_renewal_collapse_treats_unknown_as_permission_to_proceed() {
+        let as_renewal_sees_it = |v: serde_json::Value| match cert_provenance(&v) {
+            CertProvenance::Foreign(i) => Some(i),
+            CertProvenance::DockPanelIssued | CertProvenance::Unknown => None,
+        };
+        assert_eq!(as_renewal_sees_it(json!({ "has_cert": false })), None);
+        assert_eq!(
+            as_renewal_sees_it(json!({ "has_cert": true, "issuer": "CN=YR2, O=Let's Encrypt, C=US" })),
+            None
+        );
+        assert_eq!(
+            as_renewal_sees_it(
+                json!({ "has_cert": true, "issuer": "CN=Cloudflare Origin Certificate, O=CloudFlare, Inc., C=US" })
+            ),
+            Some("CN=Cloudflare Origin Certificate, O=CloudFlare, Inc., C=US".to_string())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +1788,52 @@ mod ssrf_tests {
     fn v6_public_allowed() {
         assert!(!v6_is_internal("2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()));
         assert!(!ip_is_internal("2001:4860:4860::8888".parse::<std::net::IpAddr>().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod validating_resolver_tests {
+    // Exercises `ValidatingResolver` through the actual `reqwest::dns::Resolve`
+    // trait method reqwest calls on every hop — not the classifier functions
+    // directly — so a future refactor that disconnects the impl from
+    // `resolve_all_validated` fails here even if `ip_is_internal` itself is
+    // untouched. Scoped to the literal-IP branch (no `tokio::net::lookup_host`
+    // call), which needs no network and cannot flake in CI — the DNS-dependent
+    // branch is exercised live by the uptime check itself, same as
+    // `resolve_validated`/`pinned_client` above, neither of which has a unit
+    // test for the same reason.
+    use super::ValidatingResolver;
+    use reqwest::dns::{Name, Resolve};
+    use std::str::FromStr;
+
+    async fn resolve(host: &str) -> Result<Vec<std::net::IpAddr>, ()> {
+        let name = Name::from_str(host).map_err(|_| ())?;
+        ValidatingResolver
+            .resolve(name)
+            .await
+            .map(|addrs| addrs.map(|a| a.ip()).collect())
+            .map_err(|_| ())
+    }
+
+    #[tokio::test]
+    async fn a_literal_internal_ip_redirect_target_is_refused() {
+        for host in ["127.0.0.1", "10.1.2.3", "192.168.1.1", "169.254.169.254", "100.64.0.1", "::1", "fe80::1"] {
+            assert!(resolve(host).await.is_err(), "{host} must be refused, not handed to reqwest to connect");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_literal_public_ip_redirect_target_resolves_to_itself() {
+        for host in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            let addrs = resolve(host).await.unwrap_or_else(|_| panic!("{host} must resolve"));
+            assert_eq!(addrs, vec![host.parse::<std::net::IpAddr>().unwrap()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn localhost_is_refused_by_name_before_any_lookup() {
+        assert!(resolve("localhost").await.is_err());
+        assert!(resolve("foo.localhost").await.is_err());
     }
 }
 
@@ -688,6 +2039,27 @@ pub fn open_provision_log(
             axum::http::StatusCode::NOT_FOUND,
             missing,
         )),
+    }
+}
+
+/// A future that resolves once the panel's shutdown broadcast fires.
+///
+/// `axum::serve(...).with_graceful_shutdown` waits for every in-flight
+/// connection to close on its own; a WebSocket or SSE handler that only exits
+/// when the CLIENT disconnects can therefore hold the drain open indefinitely
+/// (main.rs::shutdown_signal names the mechanism, and its 20s watchdog exists
+/// only because this half of the fix didn't). Feed the result to
+/// `StreamExt::take_until` on an SSE stream, or race it directly with
+/// `tokio::select!` in a manual per-tick loop (see `ws_metrics::handle_socket`)
+/// — the same shape `spawn_supervised` already gives every background service.
+///
+/// Takes `&AppState` rather than the `Sender` directly so call sites read the
+/// same way as every other per-request state access; the returned future does
+/// not borrow `state` past this call.
+pub fn shutdown_signal_fut(state: &crate::AppState) -> impl std::future::Future<Output = ()> + use<> {
+    let mut rx = state.shutdown_tx.subscribe();
+    async move {
+        let _ = rx.recv().await;
     }
 }
 

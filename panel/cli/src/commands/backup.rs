@@ -53,7 +53,7 @@ pub async fn cmd_backup_list(token: &str, domain: &str, output: &str) -> Result<
         let filename = b["filename"].as_str().unwrap_or("-");
         let size = b["size_bytes"].as_u64().unwrap_or(0);
         let size_mb = size as f64 / 1_048_576.0;
-        let created = b["created"].as_str().unwrap_or("-");
+        let created = b["created_at"].as_str().unwrap_or("-");
 
         println!(
             "{:<40} {:<12} {:<20}",
@@ -68,6 +68,16 @@ pub async fn cmd_backup_list(token: &str, domain: &str, output: &str) -> Result<
 }
 
 pub async fn cmd_backup_restore(token: &str, domain: &str, filename: &str) -> Result<(), String> {
+    // Prefer the panel API when a key is configured (Settings → API Keys, saved
+    // to /etc/dockpanel/backend.token): it holds the site's database
+    // credentials and can restore a backup's database dumps as well as its
+    // files, which the agent alone structurally cannot. Falls back to the
+    // agent-direct path below (files only) when no key is configured — same
+    // behavior as every CLI install before this, unchanged.
+    if let Ok(backend_token) = crate::backend_client::load_token() {
+        return cmd_backup_restore_via_backend(&backend_token, domain, filename).await;
+    }
+
     println!("Restoring {domain} from {filename}...");
 
     // An archive that carries database dumps cannot be fully restored from
@@ -84,7 +94,8 @@ pub async fn cmd_backup_restore(token: &str, domain: &str, filename: &str) -> Re
             format!(
                 "{e}\n\nThis backup contains database dumps, and the CLI cannot restore them — it \
                  talks to the agent directly and has no access to the site's database credentials. \
-                 Restore this backup from the panel instead."
+                 Mint an API key from the panel (Settings → API Keys), save it to \
+                 /etc/dockpanel/backend.token, and retry — or restore this backup from the panel instead."
             )
         } else {
             e
@@ -104,6 +115,76 @@ pub async fn cmd_backup_restore(token: &str, domain: &str, filename: &str) -> Re
         return Err(format!("Failed to restore backup: {msg}"));
     }
 
+    Ok(())
+}
+
+/// The database-capable restore path: resolve domain → site id and filename →
+/// backup id through the panel API (the CLI only ever knew the agent's own
+/// domain-keyed addressing before this), kick off the same async restore the
+/// panel UI's own Restore button starts, then follow its progress stream to
+/// completion. `ServerScope` (which every panel route resolving `/api/sites`
+/// goes through) only re-derives a caller identity from the token when an
+/// `X-Server-Id` header is present — this never sends one, so it always
+/// resolves to the LOCAL server regardless of whether the caller authenticated
+/// with a JWT or a `dp_` key. That is exactly the single-box case this
+/// restore path is scoped to; a fleet CLI wanting a specific remote server
+/// would need that header wired through, not built here.
+async fn cmd_backup_restore_via_backend(token: &str, domain: &str, filename: &str) -> Result<(), String> {
+    let sites = crate::backend_client::get("/api/sites", token).await?;
+    let sites = sites.as_array().ok_or("Expected an array from /api/sites")?;
+    let owned_site_id = sites
+        .iter()
+        .find(|s| s["domain"].as_str() == Some(domain))
+        .and_then(|s| s["id"].as_str());
+
+    // GET /api/sites is scoped to sites this account literally OWNS — but the
+    // restore endpoint below (via SITE_CALLER_PREDICATE) also admits an admin
+    // of the machine a site runs on, same as the panel UI itself. Without this
+    // fallback, an admin's key could restore a site it administers but
+    // doesn't own once it knew the id, yet never reach that id at all because
+    // this lookup 404s first. GET /api/admin/sites is the panel's own broader
+    // listing for exactly this gap; a non-admin key gets a 403 here, which is
+    // swallowed (not surfaced) so the ORIGINAL "no site found" error below
+    // still fires for the common case instead of a confusing permission error.
+    let site_id = match owned_site_id {
+        Some(id) => id.to_string(),
+        None => crate::backend_client::get("/api/admin/sites", token)
+            .await
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .and_then(|admin_sites| {
+                admin_sites
+                    .iter()
+                    .find(|s| s["domain"].as_str() == Some(domain))
+                    .and_then(|s| s["id"].as_str())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| format!("No site found for domain '{domain}' via the panel API"))?,
+    };
+
+    let backups = crate::backend_client::get(&format!("/api/sites/{site_id}/backups"), token).await?;
+    let backups = backups.as_array().ok_or("Expected an array from the backups list")?;
+    let backup_id = backups
+        .iter()
+        .find(|b| b["filename"].as_str() == Some(filename))
+        .and_then(|b| b["id"].as_str())
+        .ok_or_else(|| format!("No backup named '{filename}' found for {domain} via the panel API"))?
+        .to_string();
+
+    println!("Restoring {domain} from {filename} (via the panel API — files and databases)...");
+
+    let started = crate::backend_client::post_empty(
+        &format!("/api/sites/{site_id}/backups/{backup_id}/restore"),
+        token,
+    )
+    .await?;
+    let restore_id = started["restore_id"]
+        .as_str()
+        .ok_or("Panel API did not return a restore_id")?;
+
+    crate::backend_client::follow_progress(restore_id, token).await?;
+
+    println!("\x1b[32m✓\x1b[0m Backup restored");
     Ok(())
 }
 
@@ -127,8 +208,10 @@ pub async fn cmd_backup_delete(token: &str, domain: &str, filename: &str) -> Res
 }
 
 pub async fn cmd_db_backup_create(
-    token: &str, container: &str, db_name: &str, db_type: &str, user: &str, password: &str,
+    token: &str, container: &str, db_name: &str, db_type: &str, user: &str,
+    password: Option<String>, password_stdin: bool,
 ) -> Result<(), String> {
+    let password = crate::commands::resolve_password(password, password_stdin, "Database password: ")?;
     println!("Creating {db_type} backup for {db_name}...");
 
     let body = serde_json::json!({
@@ -169,15 +252,28 @@ pub async fn cmd_db_backup_list(token: &str, db_name: &str, output: &str) -> Res
 
     println!("\x1b[1m{:<50} {:<12} {:<20}\x1b[0m", "FILENAME", "SIZE", "CREATED");
 
+    let mut unusable = 0;
     for b in backups {
         let filename = b["filename"].as_str().unwrap_or("-");
         let size = b["size_bytes"].as_u64().unwrap_or(0);
         let size_mb = size as f64 / 1_048_576.0;
         let created = b["created_at"].as_str().unwrap_or("-");
         println!("{:<50} {:<12} {:<20}", filename, format!("{size_mb:.1} MB"), created);
+        // A file the agent cannot import is now REPORTED rather than dropped from the
+        // listing, so print the reason where the operator is already looking. Printing the
+        // row and swallowing the reason would be the same defect one layer up.
+        if let Some(reason) = b["unsupported"].as_str() {
+            unusable += 1;
+            println!("\x1b[33m  ↳ cannot be imported: {reason}\x1b[0m");
+        }
     }
 
-    println!("\n{} backup(s)", backups.len());
+    let total = backups.len();
+    if unusable > 0 {
+        println!("\n{total} file(s), {unusable} of which cannot be imported");
+    } else {
+        println!("\n{total} backup(s)");
+    }
     Ok(())
 }
 
@@ -231,12 +327,17 @@ pub async fn cmd_vol_backup_list(token: &str, container: &str, output: &str) -> 
     Ok(())
 }
 
-pub async fn cmd_backup_verify(token: &str, backup_type: &str, name: &str, filename: &str) -> Result<(), String> {
+pub async fn cmd_backup_verify(
+    token: &str, backup_type: &str, name: &str, filename: &str, db_type: &str,
+) -> Result<(), String> {
     println!("Verifying {backup_type} backup: {filename}...");
 
     let body = match backup_type {
         "site" => serde_json::json!({ "domain": name, "filename": filename }),
-        "database" => serde_json::json!({ "db_type": "postgres", "db_name": name, "filename": filename }),
+        // `db_type` was hardcoded to "postgres" here regardless of the database's
+        // real engine — a mysql/mariadb backup would always get a Postgres restore
+        // attempted against it and report FAILED, even when the backup was fine.
+        "database" => serde_json::json!({ "db_type": db_type, "db_name": name, "filename": filename }),
         "volume" => serde_json::json!({ "container_name": name, "filename": filename }),
         _ => return Err(format!("Invalid backup type: {backup_type}. Use site, database, or volume.")),
     };
@@ -267,10 +368,29 @@ pub async fn cmd_backup_verify(token: &str, backup_type: &str, name: &str, filen
     Ok(())
 }
 
+// `/var/backups/dockpanel`'s top level is not exclusively site-backup domain
+// directories — the agent also writes `databases/`, `volumes/`, `wp-snapshots/`,
+// `snapshots/`, `.staging/` and `.snapshot-staging/` there, and ops tooling
+// outside this codebase drops the panel's own DB dumps in a `db/` subdirectory
+// and as loose top-level files. Walking every top-level dir as if it were a site
+// domain folded all of that into "site backups" — reproducibly ~9x the real file
+// count and ~50000x the real size on this box. Anything starting with `.`, plus
+// every other subsystem's own root, is excluded from the site-backup count.
+const RESERVED_TOP_LEVEL_DIRS: &[&str] = &["databases", "volumes", "wp-snapshots", "snapshots", "db"];
+
+fn is_site_backup_dir(name: &str) -> bool {
+    !name.starts_with('.') && !RESERVED_TOP_LEVEL_DIRS.contains(&name)
+}
+
 pub async fn cmd_backup_health(token: &str) -> Result<(), String> {
     // This calls the API, not the agent. For CLI simplicity, show local backup counts.
     let site_dirs = std::fs::read_dir("/var/backups/dockpanel")
-        .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count())
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter(|e| is_site_backup_dir(&e.file_name().to_string_lossy()))
+                .count()
+        })
         .unwrap_or(0);
     let db_dirs = std::fs::read_dir("/var/backups/dockpanel/databases")
         .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count())
@@ -279,20 +399,26 @@ pub async fn cmd_backup_health(token: &str) -> Result<(), String> {
         .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count())
         .unwrap_or(0);
 
-    // Count total files
-    let count_files = |dir: &str| -> (usize, u64) {
+    // Count total files. `only_site_dirs`, when set, skips every subdirectory that
+    // belongs to another subsystem's own root rather than a site backup — without
+    // it, `databases`/`volumes` scans would double-count their own children too.
+    let count_files = |dir: &str, only_site_dirs: bool| -> (usize, u64) {
         let mut count = 0usize;
         let mut size = 0u64;
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Ok(sub) = std::fs::read_dir(entry.path()) {
-                        for f in sub.flatten() {
-                            if let Ok(m) = f.metadata() {
-                                if m.is_file() {
-                                    count += 1;
-                                    size += m.len();
-                                }
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                if only_site_dirs && !is_site_backup_dir(&entry.file_name().to_string_lossy()) {
+                    continue;
+                }
+                if let Ok(sub) = std::fs::read_dir(entry.path()) {
+                    for f in sub.flatten() {
+                        if let Ok(m) = f.metadata() {
+                            if m.is_file() {
+                                count += 1;
+                                size += m.len();
                             }
                         }
                     }
@@ -302,9 +428,9 @@ pub async fn cmd_backup_health(token: &str) -> Result<(), String> {
         (count, size)
     };
 
-    let (site_count, site_size) = count_files("/var/backups/dockpanel");
-    let (db_count, db_size) = count_files("/var/backups/dockpanel/databases");
-    let (vol_count, vol_size) = count_files("/var/backups/dockpanel/volumes");
+    let (site_count, site_size) = count_files("/var/backups/dockpanel", true);
+    let (db_count, db_size) = count_files("/var/backups/dockpanel/databases", false);
+    let (vol_count, vol_size) = count_files("/var/backups/dockpanel/volumes", false);
 
     let total_size = site_size + db_size + vol_size;
     let total_count = site_count + db_count + vol_count;

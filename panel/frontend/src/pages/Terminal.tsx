@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Terminal as XTerm } from "@xterm/xterm";
+import { Terminal as XTerm, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { api, ApiError } from "../api";
+import { UPLOAD_MAX_FILE_BYTES, uploadTooLargeMessage } from "../constants";
+import { useAuth } from "../context/AuthContext";
 
 interface Site {
   id: string;
@@ -12,12 +14,30 @@ interface Site {
 }
 
 // ── Terminal themes ──
-const themes: Record<string, Record<string, string>> = {
+//
+// Typed ITheme, not Record<string, string>: xterm ignores a key it does not
+// recognise, so `selection` for `selectionBackground` compiled clean and did
+// nothing. That is how cursorAccent and selectionInactiveBackground came to be
+// missing from all three — nothing could tell us they were absent.
+//
+// cursorAccent is the GLYPH under a block cursor. Unset, xterm uses #000000, so
+// the light theme drew a black character inside a blue block. It belongs to the
+// background in every theme, which is what "inverted cell" means.
+//
+// scrollbarSliderBackground is otherwise derived as foreground at 20% alpha,
+// which measured 1.42:1 on light and 1.69:1 on mocha — a scrollbar you cannot
+// see is a scrollbar that is not there.
+const themes: Record<string, ITheme> = {
   mocha: {
     background: "#1e1e2e",
     foreground: "#cdd6f4",
     cursor: "#f5e0dc",
+    cursorAccent: "#1e1e2e",
     selectionBackground: "#585b7066",
+    selectionInactiveBackground: "#585b7033",
+    scrollbarSliderBackground: "#585b7099",
+    scrollbarSliderHoverBackground: "#6c7086cc",
+    scrollbarSliderActiveBackground: "#7f849c",
     black: "#45475a",
     red: "#f38ba8",
     green: "#a6e3a1",
@@ -39,7 +59,12 @@ const themes: Record<string, Record<string, string>> = {
     background: "#282a36",
     foreground: "#f8f8f2",
     cursor: "#f8f8f2",
+    cursorAccent: "#282a36",
     selectionBackground: "#44475a66",
+    selectionInactiveBackground: "#44475a33",
+    scrollbarSliderBackground: "#6272a499",
+    scrollbarSliderHoverBackground: "#6272a4cc",
+    scrollbarSliderActiveBackground: "#7b8cc4",
     black: "#21222c",
     red: "#ff5555",
     green: "#50fa7b",
@@ -60,8 +85,13 @@ const themes: Record<string, Record<string, string>> = {
   light: {
     background: "#fafafa",
     foreground: "#383a42",
-    cursor: "#526eff",
+    cursor: "#526fff",
+    cursorAccent: "#fafafa",
     selectionBackground: "#d0d0d066",
+    selectionInactiveBackground: "#d0d0d033",
+    scrollbarSliderBackground: "#a0a1a799",
+    scrollbarSliderHoverBackground: "#8a8b91cc",
+    scrollbarSliderActiveBackground: "#696c77",
     black: "#383a42",
     red: "#e45649",
     green: "#50a14f",
@@ -77,12 +107,20 @@ const themes: Record<string, Record<string, string>> = {
     brightBlue: "#4078f2",
     brightMagenta: "#a626a4",
     brightCyan: "#0184bc",
-    brightWhite: "#fafafa",
+    // Was #fafafa — byte-identical to this theme's own background, so `\e[97m`
+    // text was invisible at a contrast ratio of exactly 1.00:1. No palette slot
+    // may hold its own background colour.
+    brightWhite: "#383a42",
   },
 };
 
 // ── Saved command snippets ──
-const snippets = [
+// Every one of these is a ROOT command against the host. A site shell is a
+// different machine as far as its occupant is concerned: it runs as www-data,
+// under `bash --restricted`, with NO_NEW_PRIVS set and a command blocklist —
+// so `systemctl restart nginx` and `docker ps` are not merely unhelpful there,
+// they are refused. Offering them on a site session is a menu of failures.
+const serverSnippets = [
   { label: "Restart Nginx", cmd: "systemctl restart nginx" },
   { label: "Restart PHP-FPM", cmd: "systemctl restart php8.3-fpm" },
   { label: "Disk Usage", cmd: "df -h" },
@@ -96,12 +134,32 @@ const snippets = [
   { label: "Persistent Session (tmux)", cmd: "tmux new-session -A -s dockpanel" },
 ];
 
+// Things that actually work from inside /var/www/<domain> as www-data.
+const siteSnippets = [
+  { label: "List Files", cmd: "ls -lah" },
+  { label: "Folder Size", cmd: "du -sh ." },
+  { label: "Largest Files", cmd: "du -ah . | sort -rh | head -20" },
+  { label: "Find Recently Changed", cmd: "find . -type f -mtime -1" },
+  { label: "PHP Version", cmd: "php -v" },
+  { label: "WP-CLI Info", cmd: "wp --info" },
+  { label: "Composer Install", cmd: "composer install --no-dev" },
+  { label: "Search In Files", cmd: "grep -rn 'needle' . | head -20" },
+];
+
 const IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 const MAX_RECONNECT_ATTEMPTS = 3;
 
 export default function Terminal() {
   const [searchParams] = useSearchParams();
   const initialSiteId = searchParams.get("site") || "";
+  const { user } = useAuth();
+  // The server shell is admin-only and stays that way: `terminal.rs` refuses a
+  // ticket with no site to anybody else, and v2.75.0 bound that decision into
+  // the signed ticket precisely because a site owner could previously drop the
+  // scope and land in a root shell. What this page got wrong was not the gate —
+  // it was arriving at the gate by default. A site owner already has a terminal
+  // on the sites they own; this page just never opened it for them.
+  const isAdmin = user?.role === "admin";
   const termRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
@@ -122,6 +180,7 @@ export default function Terminal() {
   // server is a fleet member) rather than something that went wrong.
   const [notice, setNotice] = useState("");
   const [sites, setSites] = useState<Site[]>([]);
+  const [sitesLoaded, setSitesLoaded] = useState(false);
   const [selectedSite, setSelectedSite] = useState(initialSiteId);
 
   // Snippets
@@ -149,6 +208,20 @@ export default function Terminal() {
 
   // SSH Info panel
   const [showSshInfo, setShowSshInfo] = useState(false);
+  // A share is an UNAUTHENTICATED public URL carrying whatever was on screen — root
+  // output, hostnames, anything that scrolled past. Creating one has always been a
+  // button; seeing which are live and closing one existed only as two handlers with
+  // no caller, so the moment an operator regretted a share the panel had no answer.
+  const [shares, setShares] = useState<{ share_id: string; created_at: number; expires_in_seconds: number; url: string }[]>([]);
+  const [showShares, setShowShares] = useState(false);
+  const loadShares = useCallback(async () => {
+    try {
+      const r = await api.get<{ shares: typeof shares }>("/terminal/shares");
+      setShares(r.shares ?? []);
+    } catch {
+      setShares([]);
+    }
+  }, []);
 
   // Terminal Recording
   const [recording, setRecording] = useState(false);
@@ -173,7 +246,13 @@ export default function Terminal() {
 
   // Load sites
   useEffect(() => {
-    api.get<Site[]>("/sites").then(setSites).catch(() => setError("Failed to load sites"));
+    api
+      .get<Site[]>("/sites")
+      .then(setSites)
+      .catch(() => setError("Failed to load sites"))
+      // Distinguishes "no sites" from "not asked yet" — without it the
+      // owns-nothing notice below fires for a moment on every load.
+      .finally(() => setSitesLoaded(true));
   }, []);
 
   // Idle timeout reset
@@ -216,11 +295,41 @@ export default function Terminal() {
 
       const currentTheme = themes[themeName] || themes.mocha;
 
+      // xterm measures cell width from the computed font at construction time.
+      // JetBrains Mono arrives over the network, so a cold load of /terminal can
+      // measure the fallback face and produce a grid whose columns are wrong
+      // until something forces a refit. Resolves instantly once the font is in.
+      if (document.fonts?.ready) {
+        try {
+          await document.fonts.ready;
+        } catch {
+          /* a font-loading failure must not stop the terminal opening */
+        }
+      }
+
       // Create terminal
       const term = new XTerm({
         cursorBlink: true,
         fontSize,
-        fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+        // Matches --font-mono in index.css. The two stacks had drifted, so a box
+        // without the webfont rendered the terminal and the chrome around it in
+        // two different faces.
+        fontFamily:
+          "'JetBrains Mono', ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace",
+        // 1.0 is xterm's default and is tight for a long log session.
+        lineHeight: 1.2,
+        // The default is 1000 lines. `journalctl -n 2000` silently lost its top,
+        // and both Copy Output and Share iterate this same buffer, so a shared
+        // link was truncated without saying so.
+        scrollback: 10000,
+        // The single highest-value option here. xterm raises any foreground that
+        // fails this against its own cell background, at render time, for every
+        // theme at once. Measured before: brightBlack — git hashes, systemd
+        // timestamps, most secondary CLI output — was 2.46:1 on mocha and 3.03:1
+        // on dracula, and dim (\e[2m) halved both again. Fixing it here rather
+        // than by editing palette entries keeps all three themes faithful to
+        // their upstream originals.
+        minimumContrastRatio: 4.5,
         theme: currentTheme,
       });
 
@@ -356,9 +465,18 @@ export default function Terminal() {
     [fontSize, themeName, resetIdleTimer]
   );
 
-  // Connect on mount
+  // Connect on mount.
+  //
+  // A non-admin with no `?site=` has nothing to connect to YET — their session
+  // is a site session and the site list has not arrived. Dialling anyway is what
+  // produced the report: sidebar → Terminal → an immediate "Admin access required
+  // for server terminal", from an account that does in fact have a terminal. The
+  // effect below picks their first site the moment the list lands.
   useEffect(() => {
-    connect(selectedSite || undefined);
+    // Conditional CONNECT, unconditional cleanup — an early return here would
+    // skip registering the teardown that disposes the xterm the auto-select
+    // effect goes on to create.
+    if (isAdmin || selectedSite) connect(selectedSite || undefined);
     return () => {
       if (idleTimer.current) clearTimeout(idleTimer.current);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -369,11 +487,60 @@ export default function Terminal() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Handle resize
+  // A non-admin's default session is their own first site, chosen once the list
+  // arrives rather than at mount (it is empty at mount). `/sites` is already
+  // scoped to the caller, so "the first site" is always one they own.
+  // Must live BELOW `connect` — a dependency array naming it any earlier is
+  // evaluated during render, before the useCallback has initialised.
   useEffect(() => {
-    const handleResize = () => fitRef.current?.fit();
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
+    if (isAdmin || selectedSite || sites.length === 0) return;
+    setSelectedSite(sites[0].id);
+    connect(sites[0].id);
+  }, [isAdmin, selectedSite, sites, connect]);
+
+  // ...and if they own none, say so rather than leaving a dead black rectangle.
+  useEffect(() => {
+    if (isAdmin || selectedSite || !sitesLoaded || sites.length > 0) return;
+    setNotice(
+      "This terminal opens a shell inside a site you own. No site is assigned to your account yet — once one is, it will appear in the selector above."
+    );
+  }, [isAdmin, selectedSite, sitesLoaded, sites]);
+
+  // Handle resize
+  //
+  // This was a bare window "resize" listener, which misses every way this
+  // terminal actually changes size. The Glass sidebar expands ON HOVER
+  // (GlassLayout.tsx: md:w-16 ↔ md:w-56, still in flow), so pointing at the nav
+  // swings the terminal's width by 160px with no window event at all. Vertically
+  // the same happens whenever Snippets, SSH Info, the notice banner, the error
+  // banner or the mobile More toolbar appears. The PTY kept the stale cols/rows,
+  // so wrapped output tore and any full-screen TUI — top, tmux, nano, htop —
+  // stayed corrupt until you resized the browser itself.
+  //
+  // Observing the container catches all of it, window resizes included.
+  useEffect(() => {
+    const el = termRef.current;
+    if (!el) return;
+
+    let frame = 0;
+    const refit = () => {
+      cancelAnimationFrame(frame);
+      // Coalesce the burst a CSS transition emits, and never fit a collapsed
+      // box: FitAddon divides by cell size, and a zero-height container yields
+      // a nonsense geometry that gets sent to the PTY as a real resize.
+      frame = requestAnimationFrame(() => {
+        if (el.clientWidth > 0 && el.clientHeight > 0) fitRef.current?.fit();
+      });
+    };
+
+    const ro = new ResizeObserver(refit);
+    ro.observe(el);
+    window.addEventListener("resize", refit);
+    return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
+      window.removeEventListener("resize", refit);
+    };
   }, []);
 
   const handleSiteChange = (newSiteId: string) => {
@@ -405,10 +572,26 @@ export default function Terminal() {
 
   const handleSearch = (direction: "next" | "prev") => {
     if (!searchAddonRef.current || !searchTerm) return;
+    // Without decorations a hit is merely SELECTED, and the selection colour
+    // here is a low-alpha grey — about a 1.8:1 shift against the background. In
+    // a wall of log output that is close to invisible, which is the whole reason
+    // you opened the search. Derived from the active theme so the highlight
+    // belongs to it rather than being a fourth hardcoded colour.
+    const t = themes[themeName] || themes.mocha;
+    const opts = {
+      decorations: {
+        matchBackground: `${t.yellow}55`,
+        matchBorder: t.yellow as string,
+        matchOverviewRuler: t.yellow as string,
+        activeMatchBackground: `${t.cursor}99`,
+        activeMatchBorder: t.cursor as string,
+        activeMatchColorOverviewRuler: t.cursor as string,
+      },
+    };
     if (direction === "next") {
-      searchAddonRef.current.findNext(searchTerm);
+      searchAddonRef.current.findNext(searchTerm, opts);
     } else {
-      searchAddonRef.current.findPrevious(searchTerm);
+      searchAddonRef.current.findPrevious(searchTerm, opts);
     }
   };
 
@@ -496,7 +679,9 @@ export default function Terminal() {
                 onChange={(e) => handleSiteChange(e.target.value)}
                 className="text-xs sm:text-sm border border-dark-500 rounded-lg px-2 sm:px-3 py-1 sm:py-1.5 bg-dark-800 max-w-[120px] sm:max-w-none"
               >
-                <option value="">Server root</option>
+                {/* The default option was the one shell a non-admin can never
+                    open, so the page refused itself before they touched it. */}
+                {isAdmin && <option value="">Server root</option>}
                 {sites.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.domain}
@@ -570,6 +755,11 @@ export default function Terminal() {
                   onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file || !selectedSite) return;
+                    if (file.size > UPLOAD_MAX_FILE_BYTES) {
+                      setError(uploadTooLargeMessage(file.name, file.size));
+                      e.target.value = "";
+                      return;
+                    }
                     const reader = new FileReader();
                     reader.onload = async () => {
                       const base64 = (reader.result as string).split(",")[1];
@@ -591,8 +781,8 @@ export default function Terminal() {
                         }
                         setStatus(`Uploaded: ${file.name}`);
                         setTimeout(() => setStatus(""), 3000);
-                      } catch {
-                        setError(`Upload failed: ${file.name}`);
+                      } catch (err) {
+                        setError(err instanceof Error ? err.message : `Upload failed: ${file.name}`);
                       }
                     };
                     reader.readAsDataURL(file);
@@ -630,8 +820,12 @@ export default function Terminal() {
               Copy Output
             </button>
 
-            {/* Share */}
-            <button
+            {/* Share — administrator-only, like the SSH Info button below it. The
+                endpoint calls `require_admin`, so for anyone else this offered a
+                link that could only ever answer "Failed to create share link".
+                Copy Output above is deliberately NOT gated: it never leaves the
+                browser. */}
+            {isAdmin && <button
               onClick={async () => {
                 if (!xtermRef.current) return;
                 const buffer = xtermRef.current.buffer.active;
@@ -652,6 +846,7 @@ export default function Terminal() {
                       setError("");
                       setStatus("Share link copied! Expires in 1 hour");
                       setTimeout(() => setStatus(""), 3000);
+                      loadShares();
                     })
                     .catch(() => {
                       setError("Failed to copy share link to clipboard");
@@ -664,10 +859,25 @@ export default function Terminal() {
               title="Share terminal output (1hr link)"
             >
               Share
-            </button>
+            </button>}
 
-            {/* SSH Info */}
-            <button
+            {/* Shares — the other half of the Share button. */}
+            {isAdmin && <button
+              onClick={() => { const next = !showShares; setShowShares(next); if (next) loadShares(); }}
+              className={`px-2 py-1 rounded text-xs transition-colors ${
+                showShares
+                  ? "bg-rust-500/20 text-rust-400 border border-rust-500/30"
+                  : "bg-dark-700 text-dark-200 hover:bg-dark-600"
+              }`}
+              title="List and revoke active share links"
+            >
+              Shares
+            </button>}
+
+            {/* SSH Info — the credentials it prints are for the ROOT account on
+                the host (`server_utils.rs` reads /root/.ssh/authorized_keys), so
+                it is an operator panel, not a tenant one. */}
+            {isAdmin && <button
               onClick={() => setShowSshInfo(!showSshInfo)}
               className={`px-2 py-1 rounded text-xs transition-colors ${
                 showSshInfo
@@ -676,7 +886,7 @@ export default function Terminal() {
               }`}
             >
               SSH Info
-            </button>
+            </button>}
 
             {/* Record */}
             <button
@@ -705,7 +915,10 @@ export default function Terminal() {
         {/* Snippets bar */}
         {showSnippets && (
           <div className="flex flex-wrap gap-1.5 px-3 py-2 bg-dark-900 border-b border-dark-600 shrink-0">
-            {snippets.map((s) => (
+            {/* Keyed on the SESSION, not the role: an admin who selects a site is
+                in the same restricted www-data shell a client is, and wants the
+                same commands. */}
+            {(selectedSite ? siteSnippets : serverSnippets).map((s) => (
               <button
                 key={s.label}
                 onClick={() => {
@@ -725,8 +938,48 @@ export default function Terminal() {
           </div>
         )}
 
-        {/* SSH Info panel */}
-        {showSshInfo && (
+        {/* Active shares — admin only, same reason as the button that opens it. */}
+        {isAdmin && showShares && (
+          <div className="px-3 py-2 bg-dark-900 border-b border-dark-600 space-y-1.5 shrink-0">
+            <p className="text-xs text-dark-300 uppercase font-mono tracking-widest mb-1">
+              Active share links
+            </p>
+            {shares.length === 0 ? (
+              <p className="text-xs text-dark-400 font-mono">No active shares.</p>
+            ) : (
+              shares.map((s) => (
+                <div key={s.share_id} className="flex items-center gap-2 text-xs">
+                  <code className="text-dark-100 font-mono bg-dark-700 px-2 py-0.5 rounded">{s.share_id}</code>
+                  <span className="text-dark-300">
+                    expires in {Math.max(0, Math.round(s.expires_in_seconds / 60))} min
+                  </span>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await api.delete(`/terminal/share/${s.share_id}`);
+                        setError("");
+                        setStatus("Share revoked");
+                        setTimeout(() => setStatus(""), 3000);
+                      } catch (e) {
+                        setError(e instanceof Error ? e.message : "Failed to revoke share");
+                      }
+                      loadShares();
+                    }}
+                    className="text-danger-400 hover:text-danger-300"
+                  >
+                    Revoke
+                  </button>
+                </div>
+              ))
+            )}
+            <p className="text-xs text-dark-400 font-mono">
+              A share link needs no login. Anyone holding the URL can read that output until it expires.
+            </p>
+          </div>
+        )}
+
+        {/* SSH Info panel — admin only, same reason as the button that opens it. */}
+        {isAdmin && showSshInfo && (
           <div className="px-3 py-2 bg-dark-900 border-b border-dark-600 space-y-1.5 shrink-0">
             <p className="text-xs text-dark-300 uppercase font-mono tracking-widest mb-1">
               SSH Connection
@@ -787,12 +1040,16 @@ export default function Terminal() {
           </div>
         )}
 
+        {/* warn-*, not stock amber-*. The warn tokens are re-tuned per theme;
+            amber is not, so on the light panel themes this banner measured
+            1.19:1 — invisible. It is exactly what an owner with no site assigned
+            sees, so it was the one banner that had to be readable. */}
         {notice && (
-          <div className="px-6 py-2 bg-amber-500/10 text-amber-300 text-sm border-b border-amber-500/20 shrink-0 flex items-center justify-between">
+          <div className="px-6 py-2 bg-warn-500/10 text-warn-400 text-sm border-b border-warn-500/20 shrink-0 flex items-center justify-between">
             <span>{notice}</span>
             <button
               onClick={() => setNotice("")}
-              className="text-amber-300 hover:text-amber-200 ml-4 text-xs"
+              className="text-warn-400 hover:text-warn-500 ml-4 text-xs"
             >
               Dismiss
             </button>
@@ -812,7 +1069,15 @@ export default function Terminal() {
         )}
 
         {/* Terminal */}
-        <div className="flex-1 p-2 min-h-0 relative overflow-hidden" style={{ backgroundColor: currentThemeBg }}>
+        {/* focus-within, because there is otherwise NO signal that keystrokes
+            will reach the shell: xterm sets .xterm:focus { outline: none }, the
+            element that actually takes focus is an off-screen helper textarea,
+            and this wrapper is not focusable — so the panel's global
+            :focus-visible ring had nothing to land on. */}
+        <div
+          className="flex-1 p-2 min-h-0 relative overflow-hidden focus-within:ring-2 focus-within:ring-inset focus-within:ring-accent-500"
+          style={{ backgroundColor: currentThemeBg }}
+        >
           {/* Search overlay */}
           {showSearch && (
             <div className="absolute top-0 right-0 m-2 flex items-center gap-1 bg-dark-800 border border-dark-500 rounded-lg p-1.5 shadow-lg z-10">

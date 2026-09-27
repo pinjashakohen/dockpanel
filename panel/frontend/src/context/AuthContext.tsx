@@ -31,6 +31,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data) setUser(data);
+        // An account with no password and no authenticator re-authenticates by
+        // signing in again with its identity provider. That callback redirects
+        // to "/", so the way back to the page the user was actually on has to
+        // be carried client-side.
+        if (data && sessionStorage.getItem("dp:passkey-return")) {
+          sessionStorage.removeItem("dp:passkey-return");
+          window.location.replace("/account");
+        }
       })
       .catch(() => { /* not logged in */ })
       .finally(() => setLoading(false));
@@ -60,6 +68,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = () => {
     api.post("/auth/logout").catch((e) => logger.error("Logout error:", e));
+    // The selected server is per-BROWSER, not per-account, and the next account
+    // to sign in here may not own it — a client owns no `servers` row at all, so
+    // an inherited id makes `ServerScope` refuse every request with
+    // "Server not found or access denied". Clearing it here stops the leak at
+    // the source; `ServerContext` also self-heals a browser that is already dirty.
+    localStorage.removeItem("dp-active-server");
     setUser(null);
   };
 

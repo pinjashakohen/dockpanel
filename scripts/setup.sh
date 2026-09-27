@@ -51,6 +51,7 @@ FRONTEND_DIR="$REPO_DIR/panel/frontend"
 AGENT_SRC="$REPO_DIR/panel/agent"
 API_SRC="$REPO_DIR/panel/backend"
 CLI_SRC="$REPO_DIR/panel/cli"
+MCP_SRC="$REPO_DIR/panel/mcp"
 
 # Directories the agent unit declares in ReadWritePaths, with any `-` prefix
 # stripped. The unit (panel/agent/dockpanel-agent.service) is the single source
@@ -778,9 +779,9 @@ generate_secrets() {
 setup_database() {
     header "PostgreSQL Database"
 
-    if docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$"; then
+    if docker ps --format '{{.Names}}' | grep -c "^${DB_CONTAINER}$" >/dev/null; then
         log "PostgreSQL container already running"
-    elif docker ps -a --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$"; then
+    elif docker ps -a --format '{{.Names}}' | grep -c "^${DB_CONTAINER}$" >/dev/null; then
         log "Starting existing PostgreSQL container..."
         docker start "$DB_CONTAINER" > /dev/null 2>&1
     else
@@ -808,13 +809,127 @@ setup_database() {
         log "PostgreSQL container created (port $DB_PORT)"
     fi
 
-    # Wait for PostgreSQL to be ready
+    # Wait for PostgreSQL to be ready — ON THE TRANSPORT THE PROBE BELOW USES.
+    #
+    # ⚠ A readiness poll that omits the host answers over the container's own
+    # unix socket, and the official image runs a SOCKET-ONLY temporary server
+    # for the duration of initdb (started with an empty listen_addresses) before
+    # it execs the real one. So a socket poll reports the database ready while
+    # nothing is listening on TCP yet — measured at ~1.0-1.1s on an idle box and
+    # over 20s on a loaded one, against a 2s poll grid — and the password probe
+    # directly below, which MUST use the bridge address to land on the
+    # scram-sha-256 rule, is then refused at the transport layer.
+    #
+    # The installer cannot tell a refused connection from a rejected password, so
+    # it reads that as a mismatch and takes one of two wrong branches on a
+    # database that is perfectly healthy: it prints "Database rejects this
+    # install's password" and reconciles for no reason, or the ALTER lands in the
+    # same window, fails, and the whole install aborts telling a brand-new
+    # operator to destroy their volume. Polling the same transport the consumer
+    # uses closes the window by construction — the temporary server cannot answer
+    # over TCP at all.
+    #
+    # The trailing socket check is the no-bridge-address escape hatch: a
+    # container on host networking has no address for the loop to poll, and the
+    # password probe below cannot run against it either (it degrades to the
+    # reconcile). Reaching it costs a full minute of waiting, which is why it is
+    # placed AFTER the loop rather than inside it — an in-loop fallback would
+    # fire on any box where the address is momentarily absent and silently
+    # restore the very race this closes.
     if run "Waiting for PostgreSQL to accept connections" bash -c \
-        "for i in \$(seq 1 15); do docker exec $DB_CONTAINER pg_isready -U dockpanel && exit 0; sleep 2; done; exit 1"; then
+        "for i in \$(seq 1 30); do
+             h=\$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $DB_CONTAINER 2>/dev/null | awk '{print \$1}')
+             [ -n \"\$h\" ] && docker exec $DB_CONTAINER pg_isready -h \"\$h\" -U dockpanel && exit 0
+             sleep 2
+         done
+         echo 'no TCP listener after 60s — falling back to a socket check (container has no bridge address?)'
+         docker exec $DB_CONTAINER pg_isready -U dockpanel && exit 0
+         exit 1"; then
         log "PostgreSQL ready"
     else
-        error "PostgreSQL did not become ready within 30s"
+        error "PostgreSQL did not become ready within 60s"
         exit 1
+    fi
+
+    # Make the database agree with the password this install is about to write.
+    #
+    # The container is created ONCE, here, with whatever password this run holds;
+    # api.env is not written until several steps later. So an install that dies
+    # in between — a transient download failure is enough, and the failure
+    # message tells the operator "re-running the installer is safe" — leaves a
+    # container holding password A and no api.env at all. The next run finds no
+    # api.env, generates password B, finds the container already present, starts
+    # it unchanged, and writes B. The panel then crash-loops for ever on
+    # `password authentication failed for user "dockpanel"`, and re-running never
+    # helps because each run only mints another password the container has never
+    # heard of. The reuse branch above cannot catch it: it keys on api.env
+    # existing, which in this window it does not.
+    #
+    # Probe first with the target password, so a healthy install does no work and
+    # an operator who has already fixed this by hand is not second-guessed. Only
+    # when the database genuinely refuses it do we recover the password the
+    # container was created with — the one value guaranteed to still work — and
+    # ALTER the role. Both values are hex, from `openssl rand -hex`, so neither
+    # can carry a quote into the SQL.
+    # ⚠ THE PROBE MUST ACTUALLY AUTHENTICATE, and the obvious way of writing it
+    # does not. The official Postgres image ships a pg_hba that trusts BOTH
+    # `local` and `host 127.0.0.1/32`, so `docker exec … psql -U dockpanel`
+    # connects over the container's own socket and succeeds with ANY password —
+    # including the wrong one this check exists to detect. Written that way, the
+    # branch below never ran, and a box left with mismatched credentials by an
+    # interrupted install stayed broken exactly as it did before this check was
+    # added: the API crash-looping on "password authentication failed".
+    #
+    # Only the trailing `host all all all scram-sha-256` rule demands a password,
+    # and the way to land on it from here is the container's own BRIDGE address —
+    # the same rule the API's TCP connection to the published port lands on.
+    # Verified as a two-cell experiment on a real box: over the local socket a
+    # deliberately wrong password is ACCEPTED; over the bridge address it is
+    # REJECTED while the right one succeeds.
+    local db_probe_host
+    db_probe_host=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+        "$DB_CONTAINER" 2>/dev/null | awk '{print $1}')
+    # No bridge address ⇒ we cannot verify, so fall through to the reconcile
+    # rather than assume health. Re-setting the role to the password we are about
+    # to write is idempotent when it already matches.
+    if [ -z "$db_probe_host" ] || ! docker exec -e PGPASSWORD="$DB_PASSWORD" "$DB_CONTAINER" \
+            psql -h "$db_probe_host" -U dockpanel -d dockpanel -c 'SELECT 1' >/dev/null 2>&1; then
+        warn "Database rejects this install's password — reconciling"
+        local container_pw
+        container_pw=$(docker inspect "$DB_CONTAINER" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+            | sed -n 's/^POSTGRES_PASSWORD=//p' | head -1)
+        if [ -n "$container_pw" ] && docker exec -e PGPASSWORD="$container_pw" "$DB_CONTAINER" \
+                psql -U dockpanel -d dockpanel \
+                -c "ALTER USER dockpanel WITH PASSWORD '${DB_PASSWORD}';" >/dev/null 2>&1; then
+            log "Database password reconciled with $CONFIG_DIR/api.env"
+        else
+            error "The database will not accept this install's password, and the password"
+            error "it was created with could not be recovered. The panel cannot start."
+            error ""
+            error "TRY THIS FIRST — re-run the installer. It is safe, it keeps your data,"
+            error "and it resolves this on its own in the common case:"
+            error "  bash $0"
+            error ""
+            # ⚠ The by-hand recovery is only actionable once api.env EXISTS, and it
+            # is written by create_services — several steps AFTER this function. On a
+            # first install that aborts here the file is absent, so printing it
+            # unconditionally left "destroy your volume" as the only instruction a
+            # brand-new operator could actually follow.
+            if [ -f "$CONFIG_DIR/api.env" ]; then
+                error "Or set the role's password by hand to the one the panel expects:"
+                error "  docker exec -it $DB_CONTAINER psql -U dockpanel -d dockpanel"
+                error "  ALTER USER dockpanel WITH PASSWORD '<the DATABASE_URL password in $CONFIG_DIR/api.env>';"
+                error ""
+                error "Only if neither works, and it LOSES ALL DATABASE DATA:"
+            else
+                error "This install had not yet written $CONFIG_DIR/api.env, so there is no"
+                error "stored password to match by hand. If re-running does not help — and"
+                error "this LOSES ALL DATABASE DATA, which on a first install is none:"
+            fi
+            error "  docker rm -f $DB_CONTAINER && docker volume rm dockpanel-pgdata"
+            exit 1
+        fi
     fi
 }
 
@@ -829,14 +944,42 @@ INSTALLED_VERSION=""
 # must not brick an install, integrity must). Sets FETCH_VERIFIED=1/0 so the
 # caller can report honestly whether a checksum was actually compared.
 FETCH_VERIFIED=0
+
+# dp_fetch <url> <out> — download, retrying the failures curl's own --retry will
+# not.
+#
+# `--retry` covers connection refusals, timeouts and some HTTP codes. It does NOT
+# cover a connection dropped MID-TRANSFER, which exits 56 — and 56 is precisely
+# what the release CDN has now returned on three separate installs across two
+# sessions, each time aborting the install at the binary download. `curl` grew
+# `--retry-all-errors` for exactly this, but it landed in 7.71 and Ubuntu 20.04,
+# which this installer supports, ships 7.68 — so the loop lives in shell, where
+# every supported box can run it.
+#
+# ⚠ `rc=$?` on the line after a bare `if` reads 0, because a false `if` with no
+# `else` is itself a success — the bug that shipped inside the last fix written
+# for this same failure. Capture with `|| rc=$?` on the command itself.
+dp_fetch() {
+    local url="$1" out="$2" attempt=1 rc=0
+    while [ "$attempt" -le 3 ]; do
+        rc=0
+        curl --retry 3 --retry-delay 2 -sfL "$url" -o "$out" || rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        plog "  fetch attempt ${attempt}/3 exited ${rc} — $url"
+        rm -f "$out"
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 3 ] && sleep 3
+    done
+    return "$rc"
+}
+
 fetch_asset() {
     local asset="$1" dest="$2"
     local tmp="${dest}.dpdl.$$"
     FETCH_VERIFIED=0
-    if ! run "Downloading ${asset}" \
-        curl --retry 3 --retry-delay 2 -sfL "${BASE_URL}/${asset}" -o "$tmp"; then
+    if ! run "Downloading ${asset}" dp_fetch "${BASE_URL}/${asset}" "$tmp"; then
         rm -f "$tmp"
-        error "Download failed: ${asset} — see $INSTALL_LOG"
+        error "Download failed after 3 attempts: ${asset} — see $INSTALL_LOG"
         exit 1
     fi
     if [ -s "$CHECKSUMS_FILE" ]; then
@@ -902,7 +1045,14 @@ download_binaries() {
     # mktemp (root-owned, O_EXCL, unpredictable) so a local user can't pre-seed
     # a manifest that would make a tampered binary "verify".
     CHECKSUMS_FILE=$(umask 077; mktemp /tmp/dockpanel-checksums.XXXXXX 2>/dev/null || echo "")
-    if [ -z "$CHECKSUMS_FILE" ] || ! curl --retry 3 --retry-delay 2 -sfL "${BASE_URL}/checksums.txt" -o "$CHECKSUMS_FILE" 2>/dev/null; then
+    # Through dp_fetch like every other release download, including this file's
+    # own. This line kept a bare `curl --retry` after dp_fetch was written eleven
+    # lines above it, so the one fetch that decides whether ANY binary gets
+    # verified was the one still exposed to a mid-transfer drop — and its failure
+    # is a warning, so a transient blip silently downgraded the whole install to
+    # unverified. The fail-open policy is deliberate and is unchanged: three
+    # attempts, then warn and continue.
+    if [ -z "$CHECKSUMS_FILE" ] || ! dp_fetch "${BASE_URL}/checksums.txt" "$CHECKSUMS_FILE" 2>/dev/null; then
         warn "checksums.txt not available — skipping integrity verification"
         : > "$CHECKSUMS_FILE" 2>/dev/null || CHECKSUMS_FILE=""
     fi
@@ -957,13 +1107,13 @@ cargo_build_with_progress() {
     start_time=$(date +%s)
 
     (cd "$src_dir" && $CARGO_CMD build --release 2>&1) | while IFS= read -r line; do
-        if echo "$line" | grep -qE '^\s*Compiling '; then
+        if echo "$line" | grep -cE '^\s*Compiling ' >/dev/null; then
             count=$((count + 1))
             local crate_name
             crate_name=$(echo "$line" | sed 's/.*Compiling \([^ ]*\).*/\1/')
             local elapsed=$(( $(date +%s) - start_time ))
             printf "\r    ${DIM}%s: %d crates (%ds) → %s${NC}                    " "$label" "$count" "$elapsed" "$crate_name" >&2
-        elif echo "$line" | grep -qE '^\s*Finished '; then
+        elif echo "$line" | grep -cE '^\s*Finished ' >/dev/null; then
             local elapsed=$(( $(date +%s) - start_time ))
             printf "\r    ${DIM}%s: %d crates compiled in %ds${NC}                              \n" "$label" "$count" "$elapsed" >&2
         fi
@@ -1053,6 +1203,17 @@ create_services() {
     # Agent service — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
     cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
     chmod 644 /etc/systemd/system/dockpanel-agent.service
+
+    # MCP server — deploy from repo (single source of truth: panel/mcp/dockpanel-mcp.service).
+    # Installed but deliberately NOT enabled/started: v1 has no settings toggle
+    # or mint-key UI yet (session 2), so a fresh install would just log
+    # "no panel API key configured" forever. `systemctl enable --now
+    # dockpanel-mcp` is a documented manual step once an operator has minted a
+    # key at Settings → API Keys and saved it to /etc/dockpanel/mcp.token.
+    if [ -f "$MCP_SRC/dockpanel-mcp.service" ]; then
+        cp "$MCP_SRC/dockpanel-mcp.service" /etc/systemd/system/dockpanel-mcp.service
+        chmod 644 /etc/systemd/system/dockpanel-mcp.service
+    fi
 
     # API service
     cat > /etc/systemd/system/dockpanel-api.service << 'EOF'
@@ -1324,6 +1485,25 @@ ${PANEL_TLS_BLOCK}
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+    }
+
+    # MCP server (read-only v1; opt-in, see panel/mcp) — exact match, not a
+    # prefix: Streamable HTTP is one fixed endpoint, not a family of routes
+    # like /api/. Not started by default (create_services() installs the unit
+    # but never enables it), so this 502s until an operator opts in — expected
+    # for a surface nobody has turned on yet.
+    location = /mcp {
+        proxy_pass http://127.0.0.1:3081;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        access_log off;
     }
 
     # Frontend static files
@@ -1723,7 +1903,7 @@ normalize_panel_listen() {
     systemctl restart nginx > /dev/null 2>&1 || true
 
     # Trust the socket, not the restart's exit code.
-    if command -v ss > /dev/null 2>&1 && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -q "${bind_ip}:443"; then
+    if command -v ss > /dev/null 2>&1 && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -c "${bind_ip}:443" >/dev/null; then
         warn "panel is not listening on ${bind_ip}:443 — a site vhost may shadow it"
     fi
 }
@@ -1872,8 +2052,14 @@ setup_db_backup() {
 # halfway was written out as the day's backup, the retention sweep below then
 # deleted a good older one to make room, and nothing anywhere said a word.
 set -o pipefail
+# umask is load-bearing for the same reason pipefail is: `>` creates the file
+# 0666 & ~umask, so without this the day's dump — the whole panel database,
+# including `servers.agent_token` in cleartext — lands 0644 on a box that also
+# runs other people's PHP as www-data.
+umask 077
 BACKUP_DIR="/var/backups/dockpanel/db"
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR" /var/backups/dockpanel 2>/dev/null || true
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUT="$BACKUP_DIR/dockpanel_$TIMESTAMP.sql.gz"
 if ! docker exec dockpanel-postgres pg_dump -U dockpanel -d dockpanel | gzip > "$OUT"; then
@@ -1883,7 +2069,7 @@ if ! docker exec dockpanel-postgres pg_dump -U dockpanel -d dockpanel | gzip > "
 fi
 # A zero exit is not the success condition — a whole dump is. pg_dump emits this
 # marker near the end; its absence means the file is short whatever exited 0.
-if ! gunzip -c "$OUT" | tail -20 | grep -q 'PostgreSQL database dump complete'; then
+if ! gunzip -c "$OUT" | tail -20 | grep -c 'PostgreSQL database dump complete' >/dev/null; then
     echo "dockpanel db-backup: $OUT is incomplete, discarding" >&2
     rm -f "$OUT"
     exit 1
@@ -1894,8 +2080,17 @@ find "$BACKUP_DIR" -name "*.sql.gz" -mtime +7 -delete
 BKEOF
     chmod +x "$BACKUP_SCRIPT"
 
-    # Install cron job (daily at 3 AM)
-    (crontab -l 2>/dev/null | grep -v "$BACKUP_SCRIPT"; echo "0 3 * * * $BACKUP_SCRIPT") | crontab -
+    # Install cron job (daily at 3 AM).
+    #
+    # Both greps are load-bearing. The first drops a previous install of THIS
+    # script. The second drops the pre-v2.88.0 INLINE dump line, which never
+    # contains "$BACKUP_SCRIPT" — so without it, re-running setup on an older
+    # box kept the unhardened 0644 line AND added this one, giving two daily
+    # dumps of the same database, one of them world-readable in mode.
+    (crontab -l 2>/dev/null \
+        | grep -v "$BACKUP_SCRIPT" \
+        | grep -v 'pg_dump -U dockpanel.*/var/backups/dockpanel/db'; \
+     echo "0 3 * * * $BACKUP_SCRIPT") | crontab -
 
     log "Database backup script installed ($BACKUP_SCRIPT)"
     log "Cron job: daily at 3:00 AM, 7-day retention"

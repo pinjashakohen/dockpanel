@@ -1,3 +1,4 @@
+mod backend_client;
 mod client;
 mod commands;
 
@@ -159,9 +160,15 @@ enum DbCmd {
         /// Engine: mysql, mariadb, or postgres
         #[arg(long)]
         engine: String,
-        /// Root/admin password
+        /// Root/admin password. Prefer --password-stdin or the interactive
+        /// prompt — a value given here is visible to other local users via
+        /// `ps`/`/proc` for the life of the process and lands in shell history.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the root/admin password from stdin (one line) instead of
+        /// passing it on the command line.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
         /// Host port
         #[arg(long)]
         port: u16,
@@ -246,6 +253,10 @@ enum SslCmd {
         /// Proxy port (for proxy runtime)
         #[arg(long)]
         proxy_port: Option<u16>,
+        /// Issue even if the certificate already installed for this domain was
+        /// obtained somewhere else — it will be REPLACED.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -287,9 +298,15 @@ enum BackupCmd {
         /// Database user
         #[arg(long, default_value = "root")]
         user: String,
-        /// Database password
+        /// Database password. Prefer --password-stdin or the interactive
+        /// prompt — a value given here is visible to other local users via
+        /// `ps`/`/proc` for the life of the process and lands in shell history.
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: Option<String>,
+        /// Read the database password from stdin (one line) instead of
+        /// passing it on the command line.
         #[arg(long)]
-        password: String,
+        password_stdin: bool,
     },
     /// List database backups
     DbList {
@@ -317,6 +334,9 @@ enum BackupCmd {
         name: String,
         /// Backup filename
         filename: String,
+        /// Database type, only used when --type database: mysql, mariadb, or postgres
+        #[arg(long, default_value = "postgres")]
+        db_type: String,
     },
     /// Show backup health overview
     Health,
@@ -405,8 +425,9 @@ async fn main() {
                 name,
                 engine,
                 password,
+                password_stdin,
                 port,
-            }) => commands::db::cmd_db_create(&token, &name, &engine, &password, port).await,
+            }) => commands::db::cmd_db_create(&token, &name, &engine, password, password_stdin, port).await,
             Some(DbCmd::Delete { container_id }) => commands::db::cmd_db_delete(&token, &container_id).await,
         },
         Commands::Apps { filter, command } => match command {
@@ -434,7 +455,8 @@ async fn main() {
                 email,
                 runtime,
                 proxy_port,
-            } => commands::ssl::cmd_ssl_provision(&token, &domain, &email, &runtime, proxy_port).await,
+                force,
+            } => commands::ssl::cmd_ssl_provision(&token, &domain, &email, &runtime, proxy_port, force).await,
         },
         Commands::Backup { command } => match command {
             BackupCmd::Create { domain } => commands::backup::cmd_backup_create(&token, &domain).await,
@@ -445,8 +467,8 @@ async fn main() {
             BackupCmd::Delete { domain, filename } => {
                 commands::backup::cmd_backup_delete(&token, &domain, &filename).await
             }
-            BackupCmd::DbCreate { container, db_name, db_type, user, password } => {
-                commands::backup::cmd_db_backup_create(&token, &container, &db_name, &db_type, &user, &password).await
+            BackupCmd::DbCreate { container, db_name, db_type, user, password, password_stdin } => {
+                commands::backup::cmd_db_backup_create(&token, &container, &db_name, &db_type, &user, password, password_stdin).await
             }
             BackupCmd::DbList { db_name } => {
                 commands::backup::cmd_db_backup_list(&token, &db_name, &output).await
@@ -457,8 +479,8 @@ async fn main() {
             BackupCmd::VolList { container } => {
                 commands::backup::cmd_vol_backup_list(&token, &container, &output).await
             }
-            BackupCmd::Verify { r#type, name, filename } => {
-                commands::backup::cmd_backup_verify(&token, &r#type, &name, &filename).await
+            BackupCmd::Verify { r#type, name, filename, db_type } => {
+                commands::backup::cmd_backup_verify(&token, &r#type, &name, &filename, &db_type).await
             }
             BackupCmd::Health => {
                 commands::backup::cmd_backup_health(&token).await

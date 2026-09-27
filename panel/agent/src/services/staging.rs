@@ -17,6 +17,11 @@ fn validate_domain(domain: &str) -> Result<(), String> {
 pub async fn clone_files(source_domain: &str, target_domain: &str) -> Result<String, String> {
     validate_domain(source_domain)?;
     validate_domain(target_domain)?;
+
+    // Held through the rsync+chown below, both sites at once, in a fixed
+    // order — see site_lock's module doc.
+    let _guard = crate::site_lock::lock_sites(source_domain, target_domain).await;
+
     let source = format!("{WEB_ROOT}/{source_domain}/");
     let target = format!("{WEB_ROOT}/{target_domain}/");
 
@@ -42,12 +47,27 @@ pub async fn clone_files(source_domain: &str, target_domain: &str) -> Result<Str
         return Err(format!("rsync failed: {stderr}"));
     }
 
-    // Fix ownership to www-data
-    safe_command("chown")
-        .args(["-R", "www-data:www-data", &target])
-        .output()
-        .await
-        .ok();
+    // Fix ownership to www-data — everything except `.git`, which stays root's.
+    // rsync just copied the source tree verbatim, `.git` included if the source
+    // is git-deployed; handing it to www-data gives the app `config`/`hooks/`
+    // that `deploy.rs::clone_or_pull` runs as root on the next deploy. Mirrors
+    // `deploy.rs::hand_tree_to_web_user`.
+    if let Ok(mut entries) = tokio::fs::read_dir(&target).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let _ = safe_command("chown")
+                .args(["-R", "www-data:www-data", &entry.path().to_string_lossy()])
+                .output()
+                .await;
+        }
+    }
+    let git_dir = format!("{target}.git");
+    if Path::new(&git_dir).exists() {
+        let _ = safe_command("chown").args(["-R", "root:root", &git_dir]).output().await;
+        let _ = safe_command("chmod").args(["-R", "go-rwx", &git_dir]).output().await;
+    }
 
     Ok(format!("Cloned {source} → {target}"))
 }
@@ -57,6 +77,10 @@ pub async fn clone_files(source_domain: &str, target_domain: &str) -> Result<Str
 pub async fn sync_files(source_domain: &str, target_domain: &str) -> Result<String, String> {
     validate_domain(source_domain)?;
     validate_domain(target_domain)?;
+
+    // Held through the rsync+chown below — same reasoning as `clone_files`.
+    let _guard = crate::site_lock::lock_sites(source_domain, target_domain).await;
+
     let source = format!("{WEB_ROOT}/{source_domain}/");
     let target = format!("{WEB_ROOT}/{target_domain}/");
 
@@ -78,12 +102,23 @@ pub async fn sync_files(source_domain: &str, target_domain: &str) -> Result<Stri
         return Err(format!("rsync failed: {stderr}"));
     }
 
-    // Fix ownership
-    safe_command("chown")
-        .args(["-R", "www-data:www-data", &target])
-        .output()
-        .await
-        .ok();
+    // Fix ownership — everything except `.git`. See `clone_files` above for why.
+    if let Ok(mut entries) = tokio::fs::read_dir(&target).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let _ = safe_command("chown")
+                .args(["-R", "www-data:www-data", &entry.path().to_string_lossy()])
+                .output()
+                .await;
+        }
+    }
+    let git_dir = format!("{target}.git");
+    if Path::new(&git_dir).exists() {
+        let _ = safe_command("chown").args(["-R", "root:root", &git_dir]).output().await;
+        let _ = safe_command("chmod").args(["-R", "go-rwx", &git_dir]).output().await;
+    }
 
     Ok(format!("Synced {source} → {target}"))
 }
@@ -117,6 +152,10 @@ pub async fn site_disk_usage(domain: &str) -> Result<u64, String> {
 /// Delete a site's web directory.
 pub async fn delete_site_files(domain: &str) -> Result<(), String> {
     validate_domain(domain)?;
+
+    // Held through the delete below — see site_lock's module doc.
+    let _guard = crate::site_lock::lock_site(domain).await;
+
     let path = format!("{WEB_ROOT}/{domain}");
     if Path::new(&path).exists() {
         tokio::fs::remove_dir_all(&path)

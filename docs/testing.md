@@ -1,6 +1,6 @@
 # How DockPanel Is Tested
 
-> **Reflects v2.62.1.** The version stamp, the template count and every
+> **Reflects v2.242.1.** The version stamp, the template count and every
 > assertion total on this page are checked against the source by
 > `tests/docs-claims-pin-e2e.sh`, so this page cannot quietly fall behind the
 > code it describes.
@@ -372,7 +372,7 @@ found things from coming back.
 
 **On every commit** (`ci.yml`, `codeql.yml`):
 
-- **339 unit tests** across the crates — 252 in the backend, 87 in the agent.
+- **810 unit tests** across the crates — 474 in the backend, 336 in the agent.
   (The CLI crate carries none of its own today.) Re-derive rather than trust
   this line: `for c in agent backend cli; do (cd panel/$c && cargo test
   --release); done` and sum the `test result:` lines. Nothing recomputes this
@@ -380,8 +380,17 @@ found things from coming back.
   `docs-claims-pin-e2e.sh` re-reads from each suite — so it is exactly the kind
   of number that goes quietly stale, and it had: this line still read 294 when
   the count was measured for v2.48.0.
+
+  **And it went stale again, twice.** It read `493 — 334 backend, 159 agent`
+  until v2.113.0, against a real 537, and then `701 — 437 backend, 264 agent`
+  until v2.222.0, against a real 810. The paragraph above correctly names the
+  reason — nothing recomputes it — so the warning was not the missing part.
+  Treat every figure on this page that no suite re-derives as suspect by
+  default, and note that five unit tests are `#[ignore]`d and therefore
+  excluded from the count above: they need a Docker daemon and are described
+  under the drills.
 - **`cargo audit` on all three crates, enforcing.** A real advisory fails the
-  build. Two accepted, upstream-blocked items are ignored narrowly, in a
+  build. One accepted, upstream-blocked item is ignored narrowly, in a
   committed config, with the reason written down.
 - **A frontend audit gate** that fails on anything high or critical and waives
   only advisories listed with a written reason — because one unwaivable advisory
@@ -395,40 +404,147 @@ that reads the source and fails if the fix is undone — including the shapes th
 are easy to undo by accident. The mail pins assert, among other things, that the
 sandbox was **not** widened to include `/etc/opendkim.conf`, since widening it
 would have "fixed" the bug while destroying the reason the bug was
-survivable. Thirty suites, **1026 assertions**, all green at the current commit:
+survivable. One-hundred-thirty-seven suites, **4544 assertions**, all green at the current commit:
 
 | Suite | Assertions |
 |---|---|
+| `sftp-accounts-pin-e2e.sh` | 57 |
+| `bandwidth-quota-pin-e2e.sh` | 31 |
+| `ai-diagnosis-pin-e2e.sh` | 29 |
+| `resource-mutation-audit-log-pin-e2e.sh` | 47 |
+| `carry-sweep-pin-e2e.sh` | 89 |
+| `ssl-controls-pin-e2e.sh` | 137 |
+| `db-import-pin-e2e.sh` | 53 |
 | `mail-smtp-dkim-pin-e2e.sh` | 25 |
 | `mail-auth-autosleep-pin-e2e.sh` | 28 |
 | `site-backup-databases-pin-e2e.sh` | 52 |
-| `git-deploy-sandbox-pin-e2e.sh` | 20 |
-| `ssl-correctness-pin-e2e.sh` | 37 |
+| `git-deploy-sandbox-pin-e2e.sh` | 42 |
+| `git-deploy-volumes-pin-e2e.sh` | 28 |
+| `ssl-correctness-pin-e2e.sh` | 97 |
+| `dns01-renewal-pin-e2e.sh` | 63 |
+| `acme-account-identity-pin-e2e.sh` | 20 |
 | `nginx-listen-pin-e2e.sh` | 17 |
-| `rpm-install-pin-e2e.sh` | 34 |
+| `rpm-install-pin-e2e.sh` | 71 |
 | `mail-rpm-pin-e2e.sh` | 22 |
 | `cpu-metric-pin-e2e.sh` | 17 |
-| `sandbox-paths-pin-e2e.sh` | 64 |
+| `credentials-at-rest-pin-e2e.sh` | 49 |
+| `canary-arm-pin-e2e.sh` | 20 |
+| `notifications-pin-e2e.sh` | 35 |
+| `sandbox-paths-pin-e2e.sh` | 94 |
 | `webmail-spam-pin-e2e.sh` | 18 |
 | `registration-gates-pin-e2e.sh` | 14 |
 | `settings-controls-pin-e2e.sh` | 19 |
-| `auth-doors-pin-e2e.sh` | 15 |
+| `auth-doors-pin-e2e.sh` | 70 |
 | `nginx-headers-pin-e2e.sh` | 78 |
-| `update-rollback-pin-e2e.sh` | 36 |
-| `agent-error-propagation-pin-e2e.sh` | 21 |
-| `backup-destinations-git-env-pin-e2e.sh` | 27 |
-| `agent-sandbox-paths-pin-e2e.sh` | 10 |
-| `backup-lands-pin-e2e.sh` | 31 |
+| `update-rollback-pin-e2e.sh` | 52 |
+| `agent-error-propagation-pin-e2e.sh` | 20 |
+| `backup-destinations-git-env-pin-e2e.sh` | 37 |
+| `agent-refusal-status-pin-e2e.sh` | 34 |
+| `agent-sandbox-paths-pin-e2e.sh` | 11 |
+| `backup-lands-pin-e2e.sh` | 62 |
 | `migration-analyze-async-pin-e2e.sh` | 28 |
-| `php-install-from-picker-pin-e2e.sh` | 29 |
+| `php-install-from-picker-pin-e2e.sh` | 43 |
 | `provision-log-ownership-pin-e2e.sh` | 41 |
-| `backup-truth-pin-e2e.sh` | 35 |
+| `backup-truth-pin-e2e.sh` | 54 |
 | `scheme-and-import-pin-e2e.sh` | 35 |
-| `domain-claim-pin-e2e.sh` | 45 |
-| `ownership-delete-pin-e2e.sh` | 36 |
-| `compose-stack-pin-e2e.sh` | 43 |
-| `container-identity-pin-e2e.sh` | 38 |
-| `unattended-host-scope-pin-e2e.sh` | 111 |
+| `domain-claim-pin-e2e.sh` | 60 |
+| `mail-authorisation-pin-e2e.sh` | 30 |
+| `mail-client-view-pin-e2e.sh` | 23 |
+| `mail-sender-identity-pin-e2e.sh` | 38 |
+| `ownership-delete-pin-e2e.sh` | 44 |
+| `compose-stack-pin-e2e.sh` | 56 |
+| `container-identity-pin-e2e.sh` | 45 |
+| `unattended-host-scope-pin-e2e.sh` | 118 |
+| `status-page-gate-pin-e2e.sh` | 52 |
+| `site-transfer-visibility-pin-e2e.sh` | 21 |
+| `suspend-restore-pin-e2e.sh` | 18 |
+| `site-disabled-stays-offline-pin-e2e.sh` | 19 |
+| `terminal-scope-signed-pin-e2e.sh` | 15 |
+| `logs-scope-signed-pin-e2e.sh` | 10 |
+| `client-role-honesty-pin-e2e.sh` | 28 |
+| `wrong-host-dispatch-pin-e2e.sh` | 23 |
+| `db-credential-auth-pin-e2e.sh` | 17 |
+| `client-role-and-server-ownership-pin-e2e.sh` | 99 |
+| `agent-security-signals-pin-e2e.sh` | 18 |
+| `sibling-parity-pin-e2e.sh` | 25 |
+| `webhook-verification-pin-e2e.sh` | 47 |
+| `client-account-door-pin-e2e.sh` | 32 |
+| `twofa-recovery-pin-e2e.sh` | 37 |
+| `passkey-enrolment-proof-pin-e2e.sh` | 27 |
+| `passkey-ceremony-pin-e2e.sh` | 34 |
+| `auth-401-meaning-pin-e2e.sh` | 21 |
+| `upgrade-reach-pin-e2e.sh` | 15 |
+| `access-recovery-pin-e2e.sh` | 67 |
+| `whmcs-config-writable-pin-e2e.sh` | 8 |
+| `system-logs-scope-pin-e2e.sh` | 15 |
+| `pipefail-sigpipe-pin-e2e.sh` | 9 |
+| `expected-stop-pin-e2e.sh` | 58 |
+| `install-integrity-pin-e2e.sh` | 58 |
+| `ship-gate-pin-e2e.sh` | 19 |
+| `app-template-images-pin-e2e.sh` | 20 |
+| `app-volume-ownership-pin-e2e.sh` | 38 |
+| `theme-contrast-pin-e2e.sh` | 27 |
+| `db-schema-browser-pin-e2e.sh` | 23 |
+| `client-surface-gating-pin-e2e.sh` | 38 |
+| `alert-resolve-scope-pin-e2e.sh` | 48 |
+| `alert-controls-pin-e2e.sh` | 54 |
+| `lockdown-door-census-pin-e2e.sh` | 23 |
+| `app-data-persistence-pin-e2e.sh` | 39 |
+| `deploy-approval-reachable-pin-e2e.sh` | 44 |
+| `template-domain-env-pin-e2e.sh` | 23 |
+| `update-dead-image-pin-e2e.sh` | 16 |
+| `severed-controls-pin-e2e.sh` | 33 |
+| `honest-outcomes-pin-e2e.sh` | 47 |
+| `reachable-controls-pin-e2e.sh` | 37 |
+| `clearable-fields-pin-e2e.sh` | 27 |
+| `deploy-gate-coverage-pin-e2e.sh` | 15 |
+| `site-runtime-workdir-pin-e2e.sh` | 10 |
+| `port-scope-pin-e2e.sh` | 30 |
+| `published-docs-truth-pin-e2e.sh` | 17 |
+| `ssrf-url-guard-pin-e2e.sh` | 12 |
+| `upload-refusal-pin-e2e.sh` | 23 |
+| `rename-carries-backups-pin-e2e.sh` | 42 |
+| `monitors-honest-reads-pin-e2e.sh` | 33 |
+| `certificate-registry-pin-e2e.sh` | 127 |
+| `oauth-csrf-pin-e2e.sh` | 17 |
+| `rhel-site-creation-pin-e2e.sh` | 27 |
+| `graceful-shutdown-timeout-pin-e2e.sh` | 7 |
+| `scan-alert-resolve-pin-e2e.sh` | 23 |
+| `pdns-install-scope-pin-e2e.sh` | 10 |
+| `git-deploy-pre-build-rce-pin-e2e.sh` | 35 |
+| `chain-operator-bypass-pin-e2e.sh` | 16 |
+| `volume-backup-scope-leak-pin-e2e.sh` | 9 |
+| `notification-secrets-encryption-pin-e2e.sh` | 32 |
+| `webhook-secrets-encryption-pin-e2e.sh` | 46 |
+| `nginx-clone-env-backup-path-pin-e2e.sh` | 12 |
+| `registry-ollama-arg-validation-pin-e2e.sh` | 16 |
+| `env-mask-catalogue-secrets-pin-e2e.sh` | 13 |
+| `registry-pull-credentials-pin-e2e.sh` | 7 |
+| `update-connection-resilience-pin-e2e.sh` | 7 |
+| `admin-peer-account-protection-pin-e2e.sh` | 20 |
+| `backup-encryption-integrity-pin-e2e.sh` | 18 |
+| `cli-password-args-pin-e2e.sh` | 18 |
+| `secrets-mask-value-boundary-pin-e2e.sh` | 10 |
+| `escalation-user-route-scope-pin-e2e.sh` | 13 |
+| `git-clone-ssrf-pin-e2e.sh` | 16 |
+| `timeout-orphan-kill-on-drop-pin-e2e.sh` | 36 |
+| `security-firewalld-ssh-include-pin-e2e.sh` | 24 |
+| `database-icc-reconcile-and-file-download-pin-e2e.sh` | 11 |
+| `git-blind-chown-and-restore-ownership-pin-e2e.sh` | 28 |
+| `scanner-supply-chain-and-credential-perms-pin-e2e.sh` | 20 |
+| `cms-installer-hardening-pin-e2e.sh` | 32 |
+| `pkg-rs-and-clone-dedup-hardening-pin-e2e.sh` | 27 |
+| `rhel-updates-and-smtp-from-name-pin-e2e.sh` | 18 |
+| `cli-field-mismatch-pin-e2e.sh` | 21 |
+| `cli-io-crate-audit-pin-e2e.sh` | 19 |
+| `backend-hot-file-audit-pin-e2e.sh` | 25 |
+| `telemetry-oncall-db-audit-pin-e2e.sh` | 13 |
+| `drill-ws-backup-scope-pin-e2e.sh` | 29 |
+| `shutdown-drain-race-pin-e2e.sh` | 22 |
+| `api-key-auth-pin-e2e.sh` | 17 |
+| `container-ownership-pin-e2e.sh` | 9 |
+| `git-deploy-preview-status-pin-e2e.sh` | 9 |
+| `migration-url-fetch-pin-e2e.sh` | 21 |
 
 **On a schedule, from outside** (`live-surfaces.yml`, daily). Every layer above
 runs because something changed, which is exactly why none of them could catch the
@@ -461,6 +577,39 @@ its own origin and never see the CDN in front of it. It asserts that:
 
 It is not in the assertion table above because it needs the network and the world,
 so its result is a statement about today rather than about this commit.
+
+**On every push, against a real database** (`ci.yml`, job `tier2-certpin`). Almost
+everything above can be decided by reading source. Certificate pinning cannot:
+whether a server presenting the wrong certificate is actually refused is a
+property of a running panel, a running database, and a request that really gets
+made.
+
+`tests/tier2-certpin-e2e.sh` drives it end to end. A first checkin captures a
+fingerprint; a second carrying the same one is accepted; a third carrying a
+different one is refused with a 403; a malformed one is refused with a 400 and
+leaves the stored pin untouched; an admin rotation clears the pin, is itself
+refused without a CSRF header, and is written to the activity log; and finally a
+pinned TLS dial is made to a port with nothing behind it — not to test the dial,
+which is expected to fail, but to prove the client can be *constructed*. That
+last arm exists because in v2.7.18 it could not: under rustls 0.23 a missing
+CryptoProvider panics while the TLS config is being built, so the panel answered
+500 to a request it had not begun to process.
+
+Fourteen assertions — and until s346 they ran nowhere at all. The suite was
+called `tier2-pin-e2e.sh`, which put it inside the `*-pin-e2e.sh` glob that the
+CI sweep and this page's own census both walk. Being a live suite it could not
+pass there, so it was excluded by name from both — and those two exclusions were
+the whole of its CI story. It had never executed on any machine but its author's,
+while on that machine the local "run all the pins" sweep quietly pointed it at
+the live panel database. It is now named for what it is, and has a job with a
+postgres service of its own.
+
+It is not in the assertion table above for the same reason `live-surfaces-check.sh`
+is not: that table is re-run and re-counted by `docs-claims-pin-e2e.sh` on a
+runner with no database, and a suite that needs one reports nothing there.
+Publishing a row for it would have made the wrong job red. What keeps it honest
+instead is `ship-gate-pin-e2e.sh` §S4, which fails if any test file in this
+repository runs in no job and is not exempt by name with its reason.
 
 **On every release** (`release.yml`, `smoke-test.yml`):
 

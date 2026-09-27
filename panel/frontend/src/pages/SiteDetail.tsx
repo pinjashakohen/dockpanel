@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constants";
 import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequisite";
@@ -18,6 +18,8 @@ interface Site {
   ssl_expiry: string | null;
   rate_limit: number | null;
   max_upload_mb: number;
+  bandwidth_quota_mb: number | null;
+  bandwidth_suspended_at: string | null;
   php_memory_mb: number;
   php_max_workers: number;
   custom_nginx: string | null;
@@ -33,6 +35,8 @@ interface Site {
   csp_policy: string | null;
   permissions_policy: string | null;
   bot_protection: string;
+  sftp_enabled: boolean;
+  sftp_uid: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -47,6 +51,8 @@ export default function SiteDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { user } = useAuth();
+  /** Holds sites, cannot claim a new domain — see `domain_claim::ensure_claimable`. */
+  const isClient = user?.role === "client";
   const [site, setSite] = useState<Site | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -55,6 +61,16 @@ export default function SiteDetail() {
   const [provisioning, setProvisioning] = useState(false);
   const [sslMessage, setSslMessage] = useState("");
   const [sslMessageIsError, setSslMessageIsError] = useState(false);
+  // Set only by the agent's `foreign_certificate` refusal — never inferred
+  // from any other 4xx, so a DNS 412 or a rate limit never grows a "replace
+  // it anyway" button that has no business next to it. `retry` re-issues the
+  // exact same provision call with `force: true`, the only way this reaches
+  // the wire (mirrors the CLI's `--force`).
+  const [foreignCertRefusal, setForeignCertRefusal] = useState<{
+    message: string;
+    retry: () => Promise<void>;
+  } | null>(null);
+  const [forcingSsl, setForcingSsl] = useState(false);
   // Only run the DNS prerequisite while SSL is still unconfigured; a live cert
   // is proof enough that the domain resolves here. autoPoll covers propagation:
   // a blocking gate opens by itself once the record goes live.
@@ -69,10 +85,29 @@ export default function SiteDetail() {
   // an uninstalled version stays selected while its install callout is up, and
   // only becomes the site's version once the switch actually goes through.
   const [phpChoice, setPhpChoice] = useState("");
+  // #99: which runtime the operator is proposing to switch to, or null when the
+  // row is just displaying. Held separately from `phpChoice` so an abandoned
+  // runtime switch cannot leave the PHP Version picker on a version the site is
+  // not running.
+  const [runtimeTarget, setRuntimeTarget] = useState<"static" | "php" | null>(null);
+  const [runtimePhpChoice, setRuntimePhpChoice] = useState("8.3");
+  // The picker reports whether the chosen version is actually installed AND its
+  // FPM socket is running. Holding the switch back on `false` mirrors what the
+  // PHP Version control already does for an existing PHP site; without it the
+  // button fires a switch the agent then refuses. Defaults true, matching the
+  // picker's own permissive fallback for a version it has no record of.
+  const [runtimePhpReady, setRuntimePhpReady] = useState(true);
+  const [switchingRuntime, setSwitchingRuntime] = useState(false);
+  const [runtimeMessage, setRuntimeMessage] = useState("");
   const [savingLimits, setSavingLimits] = useState(false);
   const [limitsMessage, setLimitsMessage] = useState("");
   const [rateLimit, setRateLimit] = useState<string>("");
   const [maxUpload, setMaxUpload] = useState("64");
+  const [bandwidthQuota, setBandwidthQuota] = useState<string>("");
+  const [bandwidthUsage, setBandwidthUsage] = useState<{
+    used_bytes_this_month: number;
+    year_month: string;
+  } | null>(null);
   const [phpMemory, setPhpMemory] = useState("256");
   const [phpWorkers, setPhpWorkers] = useState("5");
   const [customNginx, setCustomNginx] = useState("");
@@ -129,12 +164,42 @@ export default function SiteDetail() {
   // Health Check
   const [health, setHealth] = useState<{ healthy: boolean; status: number; response_time_ms: number } | null>(null);
   const [checkingHealth, setCheckingHealth] = useState(false);
+  const [healthSummary, setHealthSummary] = useState<{
+    ssl_status: { enabled: boolean; days_until_expiry: number | null };
+    backup_freshness: { last_backup: string | null; hours_since: number | null };
+    uptime: { status: string | null; response_time_ms: number | null; monitor_enabled: boolean };
+    score: number;
+  } | null>(null);
 
   // Site Cloning
   const [cloning, setCloning] = useState(false);
   const [cloneMsg, setCloneMsg] = useState("");
   const [showCloneInput, setShowCloneInput] = useState(false);
   const [cloneDomainValue, setCloneDomainValue] = useState("");
+  const [showTransfer, setShowTransfer] = useState(false);
+  const [transferEmail, setTransferEmail] = useState("");
+  const [transferring, setTransferring] = useState(false);
+  const [transferMsg, setTransferMsg] = useState("");
+  const [transferTargets, setTransferTargets] = useState<{ id: string; email: string; role: string }[]>([]);
+
+  // WHO ISSUED THE CERTIFICATE THIS SITE IS SERVING.
+  //
+  // The row used to name one specific CA for every enabled site — see the badge
+  // below for the wording — including a site carrying a certificate the operator
+  // uploaded from a commercial CA, and including one the panel had already
+  // DECLINED to renew for precisely that reason. The backend has been able to answer this since
+  // `foreign_cert_issuer` shipped; nothing ever asked it on the operator's
+  // behalf.
+  //
+  // ⛔ "unknown" is a real answer and is rendered as the neutral "Enabled",
+  // never as a CA name. An unreachable agent lands here, and so does a site
+  // served by a zone WILDCARD (the agent reports `has_cert:false` for the
+  // site's own name while the certificate sits under the zone's). Both hold a
+  // real certificate; neither is evidence about who issued it.
+  const [sslProvenance, setSslProvenance] = useState<{
+    provenance: "foreign" | "dockpanel" | "unknown";
+    issuer: string | null;
+  } | null>(null);
 
   // Custom SSL Upload
   const [showSslUpload, setShowSslUpload] = useState(false);
@@ -165,6 +230,17 @@ export default function SiteDetail() {
   const [redisToggling, setRedisToggling] = useState(false);
   const [redisPurging, setRedisPurging] = useState(false);
   const [redisMsg, setRedisMsg] = useState("");
+  const [sftpToggling, setSftpToggling] = useState(false);
+  const [sftpResetting, setSftpResetting] = useState(false);
+  const [sftpMsg, setSftpMsg] = useState("");
+  const [sftpPassword, setSftpPassword] = useState<string | null>(null);
+  const [copied, setCopied] = useState("");
+
+  const copyToClipboard = (text: string, label: string) => {
+    navigator.clipboard.writeText(text);
+    setCopied(label);
+    setTimeout(() => setCopied(""), 2000);
+  };
 
   // WAF
   const [wafToggling, setWafToggling] = useState(false);
@@ -192,6 +268,10 @@ export default function SiteDetail() {
   const [phpExtsLoading, setPhpExtsLoading] = useState(false);
   const [showPhpExts, setShowPhpExts] = useState(false);
   const [installingExt, setInstallingExt] = useState<string | null>(null);
+  // Rendered beside the extension list rather than reusing `phpMessage`, which
+  // paints ~1500 lines higher up next to the PHP VERSION control. A message the
+  // operator has to scroll to find is the defect #120 was filed for.
+  const [extMessage, setExtMessage] = useState("");
 
   // Environment Variables
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([]);
@@ -217,6 +297,14 @@ export default function SiteDetail() {
         await api.delete(`/sites/${id}/staging`);
         setStaging({ exists: false });
         setStagingMessage("Staging deleted");
+      } else if (type === "staging_create_db_ack") {
+        await api.post(`/sites/${id}/staging`, {
+          domain: stagingDomain || undefined,
+          acknowledge_shared_database: true,
+        });
+        fetchStaging();
+        setShowStagingForm(false);
+        setStagingMessage("Staging environment created");
       }
     } catch (e) {
       setStagingMessage(e instanceof Error ? e.message : "Action failed");
@@ -297,6 +385,55 @@ export default function SiteDetail() {
     } catch { setEnvVars([]); }
   };
 
+  // Accounts a site can be handed to. Admin-only endpoint, and Transfer is
+  // admin-only too, so this exposes nothing the caller could not already read.
+  useEffect(() => {
+    if (user?.role !== "admin") return;
+    api
+      .get<{ id: string; email: string; role: string }[]>("/users")
+      .then((rows) => setTransferTargets(rows.filter((u) => u.role !== "suspended" && u.id !== user?.id)))
+      .catch(() => setTransferTargets([]));
+  }, [user?.role, user?.id]);
+
+  // Ask WHO issued it, and only when there is something to ask about.
+  //
+  // ⚠ This costs an agent hop (`GET /api/sites/{id}/ssl` reaches the box), so it
+  // is fired only for an SSL-enabled site and it NEVER blocks the row: until it
+  // answers, `sslProvenance` is null and the badge renders the neutral wording.
+  // A failure is left as null for the same reason — a page that cannot reach the
+  // agent must not therefore start asserting a CA.
+  const loadSslProvenance = useCallback(() => {
+    api
+      .get<{ provenance: "foreign" | "dockpanel" | "unknown"; issuer: string | null }>(
+        `/sites/${id}/ssl`,
+      )
+      .then((r) => setSslProvenance({ provenance: r.provenance, issuer: r.issuer }))
+      .catch(() => setSslProvenance(null));
+  }, [id]);
+
+  useEffect(() => {
+    if (!site?.ssl_enabled) {
+      setSslProvenance(null);
+      return;
+    }
+    loadSslProvenance();
+  }, [site?.ssl_enabled, site?.domain, loadSslProvenance]);
+
+  // Composite score augmenting the plain up/down Health Check button above —
+  // computed server-side from SSL expiry + backup freshness + monitor uptime,
+  // not a replacement for the on-demand check.
+  useEffect(() => {
+    api
+      .get<{
+        ssl_status: { enabled: boolean; days_until_expiry: number | null };
+        backup_freshness: { last_backup: string | null; hours_since: number | null };
+        uptime: { status: string | null; response_time_ms: number | null; monitor_enabled: boolean };
+        score: number;
+      }>(`/sites/${id}/health-summary`)
+      .then(setHealthSummary)
+      .catch(() => setHealthSummary(null));
+  }, [id]);
+
   useEffect(() => {
     api
       .get<Site>(`/sites/${id}`)
@@ -310,6 +447,7 @@ export default function SiteDetail() {
         setCspPolicy(s.csp_policy || "");
         setPermsPolicy(s.permissions_policy || "");
         setBotMode(s.bot_protection || "off");
+        setBandwidthQuota(s.bandwidth_quota_mb != null ? String(s.bandwidth_quota_mb) : "");
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
@@ -317,6 +455,10 @@ export default function SiteDetail() {
     loadRedirects();
     loadProtected();
     loadAliases();
+    api
+      .get<{ used_bytes_this_month: number; year_month: string }>(`/sites/${id}/bandwidth-usage`)
+      .then(setBandwidthUsage)
+      .catch(() => setBandwidthUsage(null));
   }, [id]);
 
   const handleDelete = async () => {
@@ -334,37 +476,46 @@ export default function SiteDetail() {
     }
   };
 
-  const handleProvisionSSL = async () => {
+  const handleProvisionSSL = async (force = false) => {
     if (!site) return;
-    setProvisioning(true);
+    if (force) setForcingSsl(true); else setProvisioning(true);
     setSslMessage("");
+    setForeignCertRefusal(null);
     try {
-      await api.post(`/sites/${id}/ssl`);
+      await api.post(`/sites/${id}/ssl${force ? "?force=true" : ""}`);
       const updated = await api.get<Site>(`/sites/${id}`);
       setSite(updated);
       setSslMessage("SSL certificate provisioned successfully!");
       setSslMessageIsError(false);
     } catch (err) {
-      setSslMessage(
-        err instanceof Error ? err.message : "SSL provisioning failed"
-      );
-      setSslMessageIsError(true);
-      // The server may have refused on a prerequisite (a 412 naming the DNS
-      // problem). Refresh it so the callout beside the button reflects why.
-      recheckDns();
+      if (err instanceof ApiError && err.code === "foreign_certificate") {
+        setForeignCertRefusal({
+          message: err.message,
+          retry: () => handleProvisionSSL(true),
+        });
+      } else {
+        setSslMessage(
+          err instanceof Error ? err.message : "SSL provisioning failed"
+        );
+        setSslMessageIsError(true);
+        // The server may have refused on a prerequisite (a 412 naming the DNS
+        // problem). Refresh it so the callout beside the button reflects why.
+        recheckDns();
+      }
     } finally {
-      setProvisioning(false);
+      if (force) setForcingSsl(false); else setProvisioning(false);
     }
   };
 
   const [dns01Loading, setDns01Loading] = useState(false);
 
-  const handleProvisionDns01 = async (wildcard: boolean) => {
+  const handleProvisionDns01 = async (wildcard: boolean, force = false) => {
     if (!site) return;
-    setDns01Loading(true);
+    if (force) setForcingSsl(true); else setDns01Loading(true);
     setSslMessage("");
+    setForeignCertRefusal(null);
     try {
-      await api.post(`/sites/${id}/ssl/dns01`, { wildcard });
+      await api.post(`/sites/${id}/ssl/dns01`, { wildcard, force });
       const updated = await api.get<Site>(`/sites/${id}`);
       setSite(updated);
       setSslMessage(wildcard
@@ -373,10 +524,17 @@ export default function SiteDetail() {
       );
       setSslMessageIsError(false);
     } catch (err) {
-      setSslMessage(err instanceof Error ? err.message : "DNS-01 provisioning failed");
-      setSslMessageIsError(true);
+      if (err instanceof ApiError && err.code === "foreign_certificate") {
+        setForeignCertRefusal({
+          message: err.message,
+          retry: () => handleProvisionDns01(wildcard, true),
+        });
+      } else {
+        setSslMessage(err instanceof Error ? err.message : "DNS-01 provisioning failed");
+        setSslMessageIsError(true);
+      }
     } finally {
-      setDns01Loading(false);
+      if (force) setForcingSsl(false); else setDns01Loading(false);
     }
   };
 
@@ -420,8 +578,10 @@ export default function SiteDetail() {
         <div>
           <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">{site.domain}</h1>
           <div className="flex items-center gap-3 mt-2">
-            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[site.status] || "bg-dark-700 text-dark-200"}`}>
-              {site.status}
+            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+              site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
+            }`}>
+              {site.enabled === false ? "disabled" : site.status}
             </span>
             <span className="text-sm text-dark-200">
               {runtimeLabels[site.runtime] || site.runtime}
@@ -437,6 +597,24 @@ export default function SiteDetail() {
             {health && (
               <span className={`text-xs font-mono ${health.healthy ? "text-rust-400" : "text-danger-400"}`}>
                 {health.status > 0 ? `${health.status}` : "Down"} · {health.response_time_ms}ms
+              </span>
+            )}
+            {healthSummary && (
+              <span
+                title={[
+                  `SSL: ${healthSummary.ssl_status.enabled ? (healthSummary.ssl_status.days_until_expiry != null ? `expires in ${healthSummary.ssl_status.days_until_expiry}d` : "enabled") : "not enabled"}`,
+                  `Backup: ${healthSummary.backup_freshness.hours_since != null ? `${healthSummary.backup_freshness.hours_since}h ago` : "none on record"}`,
+                  `Uptime: ${healthSummary.uptime.monitor_enabled ? (healthSummary.uptime.status || "unknown") : "not monitored"}`,
+                ].join(" · ")}
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono ${
+                  healthSummary.score >= 80
+                    ? "bg-rust-500/10 text-rust-400"
+                    : healthSummary.score >= 50
+                      ? "bg-warn-500/10 text-warn-400"
+                      : "bg-danger-500/10 text-danger-400"
+                }`}
+              >
+                Health {healthSummary.score}
               </span>
             )}
           </div>
@@ -471,7 +649,7 @@ export default function SiteDetail() {
                 finally { setToggling(false); }
               }} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
                 site?.enabled !== false
-                  ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                  ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
                   : "bg-rust-500/10 text-rust-400 hover:bg-rust-500/20"
               }`}>
                 {toggling ? "..." : site?.enabled !== false ? "Disable" : "Enable"}
@@ -522,10 +700,68 @@ export default function SiteDetail() {
                   <button onClick={() => setShowCloneInput(false)} className="px-3 py-2 bg-dark-600 text-dark-200 rounded-lg text-sm font-medium">Cancel</button>
                 </div>
               ) : (
-                <button disabled={cloning} onClick={() => { setCloneDomainValue(`clone-${site?.domain}`); setShowCloneInput(true); }}
-                  className="px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors">
-                  {cloning ? "Cloning..." : "Clone"}
-                </button>
+                /* Clone, Create Staging and Add Alias all end in
+                   `domain_claim::ensure_claimable`, so all three are refusals for a
+                   `client` — on the site they DO own, which is what made them read
+                   as a fault rather than a rule. Hidden rather than disabled: a
+                   disabled control still says "this is for you, later", and for
+                   this role there is no later. */
+                !isClient && (
+                  <button disabled={cloning} onClick={() => { setCloneDomainValue(`clone-${site?.domain}`); setShowCloneInput(true); }}
+                    className="px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors">
+                    {cloning ? "Cloning..." : "Clone"}
+                  </button>
+                )
+              )}
+              {user?.role === "admin" && (
+                showTransfer ? (
+                  <div className="flex items-center gap-2">
+                    {/* Picked, not typed. The endpoint answers 404 "No account
+                        with that email" on a typo, so a text field could only
+                        fail late — and an operator does not carry their clients'
+                        addresses in their head. */}
+                    <select
+                      value={transferEmail}
+                      onChange={(e) => setTransferEmail(e.target.value)}
+                      autoFocus
+                      className="w-64 px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-sm text-dark-100"
+                    >
+                      <option value="">Choose an account…</option>
+                      {transferTargets.map((u) => (
+                        <option key={u.id} value={u.email}>{u.email} ({u.role})</option>
+                      ))}
+                    </select>
+                    <button
+                      disabled={!transferEmail || transferring}
+                      onClick={() => {
+                        setTransferring(true);
+                        setTransferMsg("");
+                        api.post(`/sites/${id}/transfer`, { email: transferEmail })
+                          .then(() => {
+                            setShowTransfer(false);
+                            setTransferMsg(
+                              `Transferred to ${transferEmail}. You no longer own this site — ` +
+                              `find it again under Sites → "All sites on this server".`
+                            );
+                          })
+                          .catch((err) => setTransferMsg(err instanceof Error ? err.message : "Transfer failed"))
+                          .finally(() => setTransferring(false));
+                      }}
+                      className="px-3 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium disabled:opacity-50"
+                    >
+                      {transferring ? "Transferring..." : "Transfer"}
+                    </button>
+                    <button onClick={() => setShowTransfer(false)} className="px-3 py-2 bg-dark-600 text-dark-200 rounded-lg text-sm font-medium">Cancel</button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setShowTransfer(true)}
+                    title="Hand this site to another account. Ownership is exclusive — the current owner loses access."
+                    className="px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 transition-colors"
+                  >
+                    Transfer
+                  </button>
+                )
               )}
               <button
                 onClick={handleDelete}
@@ -539,16 +775,20 @@ export default function SiteDetail() {
       </div>
       {/* Disabled banner */}
       {site.enabled === false && (
-        <div className="mb-4 px-4 py-3 rounded-lg text-sm bg-amber-500/10 text-amber-400 border border-amber-500/20 flex items-center justify-between">
-          <span>This site is currently disabled. Visitors see a 503 maintenance page.</span>
+        <div className="mb-4 px-4 py-3 rounded-lg text-sm bg-warn-500/10 text-warn-500 border border-warn-500/20 flex items-center justify-between">
+          <span>
+            {site.bandwidth_suspended_at
+              ? `This site was automatically disabled on ${formatDate(site.bandwidth_suspended_at)} for exceeding its monthly bandwidth quota (${site.bandwidth_quota_mb} MB). Visitors see a 503 maintenance page. Raise the quota below to restore it immediately, or it restores automatically next month.`
+              : "This site is currently disabled. Visitors see a 503 maintenance page."}
+          </span>
           <button disabled={toggling} onClick={async () => {
             setToggling(true);
             try {
               await api.put(`/sites/${id}/toggle`, { enabled: true });
-              setSite(s => s ? { ...s, enabled: true } : s);
+              setSite(s => s ? { ...s, enabled: true, bandwidth_suspended_at: null } : s);
             } catch (e) { setError(e instanceof Error ? e.message : "Enable failed"); }
             finally { setToggling(false); }
-          }} className="px-3 py-1 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
+          }} className="px-3 py-1 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50 shrink-0 ml-3">
             {toggling ? "..." : "Enable Now"}
           </button>
         </div>
@@ -590,6 +830,11 @@ export default function SiteDetail() {
           cloneMsg.includes("cloned") ? "bg-rust-500/10 text-rust-400 border border-rust-500/20" : "bg-danger-500/10 text-danger-400 border border-danger-500/20"
         }`}>{cloneMsg}</div>
       )}
+      {transferMsg && (
+        <div className={`mb-4 px-4 py-3 rounded-lg text-sm ${
+          transferMsg.includes("Transferred") ? "bg-rust-500/10 text-rust-400 border border-rust-500/20" : "bg-danger-500/10 text-danger-400 border border-danger-500/20"
+        }`}>{transferMsg}</div>
+      )}
 
       {/* Details */}
       <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
@@ -601,7 +846,132 @@ export default function SiteDetail() {
           <div className="px-5 py-4 grid grid-cols-3">
             <dt className="text-sm font-medium text-dark-200">Runtime</dt>
             <dd className="text-sm text-dark-50 col-span-2">
-              {runtimeLabels[site.runtime] || site.runtime}
+              <div className="space-y-2">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <span>{runtimeLabels[site.runtime] || site.runtime}</span>
+                  {/* #99: the reporter's workaround was deleting the site and
+                      recreating it, because there was no control here at all.
+                      Offered only between static and PHP — the proxying runtimes
+                      move the document root, which is a different change. */}
+                  {(site.runtime === "static" || site.runtime === "php") && !runtimeTarget && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRuntimeMessage("");
+                        setRuntimePhpChoice(site.php_version || "8.3");
+                        setRuntimeTarget(site.runtime === "static" ? "php" : "static");
+                      }}
+                      className="text-xs px-2 py-1 rounded-lg border border-dark-600 text-dark-100 hover:text-dark-50 hover:border-dark-500"
+                    >
+                      {site.runtime === "static" ? "Switch to PHP" : "Switch to static"}
+                    </button>
+                  )}
+                  {switchingRuntime && <span className="text-xs text-dark-200">Switching...</span>}
+                  {runtimeMessage && (
+                    <span className={`text-xs ${runtimeMessage.startsWith("Switched") ? "text-rust-400" : "text-danger-400"}`}>
+                      {runtimeMessage}
+                    </span>
+                  )}
+                </div>
+
+                {runtimeTarget === "php" && (
+                  <div className="rounded-lg border border-dark-600 p-3 space-y-3">
+                    <p className="text-xs text-dark-200">
+                      The document root does not move — <span className="font-mono">public/</span> keeps
+                      serving the files that are already there. Existing <span className="font-mono">.html</span>{" "}
+                      files keep working; <span className="font-mono">.php</span> files start executing.
+                    </p>
+                    <PhpVersionPicker
+                      className="max-w-xs"
+                      value={runtimePhpChoice}
+                      canInstall={user?.role === "admin"}
+                      disabled={switchingRuntime}
+                      onChange={(v, ready) => { setRuntimePhpChoice(v); setRuntimePhpReady(ready); }}
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={switchingRuntime || !runtimePhpReady}
+                        title={runtimePhpReady ? undefined : `PHP ${runtimePhpChoice} is not installed on this server yet — install it above first.`}
+                        onClick={async () => {
+                          setSwitchingRuntime(true);
+                          setRuntimeMessage("");
+                          try {
+                            const updated = await api.put<Site>(`/sites/${id}/runtime`, {
+                              runtime: "php",
+                              php_version: runtimePhpChoice,
+                            });
+                            setSite(updated);
+                            setRuntimeTarget(null);
+                            setRuntimeMessage(`Switched to PHP ${runtimePhpChoice}`);
+                          } catch (err) {
+                            setRuntimeMessage(err instanceof Error ? err.message : "Switch failed");
+                          } finally {
+                            setSwitchingRuntime(false);
+                          }
+                        }}
+                        className="text-xs px-3 py-1.5 rounded-lg bg-rust-600 text-white hover:bg-rust-500 disabled:opacity-50"
+                      >
+                        Switch to PHP {runtimePhpChoice}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={switchingRuntime}
+                        onClick={() => { setRuntimeTarget(null); setRuntimeMessage(""); }}
+                        className="text-xs px-3 py-1.5 rounded-lg border border-dark-600 text-dark-100 hover:text-dark-50"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {runtimeTarget === "static" && (
+                  <div className="rounded-lg border border-dark-600 p-3 space-y-3">
+                    <p className="text-xs text-dark-200">
+                      PHP stops executing on this site. Your files are not touched, and switching back
+                      restores execution — but anything the PHP vhost was hiding is a static file from
+                      now on, so the static vhost refuses <span className="font-mono">.php</span> source
+                      and dotfiles (<span className="font-mono">.env</span>,{" "}
+                      <span className="font-mono">.git/</span>) outright rather than serving them.
+                      Anything else in <span className="font-mono">public/</span> — database dumps,
+                      backups, <span className="font-mono">composer.json</span> — becomes publicly
+                      downloadable. Move it out before switching.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={switchingRuntime}
+                        onClick={async () => {
+                          setSwitchingRuntime(true);
+                          setRuntimeMessage("");
+                          try {
+                            const updated = await api.put<Site>(`/sites/${id}/runtime`, { runtime: "static" });
+                            setSite(updated);
+                            setRuntimeTarget(null);
+                            setRuntimeMessage("Switched to static");
+                          } catch (err) {
+                            setRuntimeMessage(err instanceof Error ? err.message : "Switch failed");
+                          } finally {
+                            setSwitchingRuntime(false);
+                          }
+                        }}
+                        className="text-xs px-3 py-1.5 rounded-lg bg-danger-600 text-white hover:bg-danger-500 disabled:opacity-50"
+                      >
+                        Switch to static
+                      </button>
+                      <button
+                        type="button"
+                        disabled={switchingRuntime}
+                        onClick={() => { setRuntimeTarget(null); setRuntimeMessage(""); }}
+                        className="text-xs px-3 py-1.5 rounded-lg border border-dark-600 text-dark-100 hover:text-dark-50"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </dd>
           </div>
           {site.proxy_port && (
@@ -676,12 +1046,51 @@ export default function SiteDetail() {
                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
                       <path fillRule="evenodd" d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z" clipRule="evenodd" />
                     </svg>
-                    Enabled (Let's Encrypt)
+                    {sslProvenance?.provenance === "foreign" && sslProvenance.issuer
+                      ? `Enabled (${sslProvenance.issuer})`
+                      : sslProvenance?.provenance === "dockpanel"
+                        ? "Enabled (Let's Encrypt)"
+                        : "Enabled"}
                   </span>
                   {site.ssl_expiry && (
                     <p className="text-xs text-dark-200">
                       Expires: {new Date(site.ssl_expiry).toLocaleDateString()}
                     </p>
+                  )}
+                  {sslProvenance?.provenance === "foreign" && (
+                    <p className="text-xs text-dark-300">
+                      DockPanel did not issue this certificate and will not renew it. Renew it
+                      wherever it was issued, then install the replacement here.
+                    </p>
+                  )}
+                  {/* ⛔ THE CONTROL THAT WAS MISSING. Three separate refusals in
+                      this product tell the operator to "install a replacement
+                      under the site's SSL tab" — the renew door, the security
+                      scanner's declined-renewal alert and the DNS-01 renewal
+                      plan. Every SSL control, the upload form included, used to
+                      live in the `else` branch below, so once SSL was on there
+                      was nothing on this page to act on. Revoke is admin-only
+                      and the certificate list's controls are admin-only too, so
+                      a site's own non-admin owner holding a commercial
+                      certificate had NO reachable path at all: the panel
+                      correctly declined to renew, then named a control that did
+                      not exist. The form itself is shared with the `else`
+                      branch — see below the ternary — so this is a disclosure,
+                      not a second copy. */}
+                  {site.status === "active" && (
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setShowSslUpload(!showSslUpload)}
+                        aria-expanded={showSslUpload}
+                        className="text-xs text-dark-300 hover:text-dark-100 underline decoration-dotted underline-offset-2 transition-colors"
+                      >
+                        Replace certificate
+                      </button>
+                      <p className="mt-1 text-xs text-dark-400">
+                        Paste a certificate and private key you already hold. You renew it yourself.
+                      </p>
+                    </div>
                   )}
                 </div>
               ) : (
@@ -691,7 +1100,7 @@ export default function SiteDetail() {
                     {site.status === "active" && (
                       <>
                         <button
-                          onClick={handleProvisionSSL}
+                          onClick={() => handleProvisionSSL()}
                           disabled={provisioning || prereqBlocks(dnsPrereq)}
                           title={prereqBlocks(dnsPrereq) ? dnsPrereq?.title : undefined}
                           className="px-3 py-1 bg-rust-500 text-white rounded-md text-xs font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
@@ -762,54 +1171,6 @@ export default function SiteDetail() {
                       </div>
                     </div>
                   )}
-                  {showSslUpload && (
-                    <div className="mt-3 space-y-3">
-                      <textarea value={sslCert} onChange={e => setSslCert(e.target.value)}
-                        placeholder={"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"}
-                        rows={4} className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-xs font-mono text-dark-100 focus:ring-2 focus:ring-accent-500 outline-none" />
-                      <textarea value={sslKey} onChange={e => setSslKey(e.target.value)}
-                        placeholder={"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"}
-                        rows={4} className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-xs font-mono text-dark-100 focus:ring-2 focus:ring-accent-500 outline-none" />
-                      <button disabled={uploadingSsl || !sslCert || !sslKey} onClick={async () => {
-                        setUploadingSsl(true);
-                        setSslMessage("");
-                        try {
-                          await api.post(`/sites/${id}/ssl/upload`, { certificate: sslCert, private_key: sslKey });
-                          setSslMessage("Custom SSL certificate installed successfully!");
-                          setSslMessageIsError(false);
-                          setSslCert(""); setSslKey(""); setShowSslUpload(false);
-                          const updated = await api.get<Site>(`/sites/${id}`);
-                          setSite(updated);
-                        } catch (e) {
-                          setSslMessage(e instanceof Error ? e.message : "Upload failed");
-                          setSslMessageIsError(true);
-                        }
-                        finally { setUploadingSsl(false); }
-                      }} className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50">
-                        {uploadingSsl ? "Installing..." : "Install Certificate"}
-                      </button>
-                    </div>
-                  )}
-
-                  {/* The result of the button the user just pressed, BESIDE that
-                      button. This used to render ~1400 lines further down the
-                      page, at the very bottom of the document — so a perfectly
-                      good 412 explaining the DNS problem was on screen but
-                      nowhere the user would ever look, and clicking "Let's
-                      Encrypt" appeared to do nothing at all (s252 F1). */}
-                  {sslMessage && (
-                    <div
-                      role="alert"
-                      className={`mt-3 px-3 py-2 rounded text-xs ${
-                        sslMessageIsError
-                          ? "bg-danger-500/10 text-danger-400 border border-danger-500/20"
-                          : "bg-rust-500/10 text-rust-400 border border-rust-500/20"
-                      }`}
-                    >
-                      {sslMessage}
-                    </div>
-                  )}
-
                   {/* The prerequisite itself: what is wrong, what we expected,
                       what we saw, and the exact record to create. */}
                   {site.status === "active" && (
@@ -820,6 +1181,102 @@ export default function SiteDetail() {
                       className="mt-3"
                     />
                   )}
+                </div>
+              )}
+
+              {/* ⛔ SHARED BY BOTH BRANCHES, WHICH IS THE WHOLE POINT — hoisted
+                  out of the `else` above rather than copied into the `true`
+                  side. Two instances would mean two `showSslUpload` reads of one
+                  state and a second success handler to drift, and a duplicated
+                  form is exactly what a later reader deletes "as dead code" from
+                  whichever branch they happened to be looking at. Every piece of
+                  state it touches was already declared at component scope, so
+                  the move needs no lifting and no props. */}
+              {showSslUpload && (
+                <div className="mt-3 space-y-3">
+                  <textarea value={sslCert} onChange={e => setSslCert(e.target.value)}
+                    placeholder={"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"}
+                    rows={4} className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-xs font-mono text-dark-100 focus:ring-2 focus:ring-accent-500 outline-none" />
+                  <textarea value={sslKey} onChange={e => setSslKey(e.target.value)}
+                    placeholder={"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"}
+                    rows={4} className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-xs font-mono text-dark-100 focus:ring-2 focus:ring-accent-500 outline-none" />
+                  <button disabled={uploadingSsl || !sslCert || !sslKey} onClick={async () => {
+                    setUploadingSsl(true);
+                    setSslMessage("");
+                    try {
+                      await api.post(`/sites/${id}/ssl/upload`, { certificate: sslCert, private_key: sslKey });
+                      setSslMessage("Custom SSL certificate installed successfully!");
+                      setSslMessageIsError(false);
+                      setSslCert(""); setSslKey(""); setShowSslUpload(false);
+                      const updated = await api.get<Site>(`/sites/${id}`);
+                      setSite(updated);
+                      // The badge names the issuer, so replacing the certificate
+                      // must re-ask who issued it. `ssl_enabled` was already true
+                      // on a replace, so the effect keyed on it does NOT re-run.
+                      loadSslProvenance();
+                    } catch (e) {
+                      setSslMessage(e instanceof Error ? e.message : "Upload failed");
+                      setSslMessageIsError(true);
+                    }
+                    finally { setUploadingSsl(false); }
+                  }} className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50">
+                    {uploadingSsl ? "Installing..." : "Install Certificate"}
+                  </button>
+                </div>
+              )}
+
+              {/* The refusal that used to be a dead end. The agent's
+                  provision writer declines by default over a certificate
+                  this product did not issue — correct, since a purchased
+                  wildcard or an Origin CA cert is a paid asset nobody asked
+                  to have replaced — but until this control existed the only
+                  way past it was `dockpanel ssl provision --force` on the
+                  CLI, with the panel's own button offering no path forward
+                  at all. This asks the SAME confirmation the CLI's `--force`
+                  requires: read what would be lost, then say so explicitly. */}
+              {foreignCertRefusal && (
+                <div
+                  role="alert"
+                  className="mt-3 px-3 py-2 rounded text-xs bg-warn-500/10 text-warn-400 border border-warn-500/20 space-y-2"
+                >
+                  <p>{foreignCertRefusal.message}</p>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      disabled={forcingSsl}
+                      onClick={foreignCertRefusal.retry}
+                      className="px-3 py-1 bg-danger-500/20 text-danger-400 rounded-md text-xs font-medium hover:bg-danger-500/30 disabled:opacity-50 transition-colors"
+                    >
+                      {forcingSsl ? "Replacing..." : "Replace it anyway"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={forcingSsl}
+                      onClick={() => setForeignCertRefusal(null)}
+                      className="text-xs text-dark-300 hover:text-dark-100 underline decoration-dotted underline-offset-2 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* The result of the button the user just pressed, BESIDE that
+                  button. This used to render ~1400 lines further down the
+                  page, at the very bottom of the document — so a perfectly
+                  good 412 explaining the DNS problem was on screen but
+                  nowhere the user would ever look, and clicking "Let's
+                  Encrypt" appeared to do nothing at all (s252 F1). */}
+              {sslMessage && (
+                <div
+                  role="alert"
+                  className={`mt-3 px-3 py-2 rounded text-xs ${
+                    sslMessageIsError
+                      ? "bg-danger-500/10 text-danger-400 border border-danger-500/20"
+                      : "bg-rust-500/10 text-rust-400 border border-rust-500/20"
+                  }`}
+                >
+                  {sslMessage}
                 </div>
               )}
             </dd>
@@ -980,6 +1437,17 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Bandwidth Quota (MB/mo)</label>
+                <input
+                  type="number"
+                  value={bandwidthQuota}
+                  onChange={(e) => setBandwidthQuota(e.target.value)}
+                  placeholder="Unlimited"
+                  min="1"
+                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
+                />
+              </div>
               {site.runtime === "php" && (
                 <>
                   <div>
@@ -1025,10 +1493,42 @@ export default function SiteDetail() {
               </p>
             </div>
 
+            {bandwidthUsage && (
+              <div>
+                <div className="flex items-center justify-between text-xs text-dark-300 mb-1">
+                  <span>
+                    Bandwidth this month ({bandwidthUsage.year_month}):{" "}
+                    {(bandwidthUsage.used_bytes_this_month / 1024 / 1024).toFixed(1)} MB
+                    {site.bandwidth_quota_mb ? ` of ${site.bandwidth_quota_mb} MB` : " (unlimited)"}
+                  </span>
+                </div>
+                {site.bandwidth_quota_mb != null && (
+                  <div className="w-full h-1.5 bg-dark-700 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full ${
+                        bandwidthUsage.used_bytes_this_month / 1024 / 1024 > site.bandwidth_quota_mb
+                          ? "bg-danger-500"
+                          : bandwidthUsage.used_bytes_this_month / 1024 / 1024 > site.bandwidth_quota_mb * 0.8
+                          ? "bg-warn-500"
+                          : "bg-rust-500"
+                      }`}
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          (bandwidthUsage.used_bytes_this_month / 1024 / 1024 / site.bandwidth_quota_mb) * 100
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="flex items-center justify-between">
               <p className="text-xs text-dark-300">
                 {rateLimit ? `${rateLimit} req/s per IP` : "No rate limit"} · {maxUpload} MB uploads
                 {site.runtime === "php" ? ` · ${phpMemory} MB memory · ${phpWorkers} workers` : ""}
+                {bandwidthQuota ? ` · ${bandwidthQuota} MB/mo bandwidth` : " · Unlimited bandwidth"}
               </p>
               <div className="flex items-center gap-3">
                 {limitsMessage && (
@@ -1048,9 +1548,14 @@ export default function SiteDetail() {
                         php_memory_mb: parseInt(phpMemory) || 256,
                         php_max_workers: parseInt(phpWorkers) || 5,
                         custom_nginx: customNginx || null,
+                        bandwidth_quota_mb: bandwidthQuota ? parseInt(bandwidthQuota) : null,
                       });
                       setSite(updated);
-                      setLimitsMessage("Limits saved");
+                      setLimitsMessage(
+                        updated.enabled && site.enabled === false
+                          ? "Limits saved — site re-enabled"
+                          : "Limits saved"
+                      );
                     } catch (err) {
                       setLimitsMessage(err instanceof Error ? err.message : "Save failed");
                     } finally {
@@ -1100,7 +1605,7 @@ export default function SiteDetail() {
                 }}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
                   site.fastcgi_cache
-                    ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
                     : "bg-rust-500 text-white hover:bg-rust-600"
                 }`}
               >
@@ -1174,7 +1679,7 @@ export default function SiteDetail() {
                 }}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
                   site.redis_cache
-                    ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
                     : "bg-rust-500 text-white hover:bg-rust-600"
                 }`}
               >
@@ -1206,6 +1711,126 @@ export default function SiteDetail() {
                 </span>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* SFTP Access */}
+      {site.status === "active" && (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
+          <div className="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SFTP Access</h2>
+            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+              site.sftp_enabled ? "bg-rust-500/10 text-rust-400" : "bg-dark-700 text-dark-300"
+            }`}>
+              {site.sftp_enabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
+          <div className="p-5 space-y-4">
+            <p className="text-sm text-dark-200">
+              Gives this site its own Linux account, chrooted to its own files — nothing outside this
+              site is ever reachable over the connection. Enabling it re-owns the site's existing
+              content directory; this only happens once, when you click Enable.
+            </p>
+            {site.sftp_enabled && site.sftp_uid != null && (
+              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                <div>
+                  <div className="text-dark-400 uppercase tracking-wide mb-1">Username</div>
+                  <div className="text-dark-100">sftp{site.sftp_uid}</div>
+                </div>
+                <div>
+                  <div className="text-dark-400 uppercase tracking-wide mb-1">Host / Port</div>
+                  <div className="text-dark-100">{site.domain} / 22</div>
+                </div>
+              </div>
+            )}
+            <div className="flex items-center gap-3">
+              <button
+                disabled={sftpToggling}
+                onClick={async () => {
+                  setSftpToggling(true);
+                  setSftpMsg("");
+                  setSftpPassword(null);
+                  try {
+                    const path = site.sftp_enabled ? "disable" : "enable";
+                    const result = await api.post<{ sftp_enabled: boolean }>(`/sites/${id}/sftp/${path}`);
+                    // sftp_uid isn't in this response — the toggle endpoints only
+                    // confirm the new state; re-fetching the site is what picks up
+                    // the allocated uid after an enable.
+                    setSite(s => s ? { ...s, sftp_enabled: result.sftp_enabled } : s);
+                    if (result.sftp_enabled) {
+                      const fresh = await api.get<Site>(`/sites/${id}`);
+                      setSite(fresh);
+                    }
+                    setSftpMsg(site.sftp_enabled ? "SFTP disabled" : "SFTP enabled");
+                  } catch (e) {
+                    setSftpMsg(e instanceof Error ? e.message : "Toggle failed");
+                  } finally {
+                    setSftpToggling(false);
+                  }
+                }}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+                  site.sftp_enabled
+                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
+                    : "bg-rust-500 text-white hover:bg-rust-600"
+                }`}
+              >
+                {sftpToggling ? "..." : site.sftp_enabled ? "Disable SFTP" : "Enable SFTP"}
+              </button>
+              {site.sftp_enabled && (
+                <button
+                  disabled={sftpResetting}
+                  onClick={async () => {
+                    setSftpResetting(true);
+                    setSftpMsg("");
+                    try {
+                      const result = await api.post<{ password: string }>(`/sites/${id}/sftp/reset-password`);
+                      setSftpPassword(result.password);
+                    } catch (e) {
+                      setSftpMsg(e instanceof Error ? e.message : "Reset failed");
+                    } finally {
+                      setSftpResetting(false);
+                    }
+                  }}
+                  className="px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors"
+                >
+                  {sftpResetting ? "Resetting..." : "Reset Password"}
+                </button>
+              )}
+              {sftpMsg && (
+                <span className={`text-xs ${sftpMsg.includes("failed") || sftpMsg.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
+                  {sftpMsg}
+                </span>
+              )}
+            </div>
+            {sftpPassword && (
+              <div className="bg-dark-900 rounded-lg border border-accent-500/30 p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-xs font-medium text-accent-400 uppercase font-mono tracking-widest">
+                    Password Reset Successful
+                  </h3>
+                  <button
+                    onClick={() => setSftpPassword(null)}
+                    className="text-dark-400 hover:text-dark-200 text-sm"
+                    aria-label="Dismiss"
+                  >
+                    &times;
+                  </button>
+                </div>
+                <p className="text-xs text-dark-300 mb-2">Save this password now — it will not be shown again after you leave this page.</p>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 bg-dark-800 border border-dark-500 rounded-lg px-3 py-2 text-sm font-mono text-dark-50">
+                    {sftpPassword}
+                  </code>
+                  <button
+                    onClick={() => copyToClipboard(sftpPassword, "sftp_password")}
+                    className="shrink-0 px-3 py-2 bg-dark-700 text-dark-200 rounded-lg text-xs hover:bg-dark-600 transition-colors"
+                  >
+                    {copied === "sftp_password" ? "Copied!" : "Copy"}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1253,7 +1878,7 @@ export default function SiteDetail() {
                 }}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
                   site.waf_enabled
-                    ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
                     : "bg-rust-500 text-white hover:bg-rust-600"
                 }`}
               >
@@ -1570,7 +2195,7 @@ export default function SiteDetail() {
                       {pendingConfirm.label}
                     </span>
                     <div className="flex items-center gap-2 shrink-0 ml-4">
-                      <button onClick={executeConfirm} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">
+                      <button onClick={executeConfirm} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-600 transition-colors">
                         Confirm
                       </button>
                       <button onClick={() => setPendingConfirm(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">
@@ -1639,8 +2264,23 @@ export default function SiteDetail() {
             ) : (
               <div className="space-y-3">
                 <p className="text-sm text-dark-200">
-                  Create a staging copy of this site to test changes before going live.
+                  Create a staging copy of this site's files to test changes before going live.
+                  Only files are cloned — if this site has a database attached, staging reads
+                  and writes that SAME live database; it is not isolated.
                 </p>
+                {pendingConfirm && pendingConfirm.type === "staging_create_db_ack" && (
+                  <div className="px-4 py-3 rounded-lg border border-warn-500/30 bg-warn-500/5 flex items-center justify-between">
+                    <span className="text-xs font-mono text-warn-400">{pendingConfirm.label}</span>
+                    <div className="flex items-center gap-2 shrink-0 ml-4">
+                      <button onClick={executeConfirm} className="px-3 py-1.5 bg-warn-600 text-white text-xs font-bold uppercase tracking-wider hover:bg-warn-600 transition-colors">
+                        Continue Anyway
+                      </button>
+                      <button onClick={() => setPendingConfirm(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {showStagingForm ? (
                   <div className="flex items-end gap-3">
                     <div className="flex-1">
@@ -1668,7 +2308,12 @@ export default function SiteDetail() {
                           setShowStagingForm(false);
                           setStagingMessage("Staging environment created");
                         } catch (e) {
-                          setStagingMessage(e instanceof Error ? e.message : "Creation failed");
+                          const message = e instanceof Error ? e.message : "Creation failed";
+                          if (message.includes("attached database")) {
+                            setPendingConfirm({ type: "staging_create_db_ack", label: `${message} Continue anyway?` });
+                          } else {
+                            setStagingMessage(message);
+                          }
                         } finally {
                           setStagingLoading(false);
                         }
@@ -1685,12 +2330,16 @@ export default function SiteDetail() {
                     </button>
                   </div>
                 ) : (
-                  <button
-                    onClick={() => setShowStagingForm(true)}
-                    className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
-                  >
-                    Create Staging
-                  </button>
+                  /* See the Clone control above — a staging environment is a new
+                     domain and `ensure_claimable` refuses it for a client. */
+                  !isClient && (
+                    <button
+                      onClick={() => setShowStagingForm(true)}
+                      className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
+                    >
+                      Create Staging
+                    </button>
+                  )
                 )}
                 {stagingMessage && (
                   <p className={`text-xs ${stagingMessage.includes("failed") || stagingMessage.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
@@ -1999,7 +2648,10 @@ export default function SiteDetail() {
                 </div>
               )}
 
-              {/* Add alias form */}
+              {/* Add alias form — an alias IS a new domain
+                  (`ensure_claimable`), so it is not a client's to add. Existing
+                  aliases stay listed above: they are part of the site they hold. */}
+              {!isClient && (
               <div className="flex items-end gap-3">
                 <div className="flex-1">
                   <label className="block text-xs font-medium text-dark-200 mb-1">Domain Alias</label>
@@ -2024,11 +2676,13 @@ export default function SiteDetail() {
                       setAliasMsg(e instanceof Error ? e.message : "Failed");
                     }
                   }}
-                  className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
+                  disabled={!newAlias.trim()}
+                  className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Add Alias
                 </button>
               </div>
+              )}
 
               {aliasMsg && (
                 <p className={`text-xs ${aliasMsg.includes("Failed") || aliasMsg.includes("failed") ? "text-danger-400" : "text-rust-400"}`}>
@@ -2178,16 +2832,23 @@ export default function SiteDetail() {
                   {phpExts.available.filter(e => !phpExts.installed.includes(e)).map(ext => (
                     <button key={ext} disabled={installingExt === ext} onClick={async () => {
                       setInstallingExt(ext);
+                      setExtMessage("");
                       try {
                         await api.post("/php/extensions/install", { version: site?.php_version, extension: ext });
                         loadPhpExtensions();
-                      } catch {}
+                      } catch (e) {
+                        // Without this the spinner simply stopped and the
+                        // extension stayed in "Available" — the operator's only
+                        // clue that anything had gone wrong.
+                        setExtMessage(e instanceof Error ? e.message : `Could not install ${ext}`);
+                      }
                       finally { setInstallingExt(null); }
                     }} className="px-2 py-0.5 bg-dark-700 text-dark-200 rounded text-xs font-mono hover:bg-dark-600 disabled:opacity-50">
                       {installingExt === ext ? "..." : ext}
                     </button>
                   ))}
                 </div>
+                {extMessage && <p className="text-xs text-danger-400 mt-2">{extMessage}</p>}
               </div>
             </div>
           )}

@@ -3,6 +3,7 @@ import { useParams, Link } from "react-router-dom";
 import { api } from "../api";
 import { formatDate } from "../utils/format";
 import ProvisionLog from "../components/ProvisionLog";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 interface DeployConfig {
   id: string;
@@ -42,6 +43,7 @@ interface ReleaseInfo {
 
 export default function Deploy() {
   const { id } = useParams<{ id: string }>();
+  const [siteDomain, setSiteDomain] = useState<string | null>(null);
   const [config, setConfig] = useState<DeployConfig | null>(null);
   const [logs, setLogs] = useState<DeployLog[]>([]);
   const [releases, setReleases] = useState<ReleaseInfo[]>([]);
@@ -64,14 +66,20 @@ export default function Deploy() {
   const [atomicDeploy, setAtomicDeploy] = useState(false);
   const [keepReleases, setKeepReleases] = useState(5);
 
+  // Settled, not all-or-nothing: these are two independent GETs (deploy config,
+  // deploy logs), and a rejection from either used to fall into one bare catch
+  // that never set `config` — so a genuinely-configured site with a broken
+  // logs fetch looked identical to "never configured". See Databases.tsx's
+  // loadTableDetails for the same fix applied to the same class of bug.
   const load = async () => {
-    try {
-      const [cfg, logData] = await Promise.all([
-        api.get<DeployConfig | null>(`/sites/${id}/deploy`),
-        api.get<DeployLog[]>(`/sites/${id}/deploy/logs?limit=20`),
-      ]);
+    const [cfgResult, logsResult] = await Promise.allSettled([
+      api.get<DeployConfig | null>(`/sites/${id}/deploy`),
+      api.get<DeployLog[]>(`/sites/${id}/deploy/logs?limit=20`),
+    ]);
+
+    if (cfgResult.status === "fulfilled") {
+      const cfg = cfgResult.value;
       setConfig(cfg);
-      setLogs(logData);
       if (cfg) {
         setRepoUrl(cfg.repo_url);
         setBranch(cfg.branch);
@@ -87,14 +95,33 @@ export default function Deploy() {
           } catch { /* no releases yet */ }
         }
       }
-    } catch {
-      // No config yet — that's fine
-    } finally {
-      setLoading(false);
     }
+
+    if (logsResult.status === "fulfilled") {
+      setLogs(logsResult.value);
+    }
+
+    const failed = [
+      cfgResult.status === "rejected" ? "deploy config" : null,
+      logsResult.status === "rejected" ? "deploy logs" : null,
+    ].filter(Boolean) as string[];
+    if (failed.length) {
+      const rejected = (cfgResult.status === "rejected" ? cfgResult : logsResult) as PromiseRejectedResult;
+      const detail = rejected.reason instanceof Error ? rejected.reason.message : "request failed";
+      setMessage({ text: `Could not load ${failed.join(" or ")}: ${detail}`, type: "error" });
+    }
+
+    setLoading(false);
   };
 
   useEffect(() => { load(); }, [id]);
+
+  // Breadcrumb-only: the domain, not the site's full record — same
+  // best-effort fetch Backups.tsx/Crons.tsx/Files.tsx already do for their
+  // own "Sites / {domain} / ..." trail.
+  useEffect(() => {
+    api.get<{ domain: string }>(`/sites/${id}`).then((s) => setSiteDomain(s.domain)).catch(() => {});
+  }, [id]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -219,7 +246,7 @@ export default function Deploy() {
       <div>
         <Link to="/sites" className="text-sm text-dark-200 hover:text-dark-100">Sites</Link>
         <span className="text-sm text-dark-300 mx-2">/</span>
-        <Link to={`/sites/${id}`} className="text-sm text-dark-200 hover:text-dark-100">Site</Link>
+        <Link to={`/sites/${id}`} className="text-sm text-dark-200 hover:text-dark-100 font-mono">{siteDomain || "Site"}</Link>
         <span className="text-sm text-dark-300 mx-2">/</span>
         <span className="text-sm text-dark-50 font-medium">Git Deploy</span>
       </div>
@@ -256,15 +283,14 @@ export default function Deploy() {
         </div>
       )}
 
-      {/* Inline confirmation */}
+      {/* Issue #120: portalled so arming Rollback (far down the Releases list) can't leave the prompt off-screen. */}
       {pendingConfirm && (
-        <div className="border border-danger-500/30 bg-danger-500/5 rounded-lg px-4 py-3 flex items-center justify-between">
-          <span className="text-xs text-danger-400 font-mono">{pendingConfirm.label}</span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeConfirm} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">Confirm</button>
-            <button onClick={() => setPendingConfirm(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">Cancel</button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={pendingConfirm.label}
+          tone="danger"
+          onConfirm={executeConfirm}
+          onCancel={() => setPendingConfirm(null)}
+        />
       )}
 
       {/* Deploy provisioning log */}
@@ -345,7 +371,7 @@ export default function Deploy() {
                   onChange={(e) => setAtomicDeploy(e.target.checked)}
                   className="sr-only peer"
                 />
-                <div className="w-11 h-6 bg-dark-600 peer-focus:ring-2 peer-focus:ring-accent-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-rust-500" />
+                <div className="w-11 h-6 bg-dark-600 peer-focus:ring-2 peer-focus:ring-accent-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-dark-500 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-rust-500" />
               </label>
             </div>
             {atomicDeploy && (

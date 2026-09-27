@@ -145,15 +145,24 @@ dockpanel db -f analytics
 Create a new database in a Docker container.
 
 ```bash
-dockpanel db create blog_db --engine mysql --password "s3cureP@ss" --port 3307
+# Prefer --password-stdin — a bare --password is visible to other local
+# users via `ps`/`/proc` for the life of the process and lands in shell
+# history.
+echo -n "s3cureP@ss" | dockpanel db create blog_db --engine mysql --password-stdin --port 3307
+
+# Or omit both --password and --password-stdin for an interactive, masked prompt.
+dockpanel db create blog_db --engine mysql --port 3307
 ```
 
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `NAME` | Yes | Database name |
 | `--engine` | Yes | Engine: `mysql`, `mariadb`, or `postgres` |
-| `--password` | Yes | Root/admin password |
+| `--password` | No | Root/admin password. Discouraged — visible via shell history and `ps`. |
+| `--password-stdin` | No | Read the root/admin password from stdin instead |
 | `--port` | Yes | Host port to expose |
+
+If neither `--password` nor `--password-stdin` is given, the CLI prompts interactively.
 
 ```
 Database created: blog_db
@@ -210,7 +219,7 @@ prometheus        monitoring    Prometheus       Metrics collection
 uptime-kuma       monitoring    Uptime Kuma      Uptime monitoring
 nextcloud         storage       Nextcloud        Self-hosted cloud storage
 ...
-(153 templates across 14 categories)
+(147 templates across 14 categories)
 ```
 
 #### `dockpanel apps deploy`
@@ -278,6 +287,13 @@ Deploy from a Docker Compose file.
 dockpanel apps compose /path/to/docker-compose.yml
 ```
 
+A stack deployed this way carries no domain. To front a stack with a domain — over
+Let's Encrypt or a registered certificate — create it through the panel
+(`POST /api/stacks`), which records how the domain is served. Registered
+certificates are managed from the panel, not the CLI: the CLI speaks to the agent
+alone, and a certificate the panel's database does not know cannot be referenced by
+a stack.
+
 ---
 
 ### `dockpanel services`
@@ -320,15 +336,14 @@ dockpanel ssl status example.com
 ```
 
 ```
-SSL CERTIFICATE
-─────────────────────────────────
-Domain:      example.com
-Issuer:      Let's Encrypt
-Valid From:  2026-03-15
-Expires:     2026-06-13
-Days Left:   85
-Auto-Renew:  yes
+SSL Certificate: example.com
+  Issuer:      R11
+  Expires:     2026-06-13 09:41:07.0 +00:00:00
+  Remaining:   85 days
 ```
+
+The days remaining are coloured: green above 30, amber above 7, red at or below.
+A domain with no certificate prints `No SSL certificate for example.com`.
 
 #### `dockpanel ssl provision`
 
@@ -344,6 +359,28 @@ dockpanel ssl provision example.com --email admin@example.com --runtime php
 | `--email` | Yes | | Let's Encrypt email |
 | `--runtime` | No | `static` | Site runtime: `static`, `php`, or `proxy` |
 | `--proxy-port` | No | | Upstream port (for proxy runtime) |
+| `--force` | No | | Issue even if the installed certificate came from elsewhere — it will be **replaced** |
+
+**Ordering over somebody else's certificate is refused.** Provisioning writes
+`fullchain.pem` and `privkey.pem` into `/etc/dockpanel/ssl/<domain>/`, so a
+domain already serving a purchased, Origin CA or corporate PKI certificate would
+have it destroyed rather than refreshed. The agent checks the installed
+certificate's issuer first and refuses by name:
+
+```
+Refusing to issue a Let's Encrypt certificate for example.com: the certificate
+already installed there was issued by DigiCert Inc, not by DockPanel, and
+ordering would overwrite it. Renew it wherever it was issued, or pass --force if
+you intend to replace it.
+```
+
+A certificate whose issuer cannot be read is **not** treated as somebody else's —
+refusing on doubt is how a real certificate lapses. The same guard covers
+`dockpanel sites create --ssl` and `dockpanel apply`, because it lives at the
+point where the file is written rather than at each command.
+
+> There is no `dockpanel ssl renew`. Renewal is the panel's job — the weekly
+> security scan reissues what it owns, including Compose stacks since 2.161.0.
 
 ---
 
@@ -390,9 +427,15 @@ Restoring example.com from example.com_2026-03-20_143022.tar.gz...
   Content: files only (this archive holds no database)
 ```
 
-Restoring an archive that carries database dumps **fails** from the CLI — it cannot supply the
-database credentials the agent needs, and it will not restore the files and call that success.
-Use the panel for those.
+Restoring an archive that carries database dumps works from the CLI when a panel API key is
+configured (`Settings → API Keys`, saved to `/etc/dockpanel/backend.token`) — `backup restore`
+prefers that path automatically, restoring files and databases through the same route the panel
+UI's own Restore button uses, then following its progress stream to completion.
+
+Without a configured key, `backup restore` falls back to the older agent-direct path (files
+only, same behavior as before this existed): it **fails** on a DB-bearing archive rather than
+restoring the files and calling that success, and its error message points you at minting a key
+or restoring from the panel instead.
 
 #### `dockpanel backup delete`
 
@@ -445,15 +488,11 @@ dockpanel security
 ```
 
 ```
-SECURITY OVERVIEW
-─────────────────────────────────
-Score:           82/100
-Firewall:        active (UFW)
-Fail2Ban:        active (3 jails)
-SSH Root Login:  disabled
-SSH Password:    disabled
-2FA:             enabled
-Last Scan:       2026-03-19 02:00
+Security Overview
+  Firewall:    active
+  Fail2ban:    active
+  SSH root:    disabled
+  SSH password: disabled
 ```
 
 #### `dockpanel security scan`
@@ -466,18 +505,19 @@ dockpanel security scan
 
 ```
 Running security scan...
+Scan Results
+  Risk level:  warning
 
-FINDINGS
-  [HIGH]   Port 3306 exposed to all IPs
-  [MEDIUM] SSH password authentication still enabled
-  [LOW]    Unattended upgrades not configured
-  [PASS]   Firewall active
-  [PASS]   Fail2Ban running
-  [PASS]   SSH root login disabled
-  [PASS]   SSL certificates valid
+  [warning] Unexpected open port: 3306
+  [warning] SSH password authentication still enabled
+  [info]    Unattended upgrades not configured
 
-Score: 78/100 (3 findings)
+3 finding(s)
 ```
+
+Risk level and each finding's severity are one of `critical`/`warning`/`info`,
+derived from the findings the scan actually returns — there is no
+separate numeric score.
 
 #### `dockpanel security firewall`
 
@@ -488,11 +528,11 @@ dockpanel security firewall
 ```
 
 ```
-#    ACTION    FROM           PORT      PROTO
-1    allow     Anywhere       22/tcp    tcp
-2    allow     Anywhere       80/tcp    tcp
-3    allow     Anywhere       443/tcp   tcp
-4    allow     Anywhere       8443/tcp  tcp
+#      TO           ACTION     FROM
+1      22/tcp       ALLOW IN   Anywhere
+2      80/tcp       ALLOW IN   Anywhere
+3      443/tcp      ALLOW IN   Anywhere
+4      8443/tcp     ALLOW IN   Anywhere
 ```
 
 #### `dockpanel security firewall add`
@@ -646,14 +686,26 @@ dockpanel apply config.yml --email admin@example.com
 | `--dry-run` | No | Show changes without applying |
 | `--email` | No | Email for Let's Encrypt SSL provisioning |
 
+`apply` only creates resources that are missing — for sites, databases, apps and
+PHP versions it never diffs or updates something that already exists, even if the
+file describes it differently now (e.g. a changed `proxy_port` or `php_version`
+on an existing site is silently ignored). Cron jobs are the one exception: a
+matching `id` already in the crontab is compared and re-synced if its schedule or
+command changed. Firewall rules in an exported file are shown for reference only —
+`apply` never creates, updates, or removes them; manage those with
+`dockpanel security firewall`.
+
 Dry run output:
 
 ```
-DRY RUN — no changes will be made
-  [+] Create site: staging.example.com (static, SSL)
-  [~] Update site: api.example.com (proxy_port 3000 → 3001)
-  [=] No change: example.com
-  [+] Create database: staging_db (postgres, port 5434)
+Plan:
+  + site: staging.example.com (static)
+  = site: api.example.com (already exists)
+  + database: staging_db (postgres, port 5434)
+  + cron: nightly-backup (0 2 * * * /opt/scripts/backup.sh)
+  = cron: log-rotate (already exists, unchanged)
+
+3 to create, 2 existing
 ```
 
 ---

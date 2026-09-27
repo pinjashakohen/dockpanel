@@ -5,14 +5,27 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::auth::AuthUser;
-use crate::error::{internal_error, err, paginate, require_admin, ApiError};
+use crate::auth::{AdminUser, AuthUser, ServerScope};
+use crate::error::{internal_error, err, paginate, ApiError};
 use crate::AppState;
 
 #[derive(serde::Deserialize)]
 pub struct PaginationQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+/// `alert_slack_url`/`alert_discord_url` are encrypted at rest (see `create`/
+/// `update` below). The caller reading their own monitor back — to pre-fill
+/// the edit form, or in the list view — is the expected same-account case
+/// `decrypt_credential_or_legacy` exists for.
+fn decrypt_monitor_alert_urls(m: &mut Monitor, jwt_secret: &str) {
+    if let Some(ref v) = m.alert_slack_url {
+        m.alert_slack_url = Some(crate::services::secrets_crypto::decrypt_credential_or_legacy(v, jwt_secret));
+    }
+    if let Some(ref v) = m.alert_discord_url {
+        m.alert_discord_url = Some(crate::services::secrets_crypto::decrypt_credential_or_legacy(v, jwt_secret));
+    }
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -80,7 +93,7 @@ pub async fn list(
 ) -> Result<Json<Vec<Monitor>>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
 
-    let monitors: Vec<Monitor> = sqlx::query_as(
+    let mut monitors: Vec<Monitor> = sqlx::query_as(
         "SELECT * FROM monitors WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(claims.sub)
@@ -89,6 +102,10 @@ pub async fn list(
     .fetch_all(&state.db)
     .await
     .map_err(|e| internal_error("list monitors", e))?;
+
+    for m in monitors.iter_mut() {
+        decrypt_monitor_alert_urls(m, &state.config.jwt_secret);
+    }
 
     Ok(Json(monitors))
 }
@@ -105,16 +122,34 @@ pub async fn create(
     }
 
     let url = body.url.trim();
-    if monitor_type == "http" {
-        if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
-            return Err(err(StatusCode::BAD_REQUEST, "URL must start with http:// or https://"));
+    match monitor_type {
+        "http" => {
+            if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                return Err(err(StatusCode::BAD_REQUEST, "URL must start with http:// or https://"));
+            }
+            // SSRF protection: block internal URLs
+            if let Err(e) = crate::helpers::validate_url_not_internal(url).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor URL: {}", e)));
+            }
         }
-        // SSRF protection: block internal URLs
-        if let Err(e) = crate::helpers::validate_url_not_internal(url).await {
-            return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor URL: {}", e)));
+        "tcp" | "ping" => {
+            // Same SSRF boundary as the HTTP lane, on the bare host these store: a tcp
+            // monitor to 127.0.0.1:22 is an internal port probe, not a public check.
+            if url.is_empty() {
+                return Err(err(StatusCode::BAD_REQUEST, "Host/URL is required"));
+            }
+            let host = url.trim_start_matches("tcp://").trim_start_matches("ping://");
+            let probe_port = body.port.unwrap_or(80).clamp(0, 65535) as u16;
+            if let Err(e) = crate::helpers::validate_host_not_internal(host, probe_port).await {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor host: {e}")));
+            }
         }
-    } else if url.is_empty() {
-        return Err(err(StatusCode::BAD_REQUEST, "Host/URL is required"));
+        _ => {
+            // heartbeat: passive, but still needs an identifier.
+            if url.is_empty() {
+                return Err(err(StatusCode::BAD_REQUEST, "Host/URL is required"));
+            }
+        }
     }
 
     let name = body.name.trim();
@@ -141,6 +176,15 @@ pub async fn create(
         .flatten();
 
         if let Some((global_slack, global_discord)) = global {
+            // `global_slack`/`global_discord` are ciphertext (alert_rules.notify_slack_url/
+            // notify_discord_url are encrypted at rest) — decrypt before the SSRF
+            // check below, which needs a real URL, not base64.
+            let global_slack = global_slack.as_deref().map(|v| {
+                crate::services::secrets_crypto::decrypt_credential_or_legacy(v, &state.config.jwt_secret)
+            });
+            let global_discord = global_discord.as_deref().map(|v| {
+                crate::services::secrets_crypto::decrypt_credential_or_legacy(v, &state.config.jwt_secret)
+            });
             if slack_url.as_ref().map_or(true, |s| s.is_empty()) {
                 slack_url = global_slack;
             }
@@ -179,7 +223,21 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "Monitor limit reached (50)"));
     }
 
-    let monitor: Monitor = sqlx::query_as(
+    // Encrypt at rest, now that SSRF validation above has already run on the
+    // plaintext. Empty stays empty (COALESCE-free INSERT, no "leave alone"
+    // case here — this is a fresh row).
+    let encrypt_opt = |v: &Option<String>| -> Result<Option<String>, ApiError> {
+        match v {
+            Some(s) if !s.is_empty() => crate::services::secrets_crypto::encrypt_credential(s, &state.config.jwt_secret)
+                .map(Some)
+                .map_err(|e| internal_error("encrypt monitor alert URL", e)),
+            other => Ok(other.clone()),
+        }
+    };
+    let enc_slack_url = encrypt_opt(&slack_url)?;
+    let enc_discord_url = encrypt_opt(&discord_url)?;
+
+    let mut monitor: Monitor = sqlx::query_as(
         "INSERT INTO monitors (user_id, site_id, url, name, check_interval, alert_email, alert_slack_url, alert_discord_url, monitor_type, port, keyword, keyword_must_contain, custom_headers) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *",
     )
@@ -189,8 +247,8 @@ pub async fn create(
     .bind(name)
     .bind(interval)
     .bind(body.alert_email.unwrap_or(true))
-    .bind(&slack_url)
-    .bind(&discord_url)
+    .bind(&enc_slack_url)
+    .bind(&enc_discord_url)
     .bind(monitor_type)
     .bind(body.port)
     .bind(&body.keyword)
@@ -199,6 +257,8 @@ pub async fn create(
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("create monitors", e))?;
+
+    decrypt_monitor_alert_urls(&mut monitor, &state.config.jwt_secret);
 
     Ok((StatusCode::CREATED, Json(monitor)))
 }
@@ -220,17 +280,51 @@ pub async fn update(
     .await
     .map_err(|e| internal_error("update monitors", e))?;
 
-    if existing.is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "Monitor not found"));
+    let existing = match existing {
+        Some(m) => m,
+        None => return Err(err(StatusCode::NOT_FOUND, "Monitor not found")),
+    };
+
+    // A type change must be to a known type — create checks this, update did not, so a
+    // monitor could be moved to an arbitrary string and fall through the check dispatcher.
+    if let Some(ref mt) = body.monitor_type {
+        if !matches!(mt.as_str(), "http" | "tcp" | "ping" | "heartbeat") {
+            return Err(err(StatusCode::BAD_REQUEST, "monitor_type must be 'http', 'tcp', 'ping', or 'heartbeat'"));
+        }
     }
 
-    // SSRF protection: validate URL if being updated
+    // SSRF protection: validate the target if the URL/host is being updated, against the
+    // EFFECTIVE type after this update (the new type if one is supplied, else the stored
+    // one) — otherwise switching http→tcp, or setting a host on a tcp monitor, skips the
+    // guard the create path enforces.
+    let effective_type = body
+        .monitor_type
+        .as_deref()
+        .unwrap_or(existing.monitor_type.as_str());
     if let Some(ref new_url) = body.url {
         let trimmed = new_url.trim();
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            if let Err(e) = crate::helpers::validate_url_not_internal(trimmed).await {
-                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor URL: {}", e)));
+        match effective_type {
+            "http" => {
+                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    if let Err(e) = crate::helpers::validate_url_not_internal(trimmed).await {
+                        return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor URL: {}", e)));
+                    }
+                }
             }
+            "tcp" | "ping" => {
+                if !trimmed.is_empty() {
+                    let host = trimmed.trim_start_matches("tcp://").trim_start_matches("ping://");
+                    let probe_port = body
+                        .port
+                        .or(existing.port)
+                        .unwrap_or(80)
+                        .clamp(0, 65535) as u16;
+                    if let Err(e) = crate::helpers::validate_host_not_internal(host, probe_port).await {
+                        return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid monitor host: {e}")));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -250,7 +344,22 @@ pub async fn update(
         }
     }
 
-    let monitor: Monitor = sqlx::query_as(
+    // Encrypt at rest, now that SSRF validation above has already run on the
+    // plaintext body values. `None` means "leave the stored value alone" (the
+    // COALESCE below depends on that), `Some("")` means "clear it".
+    let encrypt_opt = |v: &Option<String>| -> Result<Option<String>, ApiError> {
+        match v {
+            None => Ok(None),
+            Some(s) if s.is_empty() => Ok(Some(String::new())),
+            Some(s) => crate::services::secrets_crypto::encrypt_credential(s, &state.config.jwt_secret)
+                .map(Some)
+                .map_err(|e| internal_error("encrypt monitor alert URL", e)),
+        }
+    };
+    let enc_slack_url = encrypt_opt(&body.alert_slack_url)?;
+    let enc_discord_url = encrypt_opt(&body.alert_discord_url)?;
+
+    let mut monitor: Monitor = sqlx::query_as(
         "UPDATE monitors SET \
          name = COALESCE($2, name), \
          url = COALESCE($3, url), \
@@ -272,8 +381,8 @@ pub async fn update(
     .bind(body.check_interval.map(|i| i.max(30).min(3600)))
     .bind(body.enabled)
     .bind(body.alert_email)
-    .bind(&body.alert_slack_url)
-    .bind(&body.alert_discord_url)
+    .bind(&enc_slack_url)
+    .bind(&enc_discord_url)
     .bind(&body.monitor_type)
     .bind(body.port)
     .bind(&body.keyword)
@@ -282,6 +391,8 @@ pub async fn update(
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("update monitors", e))?;
+
+    decrypt_monitor_alert_urls(&mut monitor, &state.config.jwt_secret);
 
     Ok(Json(monitor))
 }
@@ -474,7 +585,7 @@ pub async fn response_chart(
         "SELECT response_time, checked_at FROM monitor_checks \
          WHERE monitor_id = $1 AND checked_at > NOW() - INTERVAL '24 hours' AND status_code IS NOT NULL \
          ORDER BY checked_at ASC"
-    ).bind(id).fetch_all(&state.db).await.unwrap_or_default();
+    ).bind(id).fetch_all(&state.db).await.map_err(|e| internal_error("response chart points", e))?;
 
     let data: Vec<serde_json::Value> = points.iter().map(|(rt, time)| {
         serde_json::json!({ "time": time.timestamp(), "ms": rt })
@@ -510,20 +621,38 @@ pub async fn force_check(
 pub async fn status_page(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Check if status page is enabled
-    let enabled: Option<(String,)> = sqlx::query_as(
-        "SELECT value FROM settings WHERE key = 'status_page_enabled'"
-    ).fetch_optional(&state.db).await
-        .map_err(|e| internal_error("status page enabled check", e))?;
+    // The one gate every unauthenticated status-page route passes through.
+    crate::services::public_status::require_enabled(&state.db).await?;
 
-    if enabled.map(|(v,)| v).unwrap_or_else(|| "false".to_string()) != "true" {
-        return Err(err(StatusCode::NOT_FOUND, "Status page not enabled"));
-    }
+    // ⚠ SECURITY (s430): this handler is unauthenticated, and the query below
+    // MUST be scoped to the status page's owner. Created at v2.173.0, TWO
+    // releases after the identical bug was found and fixed in the sibling
+    // `incidents::public_status_page` (v2.171.0, s418) — that fix scopes every
+    // query to `owner_id` resolved from `status_page_config`; this route
+    // instead put an unscoped `WHERE enabled = true` behind a comment saying
+    // "no user filter — this is public," which on any multi-tenant install
+    // serves every OTHER tenant's monitor names/statuses to an anonymous
+    // caller of the FIRST tenant's status page. No UI ever calls this route
+    // (dead to the frontend), which is exactly why it sat unnoticed while its
+    // twin got fixed. Reuse the same owner resolution as the sibling route
+    // rather than duplicating the query.
+    let owner_id = crate::services::public_status::resolve_current_status_page_owner(&state.db).await;
 
-    // Get all enabled monitors (no user filter — this is public)
-    let monitors: Vec<(String, String, String, Option<i32>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT name, url, status, last_response_time, last_checked_at FROM monitors WHERE enabled = true ORDER BY name"
-    ).fetch_all(&state.db).await.unwrap_or_default();
+    // Get all enabled monitors belonging to the status page's owner.
+    //
+    // ⚠ The error is propagated, and on THIS route that is the whole point. An
+    // empty list renders as a status page with nothing wrong on it, which is the
+    // most reassuring page the product can serve and the one a reader consults
+    // precisely when they suspect something is. `require_enabled` above already
+    // returns on a dead pool, so what reached this line was a failure of this
+    // query alone — a statement timeout, a type mismatch — and the honest answer
+    // to "I could not read the monitors" is never "there are no monitors".
+    let monitors: Vec<(String, String, String, Option<i32>, Option<chrono::DateTime<chrono::Utc>>)> = match owner_id {
+        Some(uid) => sqlx::query_as(
+            "SELECT name, url, status, last_response_time, last_checked_at FROM monitors WHERE enabled = true AND user_id = $1 ORDER BY name"
+        ).bind(uid).fetch_all(&state.db).await.map_err(|e| internal_error("status page monitors", e))?,
+        None => Vec::new(),
+    };
 
     let items: Vec<serde_json::Value> = monitors.iter().map(|(name, _url, status, rt, checked)| {
         serde_json::json!({
@@ -543,25 +672,481 @@ pub async fn status_page(
     })))
 }
 
+/// The one severity ladder both certificate lists use.
+///
+/// `None` is `unknown`, and that rung exists because its absence was a defect: a
+/// missing expiry became 999 days and therefore the green OK badge — the most
+/// reassuring answer on the page, produced by an absence of information. Every
+/// certificate the panel did not issue arrives that way.
+///
+/// `renewal_failing` is the same argument applied to the other axis. Every rung
+/// but that one is a function of the clock alone, so a certificate whose renewal
+/// is failing right now still read `ok` for its first three hundred days and
+/// `warning` for the next twenty-three — the page described the certificate and
+/// never the machinery that is supposed to replace it. v2.157.0 made
+/// `ssl_renewal_failure` resolve itself on a successful renewal, which sharpened
+/// the gap rather than closing it: a failure that gets fixed now disappears from
+/// the Alerts list, and one that does not had nowhere on this page to appear.
+///
+/// ⚠ It sits BELOW `expired` and ABOVE everything else. `expired` outranks it
+/// because the outage has already happened and no longer depends on the renewal;
+/// it outranks `unknown` because "the renewal is failing" is a fact and `unknown`
+/// is the absence of one; and it outranks `critical`/`warning`/`ok` because those
+/// three say when the certificate dies while this says nothing is coming to save
+/// it. The days column still carries the clock, so no information is displaced.
+pub(crate) fn expiry_status(days_left: Option<i64>, renewal_failing: bool) -> &'static str {
+    match days_left {
+        Some(d) if d < 0 => "expired",
+        _ if renewal_failing => "renewal_failed",
+        None => "unknown",
+        Some(d) if d <= 7 => "critical",
+        Some(d) if d <= 30 => "warning",
+        _ => "ok",
+    }
+}
+
+/// The sites among `site_ids` whose certificate renewal is currently failing.
+///
+/// ⚠ Keyed on the THREE `state_key`s that assert a renewal did not happen, taken
+/// from `notifications::renewal_success_clears` rather than re-listed here. That
+/// function answers "does a successful renewal disprove this alert?", and its own
+/// doc gives the reason the two questions have one answer: those three are exactly
+/// the keys that say a renewal DID NOT HAPPEN, which is what makes a later success
+/// contradict them. Re-listing the keys here would be a second classification of
+/// the same six keys, free to drift from the first — and its fall-through is
+/// `false`, so a key added later is excluded from both until somebody decides.
+///
+/// The other three describe the certificate installed now, not a failure to
+/// renew: `DECLINED` is somebody else's certificate, `MAIL_HOST_CONFLICT` is a
+/// renewal deliberately refused to protect a wildcard, and `DNS01_DOWNGRADED` is
+/// a renewal that succeeded and covered fewer names. Rendering any of them as
+/// "renewal failed" would report a failure the panel did not have.
+///
+/// ⚠ `status = 'firing'` ONLY, and that is a constraint rather than a
+/// simplification. `resolve_alert` matches `status = 'firing'` in every arm, so
+/// an ACKNOWLEDGED renewal alert is never resolved by a later success — including
+/// it here would pin the rung on permanently for any operator who acknowledged
+/// the alert before fixing the cause, and the page would keep asserting a failure
+/// that a successful renewal had already disproved.
+///
+/// Scoped by `site_id` alone, for both callers. The per-caller list is already
+/// filtered to its owner's sites and the admin list to one server, so the ids ARE
+/// the scope — and routing this through a `user_id`/`server_id` arm would
+/// reproduce the shape that made `resolve_alert` miss every row the security
+/// scanner raises with no server id.
+async fn renewal_failing_sites(
+    pool: &sqlx::PgPool,
+    site_ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, ApiError> {
+    if site_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let keys: Vec<&str> = crate::services::notifications::ssl_renewal_key::ALL
+        .into_iter()
+        .filter(|k| crate::services::notifications::renewal_success_clears(k))
+        .collect();
+
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT DISTINCT site_id FROM alerts \
+         WHERE alert_type = 'ssl_renewal_failure' AND status = 'firing' \
+           AND site_id = ANY($1) AND state_key = ANY($2)",
+    )
+    .bind(site_ids)
+    .bind(&keys)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| internal_error("renewal failure lookup", e))?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// `renewal_failing_sites`'s sibling for stacks, scoped by `user_id` instead of
+/// `server_id`. `certificate_dashboard` (this function's only caller) has no
+/// server scope of its own — unlike `certificate_dashboard_for_admin`, whose
+/// own inline stack lookup is scoped to one server because `ServerScope` gives
+/// it one. `alerts.user_id` is always the stack's real owner
+/// (`renew_stack_certificate` resolves it off the `docker_stacks` row before
+/// firing), so it is the correct scope for "does THIS caller's own stack have
+/// a firing renewal failure" with no server in hand to ask.
+async fn renewal_failing_stacks_for_user(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    domains: &[String],
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    if domains.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let keys: Vec<String> = domains
+        .iter()
+        .map(|d| crate::services::security_scanner::stack_renewal_state_key(d))
+        .collect();
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT state_key FROM alerts \
+         WHERE alert_type = 'ssl_renewal_failure' AND status = 'firing' \
+           AND user_id = $1 AND state_key = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(&keys)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| internal_error("stack renewal failure lookup", e))?;
+
+    Ok(rows.into_iter().map(|(k,)| k).collect())
+}
+
 /// GET /api/monitors/certificates — List all SSL certificates with expiry status.
 pub async fn certificate_dashboard(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
+    // No `require_admin`. The query below is already `WHERE user_id = $1`, so the
+    // gate never decided WHAT this returns — only WHO is refused their own rows.
+    // The Dashboard tile that links here reads the same certificates out of
+    // `dashboard::intelligence`, which is `AuthUser` and user-scoped, so a client
+    // was told "SSL — 2 certs, expires in 9 days" and then met "Admin access
+    // required" over "No SSL certificates found" on the page the tile points at.
+    // One of those two screens was lying about the same rows; it was this one.
+    type SiteCertRow = (uuid::Uuid, String, bool, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>);
+    let certs: Vec<SiteCertRow> = sqlx::query_as(
+        "SELECT id, domain, ssl_enabled, ssl_expiry, ssl_renewal_at FROM sites WHERE user_id = $1 AND ssl_enabled = true ORDER BY ssl_expiry ASC NULLS LAST"
+    ).bind(claims.sub).fetch_all(&state.db).await.map_err(|e| internal_error("certificate list", e))?;
 
-    let certs: Vec<(uuid::Uuid, String, bool, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT id, domain, ssl_enabled, ssl_expiry FROM sites WHERE user_id = $1 AND ssl_enabled = true ORDER BY ssl_expiry ASC NULLS LAST"
-    ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
-
+    // A certificate whose expiry the panel does not know is `unknown`, not `ok`.
+    //
+    // The missing date used to become `999` days and therefore the green OK
+    // badge — the most reassuring answer available, produced by an absence of
+    // information. Every certificate the panel did not issue itself arrives
+    // that way: until v2.139.0 `upload_ssl` stored `ssl_enabled` alone, so an
+    // operator's own certificate had a NULL expiry by construction, and it is
+    // exactly the certificate nobody renews for you. `999` also flowed into the
+    // page's own countdown column, printing a confident "999d".
     let now = chrono::Utc::now();
-    let items: Vec<serde_json::Value> = certs.iter().map(|(id, domain, _, expiry)| {
-        let days_left = expiry.map(|e| (e - now).num_days()).unwrap_or(999);
-        let status = if days_left < 0 { "expired" } else if days_left <= 7 { "critical" } else if days_left <= 30 { "warning" } else { "ok" };
-        serde_json::json!({ "site_id": id, "domain": domain, "expiry": expiry, "days_left": days_left, "status": status })
+    let ids: Vec<Uuid> = certs.iter().map(|(id, _, _, _, _)| *id).collect();
+    let failing = renewal_failing_sites(&state.db, &ids).await?;
+    let mut items: Vec<serde_json::Value> = certs.iter().map(|(id, domain, _, expiry, renewal_at)| {
+        let days_left = expiry.map(|e| (e - now).num_days());
+        // `stack_id` is null on every site row: the field is still always on the
+        // wire, so the page that consumes this list never sees it appear and
+        // disappear between a site row and a stack row.
+        //
+        // `renewal_at` is the CA-suggested ARI renewal window start (RFC 9773),
+        // fetched and stored by the auto-healer's renewal cycle. Always on the
+        // wire (null on a stack row, or a site row the healer hasn't checked
+        // yet) for the same reason `stack_id` is — see above.
+        serde_json::json!({ "site_id": id, "stack_id": serde_json::Value::Null, "domain": domain, "expiry": expiry, "days_left": days_left, "status": expiry_status(days_left, failing.contains(id)), "renewal_at": renewal_at })
     }).collect();
 
+    // The caller's own Docker Compose stacks. `certificate_dashboard_for_admin`
+    // has read this table since s412; this endpoint's `stack_id` field was
+    // already on the wire (as `null` on every row above) with nothing behind
+    // it, and the frontend's `Certificate` interface has documented the field
+    // since then too — this was the missing half of that wiring. ACME-mode
+    // only, through `effective_tls_mode`: the same rule the admin list and the
+    // alert ladder both enforce.
+    let stacks: Vec<(
+        uuid::Uuid,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, domain, ssl_expiry, tls_mode, ssl_email FROM docker_stacks \
+         WHERE user_id = $1 AND domain IS NOT NULL",
+    )
+    .bind(claims.sub)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("certificate list stacks", e))?;
+
+    let acme_stacks: Vec<&(uuid::Uuid, String, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<String>)> =
+        stacks
+            .iter()
+            .filter(|(_, _, _, tls_mode, ssl_email)| {
+                crate::routes::stacks::effective_tls_mode(tls_mode.as_deref(), ssl_email.as_deref())
+                    == "acme"
+            })
+            .collect();
+
+    let stack_domains: Vec<String> = acme_stacks.iter().map(|(_, d, _, _, _)| d.clone()).collect();
+    let failing_stacks =
+        renewal_failing_stacks_for_user(&state.db, claims.sub, &stack_domains).await?;
+
+    items.extend(acme_stacks.iter().map(|(id, domain, expiry, _, _)| {
+        let days_left = expiry.map(|e| (e - now).num_days());
+        serde_json::json!({
+            "site_id": serde_json::Value::Null,
+            "stack_id": id,
+            "domain": domain,
+            "expiry": expiry,
+            "days_left": days_left,
+            "status": expiry_status(
+                days_left,
+                failing_stacks.contains(
+                    &crate::services::security_scanner::stack_renewal_state_key(domain),
+                ),
+            ),
+            // `docker_stacks` has no ssl_renewal_at column — ARI is only tracked
+            // per `sites` row today. Always on the wire, null here, for the same
+            // reason `site_id` is null on a stack row.
+            "renewal_at": serde_json::Value::Null,
+        })
+    }));
+
     Ok(Json(serde_json::json!({ "certificates": items })))
+}
+
+/// GET /api/admin/certificates — every certificate on this server, admin only.
+///
+/// A SEPARATE route rather than a role branch inside `certificate_dashboard`,
+/// because that is the shape this codebase already chose for the identical
+/// problem: `sites::list` stayed scoped to the caller and admins got
+/// `/api/admin/sites` with its own projection, so that a per-caller list can
+/// never quietly start returning other people's rows.
+///
+/// **Why it had to exist.** The agent's diagnostics walks `/etc/dockpanel/ssl`
+/// on the HOST and raises "SSL certificate expiring soon: {domain}" for anything
+/// it finds, so an administrator on a multi-tenant box was shown a finding — with
+/// a Fix button — about a certificate that appeared on no list they could open.
+/// The API would already let them renew it (`SITE_CALLER_PREDICATE` carries an
+/// admin arm); only the list refused. The finding and the list disagreed about
+/// what existed.
+///
+/// So this returns the union of two populations, and says which is which:
+///   * every SSL-enabled site row on this server, with its owner resolved, and
+///   * every certificate the host actually holds that no such row explains —
+///     a DNS-01 wildcard apex, a Docker app's certificate (Docker apps have no
+///     table at all), one installed by hand.
+///
+/// The second half needs an agent that can enumerate certificates. An older
+/// agent has no such route, and the honest answer to that is to say so rather
+/// than to imply the list is complete: `host_scan` reports whether the disk was
+/// actually read. A limitation the product will not speak at the moment it bites
+/// is, from the operator's chair, an undocumented one.
+pub async fn certificate_dashboard_for_admin(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    ServerScope(server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    type AdminCertRow = (uuid::Uuid, String, Option<chrono::DateTime<chrono::Utc>>, Option<String>, Option<chrono::DateTime<chrono::Utc>>);
+    let certs: Vec<AdminCertRow> =
+        sqlx::query_as(
+            "SELECT s.id, s.domain, s.ssl_expiry, u.email AS owner_email, s.ssl_renewal_at \
+             FROM sites s LEFT JOIN users u ON u.id = s.user_id \
+             WHERE s.server_id = $1 AND s.ssl_enabled = true \
+             ORDER BY s.ssl_expiry ASC NULLS LAST",
+        )
+        .bind(server_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| internal_error("admin certificate list", e))?;
+
+    let now = chrono::Utc::now();
+    let ids: Vec<Uuid> = certs.iter().map(|(id, _, _, _, _)| *id).collect();
+    let failing = renewal_failing_sites(&state.db, &ids).await?;
+    let mut items: Vec<serde_json::Value> = certs
+        .iter()
+        .map(|(id, domain, expiry, owner, renewal_at)| {
+            let days_left = expiry.map(|e| (e - now).num_days());
+            serde_json::json!({
+                "site_id": id,
+                // Always on the wire, even as null. A field that is present on
+                // some rows and absent on others reaches TypeScript as
+                // `undefined`, and `undefined !== null` is true — which would
+                // hand every ordinary site row the control meant for stacks.
+                "stack_id": serde_json::Value::Null,
+                "domain": domain,
+                "expiry": expiry,
+                "days_left": days_left,
+                "status": expiry_status(days_left, failing.contains(id)),
+                "owner_email": owner,
+                "managed": true,
+                // CA-suggested ARI renewal window start (RFC 9773). `sites`-only
+                // column — see the site-scoped dashboard above for the same note.
+                "renewal_at": renewal_at,
+            })
+        })
+        .collect();
+
+    // Every stack on this host that has a domain, read ONCE. The walk below needs
+    // to ask "is this certificate a stack's?" per directory on disk, and a query
+    // per directory would be a round trip per certificate.
+    //
+    // `ssl_expiry` comes along for the offline arm at the bottom, which is the
+    // only reader that has nothing else to fall back on.
+    let stacks: Vec<(Uuid, String, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            "SELECT id, domain, tls_mode, ssl_email, ssl_expiry FROM docker_stacks \
+             WHERE server_id = $1 AND domain IS NOT NULL",
+        )
+        .bind(server_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| internal_error("admin certificate list stacks", e))?;
+
+    // Stack-level `ssl_renewal_failure` alerts carry `site_id = NULL` (there is
+    // no sites row to name) and are keyed instead by
+    // `stack_renewal_state_key(domain)` under this server — see that
+    // function's own doc. `renewal_failing_sites` above filters
+    // `site_id = ANY($1)`, which a NULL site_id can never satisfy, so it is the
+    // wrong lookup for these rows; this is `renewal_failing_sites`'s sibling,
+    // scoped by server + state_key instead of by site id, because a stack
+    // alert has no site id to scope by.
+    let stack_keys: Vec<String> = stacks
+        .iter()
+        .map(|(_, d, _, _, _)| crate::services::security_scanner::stack_renewal_state_key(d))
+        .collect();
+    let failing_stacks: std::collections::HashSet<String> = if stack_keys.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT state_key FROM alerts \
+             WHERE alert_type = 'ssl_renewal_failure' AND status = 'firing' \
+               AND server_id = $1 AND state_key = ANY($2)",
+        )
+        .bind(server_id)
+        .bind(&stack_keys)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| internal_error("stack renewal failure lookup", e))?;
+        rows.into_iter().map(|(k,)| k).collect()
+    };
+
+    // ⛔ Only an ACME stack is ours. A `provided` stack serves its certificate from
+    //    the registry, and the file this walk finds under /etc/dockpanel/ssl is a
+    //    LEFTOVER from before the switch — offering to renew it, or stamping the
+    //    row with its expiry, would be the panel describing a certificate the
+    //    stack does not serve. Read through the one spelling of the rule.
+    let acme_stack = |domain: &str| -> Option<(Uuid, Option<chrono::DateTime<chrono::Utc>>)> {
+        stacks
+            .iter()
+            .find(|(_, d, mode, email, _)| {
+                d.eq_ignore_ascii_case(domain)
+                    && crate::routes::stacks::effective_tls_mode(mode.as_deref(), email.as_deref())
+                        == "acme"
+            })
+            .map(|(id, _, _, _, recorded)| (*id, *recorded))
+    };
+
+    // Best-effort, and its failure is REPORTED rather than swallowed: without it
+    // the list silently reverts to the DB-only view that caused the problem.
+    let host_scan = match agent.get("/ssl/certificates").await {
+        Ok(v) => {
+            let known: std::collections::HashSet<&str> =
+                certs.iter().map(|(_, d, _, _, _)| d.as_str()).collect();
+            if let Some(arr) = v.as_array() {
+                for c in arr {
+                    let Some(domain) = c.get("domain").and_then(|d| d.as_str()) else { continue };
+                    if known.contains(domain) {
+                        continue;
+                    }
+                    let days_left = c.get("days_remaining").and_then(|d| d.as_i64());
+                    let expiry = c.get("not_after").and_then(|d| d.as_str())
+                        .and_then(crate::helpers::parse_agent_cert_expiry);
+                    let stack = acme_stack(domain);
+                    let stack_id = stack.map(|(id, _)| id);
+
+                    // BOOTSTRAP. The agent's walk is the only thing that knows when
+                    // a stack's certificate expires, and until now the panel read
+                    // that answer, rendered it, and threw it away — so nothing in
+                    // Postgres could ever answer the question, and the arm below
+                    // had nothing to fall back on.
+                    //
+                    // ⛔ Best-effort by construction: `let _`, never `?`. This is a
+                    //    GET, and a failed bookkeeping write must not turn a page
+                    //    the operator asked for into an error. The next read
+                    //    retries it.
+                    // ⚠ Only when it actually MOVED. This runs per certificate on
+                    //    disk, on every load of this page, and a row that already
+                    //    holds the right date does not need writing — an admin
+                    //    refreshing would otherwise issue one UPDATE per stack
+                    //    certificate every time, for ever, to change nothing.
+                    if let (Some((id, recorded)), Some(exp)) = (stack, expiry) {
+                        if recorded != Some(exp) {
+                            let _ = sqlx::query(
+                                "UPDATE docker_stacks SET ssl_expiry = $1 WHERE id = $2",
+                            )
+                            .bind(exp)
+                            .bind(id)
+                            .execute(&state.db)
+                            .await;
+                        }
+                    }
+
+                    items.push(serde_json::json!({
+                        "site_id": serde_json::Value::Null,
+                        "stack_id": stack_id,
+                        "domain": domain,
+                        "expiry": expiry,
+                        "days_left": days_left,
+                        "status": expiry_status(
+                            days_left,
+                            failing_stacks.contains(
+                                &crate::services::security_scanner::stack_renewal_state_key(domain),
+                            ),
+                        ),
+                        "issuer": c.get("issuer"),
+                        "owner_email": serde_json::Value::Null,
+                        // A certificate on disk that belongs to no site and no
+                        // ACME stack: nothing here can renew or remove it, and the
+                        // page says so rather than offering a control that fails.
+                        "managed": false,
+                        "renewal_at": serde_json::Value::Null,
+                    }));
+                }
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Admin certificate list: this server's agent could not enumerate certificates ({e}) — falling back to what the panel recorded");
+
+            // ⭐ THE OFFLINE ANSWER, and the reason `docker_stacks.ssl_expiry`
+            //    exists. A site keeps its row in the list when the agent is
+            //    unreachable, because the panel stores `sites.ssl_expiry`. A stack
+            //    had no such column, so every stack certificate simply VANISHED
+            //    from this page for as long as the agent was down — at exactly the
+            //    moment an operator is most likely to be looking at it.
+            //
+            //    These rows are the panel's own record, not a live read. They
+            //    carry no issuer (nothing re-read the file) and no control: this
+            //    half of the page is reached only when the agent cannot be asked,
+            //    and a Renew button here would post to a host that is not
+            //    answering.
+            for (id, domain, mode, email, expiry) in &stacks {
+                if crate::routes::stacks::effective_tls_mode(mode.as_deref(), email.as_deref())
+                    != "acme"
+                {
+                    continue;
+                }
+                let Some(expiry) = expiry else { continue };
+                let days_left = Some((*expiry - now).num_days());
+                items.push(serde_json::json!({
+                    "site_id": serde_json::Value::Null,
+                    "stack_id": id,
+                    "domain": domain,
+                    "expiry": expiry,
+                    "days_left": days_left,
+                    "status": expiry_status(
+                        days_left,
+                        failing_stacks.contains(
+                            &crate::services::security_scanner::stack_renewal_state_key(domain),
+                        ),
+                    ),
+                    "issuer": serde_json::Value::Null,
+                    "owner_email": serde_json::Value::Null,
+                    "managed": true,
+                    // The one thing this row must not do is look like a live read.
+                    "stale": true,
+                    "renewal_at": serde_json::Value::Null,
+                }));
+            }
+            false
+        }
+    };
+
+    Ok(Json(serde_json::json!({ "certificates": items, "host_scan": host_scan })))
 }
 
 /// POST /api/monitors/maintenance — Create a maintenance window.
@@ -570,7 +1155,11 @@ pub async fn create_maintenance(
     AuthUser(claims): AuthUser,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
+    // Maintenance windows are per-caller in all three statements — this INSERT
+    // stamps `user_id`, the list filters on it, the delete requires it — and what
+    // a window does is silence THAT caller's alerts. A site owner who has alerts
+    // (`alerts` is user-scoped for every role) is exactly who needs to silence
+    // them while they work on their own site.
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("Maintenance");
     let starts_at = body.get("starts_at").and_then(|v| v.as_str()).unwrap_or("");
     let ends_at = body.get("ends_at").and_then(|v| v.as_str()).unwrap_or("");
@@ -593,10 +1182,17 @@ pub async fn list_maintenance(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
+    // Per-caller by `WHERE user_id = $1` — see `create_maintenance` above.
+    //
+    // ⚠ The error is propagated because an empty list is not a neutral answer
+    // here. `uptime.rs` skips every monitor belonging to a user with a currently
+    // active window, so a failed read used to show an operator no windows while
+    // one of them was still suppressing their alerting — the screen said nothing
+    // was muting anything, and the delete control that is the way out was not
+    // offered, because the row it belongs to was never drawn.
     let windows: Vec<(uuid::Uuid, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT id, name, starts_at, ends_at FROM maintenance_windows WHERE user_id = $1 ORDER BY starts_at DESC LIMIT 20"
-    ).bind(claims.sub).fetch_all(&state.db).await.unwrap_or_default();
+    ).bind(claims.sub).fetch_all(&state.db).await.map_err(|e| internal_error("maintenance windows", e))?;
 
     let now = chrono::Utc::now();
     let items: Vec<serde_json::Value> = windows.iter().map(|(id, name, start, end)| {
@@ -613,8 +1209,31 @@ pub async fn delete_maintenance(
     AuthUser(claims): AuthUser,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
-    sqlx::query("DELETE FROM maintenance_windows WHERE id = $1 AND user_id = $2").bind(id).bind(claims.sub).execute(&state.db).await.ok();
+    // `AND user_id = $2` is the authorization — a caller can only delete a window
+    // they own, which is the same rule the gate above used to approximate.
+    //
+    // The result is checked rather than discarded, and the reason is not tidiness.
+    // `uptime.rs` skips EVERY monitor belonging to a user with a currently-active
+    // window, so a window that outlives its "Maintenance window deleted" message
+    // leaves that whole account with no uptime checks, no downtime detection and no
+    // alerts — and the ordinary trigger for pressing delete is finishing maintenance
+    // early to resume exactly those. Reporting success for a row that is still there
+    // is the one answer the panel must not give here.
+    let deleted = sqlx::query("DELETE FROM maintenance_windows WHERE id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(claims.sub)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("delete maintenance window", e))?;
+
+    if deleted.rows_affected() == 0 {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "That maintenance window no longer exists, or it belongs to another account. \
+             Monitoring is unchanged — reload the list before retrying.",
+        ));
+    }
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

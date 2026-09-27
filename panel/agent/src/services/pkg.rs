@@ -198,15 +198,11 @@ pub async fn enable_php_stream(version: &str) -> Result<(), String> {
     if inst.is_apt() {
         return Ok(());
     }
-    let out = tokio::time::timeout(
-        INSTALL_TIMEOUT,
-        safe_command_unsandboxed(inst.bin(), &[])
-            .args(["-y", "module", "enable", &format!("php:{version}")])
-            .output(),
-    )
-    .await
-    .map_err(|_| "Enabling the PHP module stream timed out".to_string())?
-    .map_err(|e| format!("Enabling the PHP module stream failed: {e}"))?;
+    let out = safe_command_unsandboxed(inst.bin(), &[])
+        .args(["-y", "module", "enable", &format!("php:{version}")])
+        .output_with_timeout(INSTALL_TIMEOUT)
+        .await
+        .map_err(|e| format!("Enabling the PHP module stream failed: {e}"))?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -231,7 +227,10 @@ pub async fn installed_php_version() -> Option<String> {
     }
     let out = tokio::time::timeout(
         Duration::from_secs(60),
-        safe_command("rpm").args(["-q", "--qf", "%{VERSION}", "php-fpm"]).output(),
+        safe_command("rpm")
+            .args(["-q", "--qf", "%{VERSION}", "php-fpm"])
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()?
@@ -246,6 +245,32 @@ pub async fn installed_php_version() -> Option<String> {
     (!major.is_empty() && !minor.is_empty()).then(|| format!("{major}.{minor}"))
 }
 
+/// Resolve the real, currently-existing PHP-FPM socket for a version, across
+/// both families.
+///
+/// Debian ships one socket per version at a fixed, predictable path. The RHEL
+/// family ships exactly one unversioned socket for whichever stream is
+/// active — see [`installed_php_version`] for why RHEL can only ever have one
+/// live version at a time. Callers that build a nginx vhost or answer a
+/// status check used to assume the Debian path unconditionally, which made
+/// PHP sites unreachable on the RHEL family even though PHP-FPM was
+/// genuinely installed and running: `settle()`'s own socket check already
+/// knew about this split (see [`crate::routes::php::socket_exists`]), but
+/// `nginx.rs::put_site()` re-implemented a Debian-only existence check
+/// instead of sharing it. This is the single source of truth both now call.
+pub async fn resolve_php_fpm_socket(version: &str) -> Option<String> {
+    let debian = format!("/run/php/php{version}-fpm.sock");
+    if std::path::Path::new(&debian).exists() {
+        return Some(debian);
+    }
+    if installed_php_version().await.as_deref() == Some(version)
+        && std::path::Path::new("/run/php-fpm/www.sock").exists()
+    {
+        return Some("/run/php-fpm/www.sock".to_string());
+    }
+    None
+}
+
 /// The PHP module streams this box offers, newest first. Empty on apt boxes,
 /// where versions come from the archive rather than a stream.
 pub async fn php_streams() -> Vec<String> {
@@ -257,7 +282,10 @@ pub async fn php_streams() -> Vec<String> {
     }
     let out = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command(inst.bin()).args(["-q", "module", "list", "php"]).output(),
+        safe_command(inst.bin())
+            .args(["-q", "module", "list", "php"])
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()
@@ -489,13 +517,10 @@ async fn transact(action: Action, packages: &[&str]) -> Result<(), String> {
     // Unsandboxed: a package transaction writes across the whole filesystem,
     // which ProtectSystem=strict exists to prevent. This is the same escape
     // hatch every installer already used for exactly this reason.
-    let out = tokio::time::timeout(
-        INSTALL_TIMEOUT,
-        safe_command_unsandboxed(inst.bin(), &[]).args(&argv).output(),
-    )
-    .await
-    .map_err(|_| format!("{} timed out after {}s", inst.bin(), INSTALL_TIMEOUT.as_secs()))?
-    .map_err(|e| format!("{} could not be run: {e}", inst.bin()))?;
+    let out = safe_command_unsandboxed(inst.bin(), &[])
+        .args(&argv)
+        .output_with_timeout(INSTALL_TIMEOUT)
+        .await?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -510,13 +535,10 @@ async fn transact(action: Action, packages: &[&str]) -> Result<(), String> {
     // apt leaves orphans behind after a purge; dnf's `remove` already takes
     // unused dependencies with it, so autoremove has no counterpart to call.
     if matches!(action, Action::Remove) && inst.is_apt() {
-        let _ = tokio::time::timeout(
-            INSTALL_TIMEOUT,
-            safe_command_unsandboxed("apt-get", &[])
-                .args(["autoremove", "-y"])
-                .output(),
-        )
-        .await;
+        let _ = safe_command_unsandboxed("apt-get", &[])
+            .args(["autoremove", "-y"])
+            .output_with_timeout(INSTALL_TIMEOUT)
+            .await;
     }
 
     Ok(())
@@ -526,11 +548,10 @@ async fn transact(action: Action, packages: &[&str]) -> Result<(), String> {
 /// visible; dnf reads repo metadata on demand and needs nothing.
 pub async fn refresh_index() {
     if let Some(Installer::AptGet) = installer().await {
-        let _ = tokio::time::timeout(
-            INSTALL_TIMEOUT,
-            safe_command_unsandboxed("apt-get", &[]).arg("update").output(),
-        )
-        .await;
+        let _ = safe_command_unsandboxed("apt-get", &[])
+            .arg("update")
+            .output_with_timeout(INSTALL_TIMEOUT)
+            .await;
     }
 }
 
@@ -560,15 +581,11 @@ pub async fn refresh_index() {
 async fn escape_hatch_works() -> bool {
     static OK: OnceCell<bool> = OnceCell::const_new();
     *OK.get_or_init(|| async {
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            safe_command_unsandboxed("true", &[]).output(),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        safe_command_unsandboxed("true", &[])
+            .output_with_timeout(Duration::from_secs(30))
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
     .await
 }
@@ -787,13 +804,11 @@ pub async fn add_repo(repo: Repo) -> Result<(), String> {
     // of the wrapper: without it a failed `curl` pipes nothing into `bash -`,
     // which exits 0, and the install proceeds against a repo that was never
     // added (Lesson #73B, learned in setup.sh and re-learnable here).
-    let out = tokio::time::timeout(
-        INSTALL_TIMEOUT,
-        safe_command_unsandboxed("bash", &[]).args(["-c", &script]).output(),
-    )
-    .await
-    .map_err(|_| "Repository setup timed out".to_string())?
-    .map_err(|e| format!("Repository setup could not be run: {e}"))?;
+    let out = safe_command_unsandboxed("bash", &[])
+        .args(["-c", &script])
+        .output_with_timeout(INSTALL_TIMEOUT)
+        .await
+        .map_err(|e| format!("Repository setup could not be run: {e}"))?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -807,20 +822,59 @@ pub async fn add_repo(repo: Repo) -> Result<(), String> {
 }
 
 /// Delete a repository this module added. Safe to call when it is absent.
+///
+/// **The list must track upstream's ACTUAL current footprint, not just the one
+/// file `add_repo` itself references.** NodeSource's `setup_22.x` (verified
+/// live against `deb.nodesource.com`/`rpm.nodesource.com` before this list was
+/// written) additionally drops a keyring and two `Pin-Priority: 600` files
+/// that outrank a normally-installed package — leaving them behind after an
+/// operator clicks "Uninstall" silently keeps `deb.nodesource.com` as the
+/// preferred source for `nodejs`/`nsolid` on every LATER unrelated
+/// `apt-get install` (e.g. as another package's dependency), contradicting
+/// this file's own comment two functions up that failure "must leave nothing
+/// behind" — that promise was false on the ORDINARY successful uninstall path
+/// too, not only on a failed install.
+///
+/// **Deliberately NOT attempted here:** revoking the RPM-imported GPG key
+/// (`rpm -qa gpg-pubkey`) NodeSource's and Cloudflared's `.repo` `gpgkey=`
+/// lines cause `dnf`/`yum` to import on first use. It is not a file on disk —
+/// there is nothing here to `remove_file` — and matching the right
+/// `gpg-pubkey-*` package by heuristic risks revoking a key some OTHER
+/// still-active repo also relies on. Deleting the `.repo` file (below) is
+/// what actually stops the repo from being consulted; the trust-store entry
+/// surviving with no repo left pointing at it is a much smaller residual than
+/// the live, silently-preferred repo this fix closes.
 pub async fn remove_repo(repo: Repo) {
-    let paths: &[&str] = match repo {
+    for p in repo_artifact_paths(repo) {
+        let _ = tokio::fs::remove_file(p).await;
+    }
+}
+
+/// Every on-disk artifact [`add_repo`] can leave for `repo`, so [`remove_repo`]
+/// and its tests share one list instead of drifting apart the way the pre-fix
+/// version did. Pulled out of `remove_repo` itself so a unit test can assert on
+/// the path set directly, without touching the real filesystem paths involved.
+fn repo_artifact_paths(repo: Repo) -> &'static [&'static str] {
+    match repo {
         Repo::NodeSource => &[
+            // Debian: current (DEB822) + the pre-nodesource.sources filename
+            // upstream's own script still self-cleans on reinstall, for any
+            // box that added the repo under an older script version.
+            "/etc/apt/sources.list.d/nodesource.sources",
             "/etc/apt/sources.list.d/nodesource.list",
+            "/usr/share/keyrings/nodesource.gpg",
+            "/etc/apt/preferences.d/nodejs",
+            "/etc/apt/preferences.d/nsolid",
+            // RPM: both repo defs upstream's setup script can write.
             "/etc/yum.repos.d/nodesource-nodejs.repo",
+            "/etc/yum.repos.d/nodesource-nsolid.repo",
         ],
         Repo::Cloudflared => &[
             "/etc/apt/sources.list.d/cloudflared.list",
+            "/usr/share/keyrings/cloudflare-main.gpg",
             "/etc/yum.repos.d/cloudflared.repo",
         ],
         Repo::Rspamd => &["/etc/yum.repos.d/rspamd.repo"],
-    };
-    for p in paths {
-        let _ = tokio::fs::remove_file(p).await;
     }
 }
 
@@ -853,7 +907,7 @@ pub async fn os_release_value(key: &str) -> Option<String> {
 async fn run_ok(bin: &str, args: &[&str], accept: impl Fn(&str) -> bool) -> bool {
     tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command(bin).args(args).output(),
+        safe_command(bin).args(args).kill_on_drop(true).output(),
     )
     .await
     .ok()
@@ -865,7 +919,7 @@ async fn run_ok(bin: &str, args: &[&str], accept: impl Fn(&str) -> bool) -> bool
 async fn which(cmd: &str) -> bool {
     tokio::time::timeout(
         Duration::from_secs(30),
-        safe_command("which").arg(cmd).output(),
+        safe_command("which").arg(cmd).kill_on_drop(true).output(),
     )
     .await
     .ok()
@@ -989,5 +1043,59 @@ mod tests {
         for p in ["phpmyadmin", "php", "postfix-policyd", "python3-venv"] {
             assert_eq!(rpm_name(p), p, "{p} should pass through untouched");
         }
+    }
+
+    /// NodeSource's setup_22.x (verified live against deb.nodesource.com
+    /// before this test was written) writes a keyring and two Pin-Priority:600
+    /// files in addition to the .sources file — all three must be on the
+    /// cleanup list, or an uninstalled NodeSource repo keeps silently winning
+    /// over Debian's own archive for `nodejs`/`nsolid` on every later install.
+    #[test]
+    fn nodesource_cleanup_covers_the_keyring_and_both_pin_files() {
+        let paths = repo_artifact_paths(Repo::NodeSource);
+        for must_have in [
+            "/etc/apt/sources.list.d/nodesource.sources",
+            "/usr/share/keyrings/nodesource.gpg",
+            "/etc/apt/preferences.d/nodejs",
+            "/etc/apt/preferences.d/nsolid",
+            "/etc/yum.repos.d/nodesource-nodejs.repo",
+            "/etc/yum.repos.d/nodesource-nsolid.repo",
+        ] {
+            assert!(
+                paths.contains(&must_have),
+                "NodeSource cleanup list is missing {must_have}"
+            );
+        }
+    }
+
+    /// The legacy `.list` filename must stay on the list even though upstream's
+    /// own script no longer writes it — a box that added the repo under an
+    /// older script version still has it on disk.
+    #[test]
+    fn nodesource_cleanup_still_covers_the_legacy_list_filename() {
+        assert!(repo_artifact_paths(Repo::NodeSource)
+            .contains(&"/etc/apt/sources.list.d/nodesource.list"));
+    }
+
+    /// `add_repo`'s Cloudflared branch writes a keyring alongside the repo
+    /// file (pkg.rs's own `add_repo`, apt arm) — `remove_repo` must delete both.
+    #[test]
+    fn cloudflared_cleanup_covers_the_keyring_not_just_the_repo_file() {
+        let paths = repo_artifact_paths(Repo::Cloudflared);
+        assert!(paths.contains(&"/usr/share/keyrings/cloudflare-main.gpg"));
+        assert!(paths.contains(&"/etc/apt/sources.list.d/cloudflared.list"));
+        assert!(paths.contains(&"/etc/yum.repos.d/cloudflared.repo"));
+    }
+
+    /// Rspamd's footprint is a single flat repo file (add_repo's rpm-only
+    /// branch never writes a keyring) — unlike NodeSource/Cloudflared, this
+    /// list was already correct before this fix and must stay exactly that
+    /// size, not grow to match the other two by copy-paste.
+    #[test]
+    fn rspamd_cleanup_is_exactly_the_one_repo_file() {
+        assert_eq!(
+            repo_artifact_paths(Repo::Rspamd),
+            &["/etc/yum.repos.d/rspamd.repo"]
+        );
     }
 }

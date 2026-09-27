@@ -13,13 +13,21 @@ use crate::AppState;
 // ─── Terraform / Pulumi IaC Provider API ───────────────────────
 //
 // These endpoints provide a stable API surface for Terraform/Pulumi providers.
-// Authentication via IaC tokens (Bearer token) or regular JWT.
-// Resources: sites, databases, dns_records
+//
+// ⚠ (s418, corrected) IaC tokens are CRUD-only — created, listed, deleted — and
+// do not authenticate anything. Every handler below takes `AuthUser` (JWT); no
+// extractor anywhere in this crate reads a `dpiac_`-prefixed bearer token back
+// against `iac_tokens.token_hash` to admit a request. The line this replaced
+// claimed "Authentication via IaC tokens (Bearer token) or regular JWT" — that
+// was never true. See FEATURES.md § Withdrawn Claims.
+// Resources: sites, databases. (`dns_records` was named here too; no
+// `tf_list_dns` handler, or any dns_records reader, has ever existed.)
 
 /// POST /api/iac/tokens — Create a new IaC token.
 pub async fn create_token(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     require_admin(&claims.role)?;
@@ -56,9 +64,16 @@ pub async fn create_token(
     .await
     .map_err(|e| internal_error("create iac token", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
+
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "iac.token_created",
-        Some("iac_token"), Some(name), None, None,
+        Some("iac_token"), Some(name), None, ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db, "iac.token_created", Some(&claims.email), ip.as_deref(),
+        Some("iac_token"), Some(name), None, None, "warning", claims.key_id,
     ).await;
 
     // Return the raw token ONCE — it cannot be retrieved after this
@@ -250,7 +265,7 @@ pub async fn create_autoscale(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "autoscale.rule_created",
-        Some("container"), Some(name), None, None,
+        Some("container"), Some(name), None, None, claims.key_id,
     ).await;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "ok": true, "id": id.0 }))))

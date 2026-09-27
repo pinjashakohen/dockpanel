@@ -268,7 +268,7 @@ pub async fn get_rules(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Vec<AlertRuleRow>>, ApiError> {
-    let rules: Vec<AlertRuleRow> = sqlx::query_as(
+    let mut rules: Vec<AlertRuleRow> = sqlx::query_as(
         "SELECT id, server_id, cpu_threshold, cpu_duration, memory_threshold, memory_duration, \
          disk_threshold, alert_cpu, alert_memory, alert_disk, alert_offline, \
          alert_backup_failure, alert_ssl_expiry, alert_service_health, \
@@ -282,6 +282,25 @@ pub async fn get_rules(
     .fetch_all(&state.db)
     .await
     .map_err(|e| internal_error("get rules", e))?;
+
+    // These four columns are encrypted at rest (encrypt_credential in
+    // upsert_rules below); the caller reading their OWN rule row back to
+    // pre-fill the settings form is the expected, same-account case
+    // `decrypt_credential_or_legacy` exists for.
+    for r in rules.iter_mut() {
+        r.notify_slack_url = r.notify_slack_url.as_deref().map(|v| {
+            crate::services::secrets_crypto::decrypt_credential_or_legacy(v, &state.config.jwt_secret)
+        });
+        r.notify_discord_url = r.notify_discord_url.as_deref().map(|v| {
+            crate::services::secrets_crypto::decrypt_credential_or_legacy(v, &state.config.jwt_secret)
+        });
+        r.notify_pagerduty_key = r.notify_pagerduty_key.as_deref().map(|v| {
+            crate::services::secrets_crypto::decrypt_credential_or_legacy(v, &state.config.jwt_secret)
+        });
+        r.notify_webhook_url = r.notify_webhook_url.as_deref().map(|v| {
+            crate::services::secrets_crypto::decrypt_credential_or_legacy(v, &state.config.jwt_secret)
+        });
+    }
 
     Ok(Json(rules))
 }
@@ -327,12 +346,49 @@ pub async fn update_rules(
 }
 
 /// PUT /api/alert-rules/{server_id} — Create or update per-server alert rules.
+///
+/// ⚠ SECURITY (s433): `server_id` comes from the URL, not from anything
+/// scoped to the caller — without an ownership check here, any authenticated
+/// user could PUT rules for a `server_id` they don't own. `upsert_rules`'s
+/// own existence lookup is `WHERE user_id = $1 AND server_id = $2`, so a
+/// non-owner's write was never actually overwriting the real owner's row —
+/// it was silently INSERTing a second, independent row for that server_id
+/// (`alert_rules` only enforces `UNIQUE(user_id, server_id)`, not
+/// `UNIQUE(server_id)`), a stray row `services/drift.rs::fetch_alert_rules`
+/// had to defend against (s432).
+///
+/// This does NOT widen for `claims.role == "admin"`, unlike the read routes
+/// s432 fixed — and that's not an inconsistency, it's a different axis
+/// entirely: a single resource resolved by a caller-supplied ID (this route,
+/// `auth::ServerScope`, `metrics.rs::server_metrics`, `servers.rs`'s own
+/// single-server writes) never widens for anyone, admin included — an
+/// account only acts on what it's the registered owner of. What widens is a
+/// FLEET-WIDE AGGREGATE with no mandatory per-resource ID (`dashboard.rs`'s
+/// `fleet_overview`/`metrics_history`/`gpu_metrics_history`/`timeline`,
+/// `drift.rs`) — there an admin legitimately needs the whole install's data
+/// in one read. `helpers::SITE_CALLER_PREDICATE`'s admin arm looks like a
+/// third case (a WRITE that DOES widen) but isn't a counterexample to either
+/// rule above — it's site-specific: a site's owner (often a `client`
+/// account) and the admin who registered the underlying SERVER are
+/// legitimately different people, which this route has no equivalent of.
 pub async fn update_server_rules(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(server_id): Path<Uuid>,
     Json(body): Json<UpdateRules>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let owns: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM servers WHERE id = $1 AND user_id = $2",
+    )
+    .bind(server_id)
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("check server ownership", e))?;
+    if owns.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "Server not found"));
+    }
+
     upsert_rules(&state, claims.sub, Some(server_id), &body).await
 }
 
@@ -362,6 +418,47 @@ async fn upsert_rules(
             if let Err(e) = crate::helpers::validate_url_not_internal(url).await {
                 return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid Discord URL: {}", e)));
             }
+        }
+    }
+
+    // Encrypt at rest — validated above on PLAINTEXT (SSRF check needs a real
+    // URL), encrypted here before it ever reaches SQL. `None` means "leave the
+    // stored value alone" (the COALESCE below depends on that), `Some("")`
+    // means "clear it", so both are passed through unencrypted; only a
+    // genuine non-empty value is encrypted. Read back via
+    // `decrypt_credential_or_legacy` in `get_rules` above.
+    let jwt_secret = &state.config.jwt_secret;
+    let encrypt_opt = |v: &Option<String>| -> Result<Option<String>, ApiError> {
+        match v {
+            None => Ok(None),
+            Some(s) if s.is_empty() => Ok(Some(String::new())),
+            Some(s) => crate::services::secrets_crypto::encrypt_credential(s, jwt_secret)
+                .map(Some)
+                .map_err(|e| internal_error("encrypt notification credential", e)),
+        }
+    };
+    let enc_slack_url = encrypt_opt(&body.notify_slack_url)?;
+    let enc_discord_url = encrypt_opt(&body.notify_discord_url)?;
+    let enc_pagerduty_key = encrypt_opt(&body.notify_pagerduty_key)?;
+    let enc_webhook_url = encrypt_opt(&body.notify_webhook_url)?;
+
+    // A suppression list is matched token-for-token against the alert type on
+    // the fan-out, so a token that names nothing suppresses nothing. Stored
+    // unchecked it then echoed back on every read as though it had worked, and
+    // the operator kept being paged by a type their own settings showed as off.
+    // Reject it here, naming the token, rather than accept a setting that
+    // cannot do what it says.
+    if let Some(ref raw) = body.muted_types {
+        let unknown = crate::services::notifications::unknown_suppressible_types(raw);
+        if !unknown.is_empty() {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Unknown alert type(s) in muted_types: {}. Suppressible types are: {}",
+                    unknown.join(", "),
+                    crate::services::notifications::SUPPRESSIBLE_ALERT_TYPES.join(", ")
+                ),
+            ));
         }
     }
 
@@ -447,11 +544,11 @@ async fn upsert_rules(
     .bind(body.alert_service_health)
     .bind(&body.ssl_warning_days)
     .bind(body.notify_email)
-    .bind(&body.notify_slack_url)
-    .bind(&body.notify_discord_url)
+    .bind(&enc_slack_url)
+    .bind(&enc_discord_url)
     .bind(body.cooldown_minutes)
-    .bind(&body.notify_pagerduty_key)
-    .bind(&body.notify_webhook_url)
+    .bind(&enc_pagerduty_key)
+    .bind(&enc_webhook_url)
     .bind(&body.muted_types)
     .bind(body.gpu_util_threshold)
     .bind(body.gpu_util_duration)
@@ -476,19 +573,40 @@ pub struct AttachPolicy {
 /// PUT /api/alert-rules/{rule_id}/escalation-policy — Admin: attach or
 /// detach an escalation policy on a single rule. Admin-only because
 /// mis-attaching a policy can route 3 AM pages to the wrong on-call user.
+///
+/// ⚠ SECURITY (s437): `rule_id` came from the URL under plain `AdminUser`
+/// (role only) with NO ownership check at all — any admin on the install
+/// could re-point ANY other tenant's alert rule at ANY escalation policy
+/// (including one they don't own, since the old existence check was also
+/// unscoped). Same shape as `update_server_rules`/`delete_server_rules`
+/// (s433): a single resource resolved by a caller-supplied ID never widens
+/// for admin, admin included.
 pub async fn attach_escalation_policy(
     State(state): State<AppState>,
-    AdminUser(_claims): AdminUser,
+    AdminUser(claims): AdminUser,
     Path(rule_id): Path<Uuid>,
     Json(body): Json<AttachPolicy>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // If setting (not clearing), verify the policy exists so the FK violation
-    // surfaces as a 400 instead of a 500.
+    let owns_rule: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM alert_rules WHERE id = $1 AND user_id = $2")
+            .bind(rule_id)
+            .bind(claims.sub)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("check alert rule ownership", e))?;
+    if owns_rule.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "Alert rule not found"));
+    }
+
+    // If setting (not clearing), verify the policy exists AND is owned by
+    // the same tenant so the FK violation surfaces as a 400 instead of a
+    // 500, and so a rule can never be pointed at another tenant's policy.
     if let Some(pid) = body.policy_id {
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM escalation_policies WHERE id = $1)",
+            "SELECT EXISTS(SELECT 1 FROM escalation_policies WHERE id = $1 AND user_id = $2)",
         )
         .bind(pid)
+        .bind(claims.sub)
         .fetch_one(&state.db)
         .await
         .map_err(|e| internal_error("check policy exists", e))?;
@@ -497,10 +615,12 @@ pub async fn attach_escalation_policy(
         }
     }
     let result = sqlx::query(
-        "UPDATE alert_rules SET escalation_policy_id = $2, updated_at = NOW() WHERE id = $1",
+        "UPDATE alert_rules SET escalation_policy_id = $2, updated_at = NOW() \
+         WHERE id = $1 AND user_id = $3",
     )
     .bind(rule_id)
     .bind(body.policy_id)
+    .bind(claims.sub)
     .execute(&state.db)
     .await
     .map_err(|e| internal_error("attach policy", e))?;
@@ -511,11 +631,32 @@ pub async fn attach_escalation_policy(
 }
 
 /// DELETE /api/alert-rules/{server_id} — Remove server-specific override.
+///
+/// ⚠ SECURITY/HONESTY (s433): the DELETE itself was already scoped
+/// `WHERE user_id = $1 AND server_id = $2`, so a non-owner could never
+/// remove the real owner's row — but with no upfront ownership check on
+/// `server_id`, a request naming a server the caller doesn't own (or that
+/// doesn't exist) matched 0 rows and still answered `{"ok": true}`, same as
+/// a real deletion. Checked the same way `update_server_rules` above now
+/// does, so this route is honest about which requests actually did
+/// something.
 pub async fn delete_server_rules(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let owns: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM servers WHERE id = $1 AND user_id = $2",
+    )
+    .bind(server_id)
+    .bind(claims.sub)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("check server ownership", e))?;
+    if owns.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "Server not found"));
+    }
+
     sqlx::query(
         "DELETE FROM alert_rules WHERE user_id = $1 AND server_id = $2",
     )

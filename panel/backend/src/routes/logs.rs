@@ -37,6 +37,18 @@ struct StreamTicket {
     sub: String,
     purpose: String,
     exp: usize,
+    /// The logs this ticket authorises: a site's domain, or `@system` for the
+    /// admin-only host logs. It rides INSIDE the signature exactly as the
+    /// terminal ticket's `scope` does, and it is the fix for the same
+    /// escalation the terminal had: the agent used to read the scope from the
+    /// `?domain=` query param AND the log type from `?type=`, both
+    /// browser-controlled, so a site-scoped ticket dialled with `type=auth` and
+    /// the domain omitted streamed `/var/log/auth.log`. A site owner minting a
+    /// legitimate site ticket then read the host's SSH auth log. Binding the
+    /// scope into the signature is what closes it; `@system` contains an `@`,
+    /// which the agent's domain validation rejects, so it cannot collide with a
+    /// real domain.
+    scope: String,
 }
 
 /// GET /api/logs — System-wide logs (admin only).
@@ -69,18 +81,13 @@ pub async fn site_logs(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<uuid::Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
     Query(q): Query<LogQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(id)
-            .bind(claims.sub)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("site logs", e))?;
-
-    let (domain,) = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    // Asking the wrong host for a site's logs does not fail. That machine has no
+    // vhost by this name, so it answers with nothing, and nothing is exactly what a
+    // quiet site looks like — the operator reads "no traffic" instead of "wrong
+    // question". The row names the host.
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let log_type = q.log_type.as_deref().unwrap_or("access");
     if !["access", "error"].contains(&log_type) {
@@ -138,18 +145,12 @@ pub async fn search_site_logs(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<uuid::Uuid>,
-    ServerScope(_server_id, agent): ServerScope,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-            .bind(id)
-            .bind(claims.sub)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("search site logs", e))?;
-
-    let (domain,) = row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    // Same as the reader above, and a search is the worse of the two: "no matching
+    // lines" is a confident negative answer, and an operator searching a remote
+    // site's access log for an attack would have got one.
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     let log_type = q.log_type.as_deref().unwrap_or("access");
     let full_type = match log_type {
@@ -206,7 +207,7 @@ pub async fn stream_token(
             .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid site_id"))?;
 
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
+            sqlx::query_as(&format!("SELECT s.domain FROM sites s WHERE {}", crate::helpers::SITE_CALLER_PREDICATE))
                 .bind(site_id)
                 .bind(claims.sub)
                 .fetch_optional(&state.db)
@@ -219,10 +220,17 @@ pub async fn stream_token(
         }
     }
 
+    // The scope is the SIGNED decision, not `?domain=`/`?type=`. A site ticket
+    // is bound to its own domain; a system ticket (admin only, checked above)
+    // carries the `@system` sentinel so the agent knows the host logs are
+    // allowed without trusting any query param.
+    let scope = domain.clone().unwrap_or_else(|| "@system".to_string());
+
     let ticket = StreamTicket {
         sub: claims.email,
         purpose: "log_stream".to_string(),
         exp: (chrono::Utc::now() + chrono::Duration::seconds(60)).timestamp() as usize,
+        scope,
     };
 
     let token = encode(
@@ -239,17 +247,60 @@ pub async fn stream_token(
     })))
 }
 
-/// GET /api/logs/stats — Log aggregation stats (admin only).
+/// GET /api/logs/stats — Log aggregation stats for the server in scope (admin only).
+///
+/// With no `?domain=` this is the host-wide question its siblings on this page ask,
+/// and the answer belongs to the server the operator has selected.
+///
+/// With one, it used to be neither authorised nor resolved: the parameter went
+/// straight into the agent path, so no row was ever read and there was nothing to
+/// check the caller against — the browser named the subject and the panel asked it.
+/// Being admin-only did not cover that. An administrator here is not a superuser;
+/// the shared predicate lets one reach the sites on the machines they operate, and
+/// stops at a server somebody else registered. A parameter is now a lookup key and
+/// nothing else, and the domain that reaches the agent is the one read back off the
+/// row.
+///
+/// The row read is deliberately pinned to the server in scope, which is what makes
+/// this different from the per-site readers above. Two things force it. A domain is
+/// only unique PER SERVER — the constraint is `(domain, server_id)` — so a
+/// domain-keyed read with no server term is ambiguous the moment the same name is
+/// hosted twice, and picking either row would be a guess. And the question itself is
+/// host-shaped: these stats are computed by grepping one machine's nginx logs, so a
+/// site that lives elsewhere has no answer here to give. It is refused rather than
+/// answered with the zeroes a quiet site would produce, and the operator moves the
+/// server picker — the same picker every other control on this page already obeys.
+/// Pinning also makes a misdispatch impossible by construction: the host that
+/// answers and the host the row names cannot come apart.
 pub async fn log_stats(
-    State(_state): State<AppState>,
-    AdminUser(_claims): AdminUser,
-    ServerScope(_server_id, agent): ServerScope,
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(server_id, agent): ServerScope,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let domain = params
-        .get("domain")
-        .map(|d| format!("?domain={d}"))
-        .unwrap_or_default();
+    let domain = match params.get("domain") {
+        Some(requested) => {
+            let row: Option<(uuid::Uuid,)> =
+                sqlx::query_as("SELECT id FROM sites WHERE domain = $1 AND server_id = $2")
+                    .bind(requested.as_str())
+                    .bind(server_id)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|e| internal_error("log stats", e))?;
+
+            // Identity first, then permission — and the permission half is the one
+            // shared decision, not a copy of it living here. The name that goes on
+            // the wire is the one it hands back.
+            let site_id = row
+                .map(|(id,)| id)
+                .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+            let resolved =
+                crate::helpers::site_domain_for_caller(&state, site_id, &claims).await?;
+            format!("?domain={resolved}")
+        }
+        None => String::new(),
+    };
+
     let result = agent
         .get(&format!("/logs/stats{domain}"))
         .await
@@ -332,12 +383,14 @@ pub async fn truncate_log(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     agent
         .post("/logs/truncate", Some(body))
         .await
         .map_err(|e| agent_error("Truncate", e))?;
+    let ip = crate::routes::client_ip(&headers);
     crate::services::activity::log_activity(
         &state.db,
         claims.sub,
@@ -346,7 +399,21 @@ pub async fn truncate_log(
         None,
         None,
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "logs.truncate",
+        Some(&claims.email),
+        ip.as_deref(),
         None,
+        None,
+        None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
     Ok(Json(serde_json::json!({ "ok": true })))

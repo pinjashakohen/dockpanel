@@ -1,11 +1,11 @@
 use axum::{
-    extract::Path,
+    extract::{rejection::JsonRejection, Path},
     http::StatusCode,
     routing::{get, post, delete},
     Json, Router,
 };
 use serde::Deserialize;
-use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
+use crate::safe_cmd::safe_command_unsandboxed;
 
 use super::AppState;
 use base64::Engine as _;
@@ -20,6 +20,34 @@ fn ok(msg: &str) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true, "message": msg }))
 }
 
+/// The largest file this endpoint accepts, in DECODED bytes.
+///
+/// ⛔ This number must equal `UPLOAD_MAX_FILE_BYTES` in the panel's
+/// `routes/files.rs`. The two are separate crates, so nothing but a pin can
+/// hold them together — `upload-refusal-pin-e2e.sh` compares them, along with
+/// the figure published in `docs/guides/file-uploads.md`.
+///
+/// It used to read 50 MB, and like the panel's 100 MB it could never fire: this
+/// is a second axum service with the same 2 MiB default request-body limit, so
+/// an oversize upload was refused by the framework, in plain text, before this
+/// handler ran. Two services, two unreachable numbers, one silent failure.
+const UPLOAD_MAX_FILE_BYTES: usize = 1_500_000;
+
+/// The refusal, worded as the panel words it — an agent 4xx is passed through
+/// to the operator verbatim by `error.rs::agent_error`, so this sentence is
+/// read by a human and must say what to do instead.
+fn upload_too_large() -> ApiErr {
+    err(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &format!(
+            "File is too large for the file manager (limit {:.1} MB). Copy it \
+             with rsync or scp over the server's own SSH, or use the Migration \
+             wizard to move a whole site.",
+            UPLOAD_MAX_FILE_BYTES as f64 / 1_000_000.0
+        ),
+    )
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         // File upload (binary)
@@ -31,8 +59,6 @@ pub fn router() -> Router<AppState> {
         .route("/auto-updates/status", get(auto_updates_status))
         .route("/auto-updates/enable", post(enable_auto_updates))
         .route("/auto-updates/disable", post(disable_auto_updates))
-        // IP whitelist for panel
-        .route("/panel-whitelist", get(get_whitelist).post(set_whitelist))
 }
 
 // ── File Upload ─────────────────────────────────────────────────────────
@@ -52,10 +78,21 @@ pub struct UploadRequest {
 
 async fn file_upload(
     Path(domain): Path<String>,
-    Json(body): Json<UploadRequest>,
+    body: Result<Json<UploadRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     use base64::Engine as _;
     use crate::services::files as file_svc;
+
+    // Take the rejection rather than letting it short-circuit — see the panel's
+    // `upload_file`. Without this the body limit answers in plain text the
+    // panel then relays as an unexplained 413.
+    let Json(body) = body.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            upload_too_large()
+        } else {
+            err(StatusCode::BAD_REQUEST, &format!("Invalid upload request: {e}"))
+        }
+    })?;
 
     // Validate domain
     if !super::is_valid_domain(&domain) {
@@ -67,9 +104,9 @@ async fn file_upload(
         .decode(&body.content)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid base64 content"))?;
 
-    // Enforce 50MB size limit for all uploads
-    if bytes.len() > 50 * 1024 * 1024 {
-        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "File too large (max 50MB)"));
+    // Enforce the same limit the panel enforces, on the decoded bytes.
+    if bytes.len() > UPLOAD_MAX_FILE_BYTES {
+        return Err(upload_too_large());
     }
 
     // Resolve the target relative path. When a filename is provided we treat
@@ -109,9 +146,105 @@ async fn file_upload(
 
 // ── SSH Key Management ──────────────────────────────────────────────────
 
+/// The file these three handlers manage. sshd reads root's keys from here and
+/// nowhere else, so — unlike `known_hosts` in `services/remote_backup.rs` — it
+/// cannot be relocated out of the sandbox's way.
+const AUTHORIZED_KEYS: &str = "/root/.ssh/authorized_keys";
+
+/// Read root's `authorized_keys` from OUTSIDE the agent's sandbox.
+///
+/// ⚠ THIS FEATURE HAS NEVER WORKED, ON ANY INSTALL. The agent unit sets
+/// `ProtectHome=yes`, which binds an inaccessible read-only directory over
+/// `/root` inside the agent's mount namespace, so an in-process `read_to_string`
+/// answers ENOENT for a file that exists. `ProtectHome=yes` landed 2026-03-13
+/// and these handlers landed 2026-03-15 — born broken, the next commit but one.
+///
+/// It failed in the worst possible direction: the read discarded its error into
+/// a default, so a failure became an empty string and the endpoint answered
+/// **200 with an empty list**. (Spelled in prose rather than in code on purpose:
+/// `agent-security-signals-pin-e2e.sh` §E greps this file for that call shape,
+/// and a pin that matches the comment describing it cannot fail.) Measured
+/// on the demo box at v2.87.0: three live ed25519 keys on disk, `GET /ssh-keys`
+/// → `{"keys":[]}`. The panel's only view of "who can SSH in as root" has shown
+/// nothing, always, on every install — a false all-clear on the most
+/// consequential access list a server has. Add and Remove returned 500.
+///
+/// ⚠ `ReadWritePaths=/root/.ssh` and `BindPaths=/root/.ssh` do NOT override
+/// `ProtectHome=yes` — both were measured in a transient unit and both still
+/// hide the file. Either fix loosens `ProtectHome` itself, which is the exact
+/// direction `agent_unit.rs`'s `compiled_unit_is_the_hardened_one` exists to
+/// prevent, or it does what this does: run the handful of file operations
+/// unsandboxed, the precedent `services/wordpress.rs` already sets.
+///
+/// `Ok(None)` means the file genuinely does not exist, which is a legitimate
+/// empty list. An unreadable file is an `Err` — the whole point of the fix.
+async fn read_authorized_keys() -> Result<Option<String>, String> {
+    // `test -e` first so "absent" and "unreadable" are DIFFERENT answers rather
+    // than being told apart by matching a locale-dependent error string.
+    let exists = safe_command_unsandboxed("test", &[])
+        .args(["-e", AUTHORIZED_KEYS])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+    let out = safe_command_unsandboxed("cat", &[])
+        .arg(AUTHORIZED_KEYS)
+        .output()
+        .await
+        .map_err(|e| format!("could not read {AUTHORIZED_KEYS}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not read {AUTHORIZED_KEYS}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// Replace root's `authorized_keys` atomically, from outside the sandbox.
+///
+/// Staged inside `/var/lib/dockpanel` (which IS in the unit's `ReadWritePaths`)
+/// and then moved into place by `install`, which creates `/root/.ssh`, sets the
+/// mode and copies in one call that runs outside the namespace.
+async fn write_authorized_keys(content: &str) -> Result<(), String> {
+    let staging = format!("/var/lib/dockpanel/.authorized_keys.{}", uuid::Uuid::new_v4());
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)
+            .map_err(|e| format!("could not stage the new key file: {e}"))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("could not stage the new key file: {e}"))?;
+    }
+    let out = safe_command_unsandboxed("install", &[])
+        .args(["-D", "-m", "600", "-o", "root", "-g", "root", &staging, AUTHORIZED_KEYS])
+        .output()
+        .await;
+    let _ = std::fs::remove_file(&staging);
+    let out = out.map_err(|e| format!("could not install {AUTHORIZED_KEYS}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not install {AUTHORIZED_KEYS}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 async fn list_ssh_keys() -> Result<Json<serde_json::Value>, ApiErr> {
-    let path = "/root/.ssh/authorized_keys";
-    let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    // An empty list must mean "root has no keys", never "I could not look".
+    let content = read_authorized_keys()
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?
+        .unwrap_or_default();
 
     let keys: Vec<serde_json::Value> = content
         .lines()
@@ -172,10 +305,12 @@ async fn add_ssh_key(
         return Err(err(StatusCode::BAD_REQUEST, "SSH key options not allowed"));
     }
 
-    let path = "/root/.ssh/authorized_keys";
-    tokio::fs::create_dir_all("/root/.ssh").await.ok();
-
-    let mut content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    // A read that FAILED must not be mistaken for an empty key file — that is
+    // how an append would silently become a replace.
+    let mut content = read_authorized_keys()
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?
+        .unwrap_or_default();
     if content.contains(key) {
         return Err(err(StatusCode::CONFLICT, "Key already exists"));
     }
@@ -186,9 +321,9 @@ async fn add_ssh_key(
     content.push_str(key);
     content.push('\n');
 
-    tokio::fs::write(path, &content).await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write: {e}")))?;
-    let _ = safe_command("chmod").args(["600", path]).output().await;
+    write_authorized_keys(&content)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
 
     tracing::info!("SSH key added");
     Ok(ok("SSH key added"))
@@ -197,8 +332,18 @@ async fn add_ssh_key(
 async fn remove_ssh_key(
     Path(fingerprint): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    let path = "/root/.ssh/authorized_keys";
-    let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    // ⚠ THE ORDER OF THESE TWO FIXES MATTERS, and getting only one of them
+    // would have been worse than shipping neither. This read was also
+    // `unwrap_or_default()`: on a failed read `content` is empty, every line is
+    // filtered out of nothing, and the write below stores `"\n"` — i.e. it
+    // DELETES EVERY ROOT SSH KEY ON THE BOX. Today that is inert only because
+    // the write fails too, under the same sandbox. Repairing the sandbox alone
+    // would have converted a dead feature into a destructive one on the first
+    // transient read error.
+    let content = read_authorized_keys()
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "root has no authorized_keys file"))?;
 
     let new_content: String = content
         .lines()
@@ -219,8 +364,9 @@ async fn remove_ssh_key(
         .collect::<Vec<_>>()
         .join("\n");
 
-    tokio::fs::write(path, format!("{new_content}\n")).await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write: {e}")))?;
+    write_authorized_keys(&format!("{new_content}\n"))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
 
     tracing::info!("SSH key removed: {fingerprint}");
     Ok(ok("SSH key removed"))
@@ -269,49 +415,27 @@ async fn disable_auto_updates() -> Result<Json<serde_json::Value>, ApiErr> {
     Ok(ok("Automatic security updates disabled"))
 }
 
-// ── Panel IP Whitelist ──────────────────────────────────────────────────
-
-async fn get_whitelist() -> Result<Json<serde_json::Value>, ApiErr> {
-    let path = "/etc/dockpanel/panel-whitelist.conf";
-    let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    let ips: Vec<String> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .map(|l| l.trim().to_string())
-        .collect();
-
-    Ok(Json(serde_json::json!({ "ips": ips, "enabled": !ips.is_empty() })))
-}
-
-#[derive(Deserialize)]
-pub struct WhitelistRequest {
-    pub ips: Vec<String>,
-}
-
-async fn set_whitelist(
-    Json(body): Json<WhitelistRequest>,
-) -> Result<Json<serde_json::Value>, ApiErr> {
-    let path = "/etc/dockpanel/panel-whitelist.conf";
-
-    // Validate IPs
-    for ip in &body.ips {
-        let trimmed = ip.trim();
-        if !trimmed.is_empty() && !trimmed.contains('.') && !trimmed.contains(':') {
-            return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid IP: {trimmed}")));
-        }
-    }
-
-    let content: String = body.ips.iter()
-        .filter(|ip| !ip.trim().is_empty())
-        .map(|ip| ip.trim().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    tokio::fs::write(path, format!("{content}\n")).await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write: {e}")))?;
-
-    // Update nginx config to include allow/deny directives
-    // This would be picked up by the panel's nginx config
-    tracing::info!("Panel whitelist updated: {} IPs", body.ips.len());
-    Ok(ok(&format!("Whitelist updated with {} IPs", body.ips.iter().filter(|ip| !ip.trim().is_empty()).count())))
-}
+// The panel IP whitelist handlers that stood here were removed in v2.90.0.
+//
+// ⚠ Deliberately spelled around: an absence pin greps this tree for the endpoint's
+// literal name, and a tombstone that spells it turns that pin red on a correct fix.
+// The route was the panel-side whitelist endpoint; the file was its `.conf` under
+// `/etc/dockpanel/`.
+//
+// They wrote that file and read it back for display, and those two functions were
+// the ONLY references to the path in the entire repository:
+// no nginx include, no template, nothing compiled into either binary beyond the string
+// itself. Their own author had left the note "this WOULD be picked up by the panel's
+// nginx config" — it never was, from 2026-03-15 until removal. Meanwhile the panel
+// grew a real IP restriction one week later, enforced in the backend at every door
+// that mints a session, and the two controls sat on the same settings tab with the
+// inert one listed first.
+//
+// Deliberately NOT finished instead of deleted: the file holds bare addresses, not
+// `allow`/`deny` directives, and lands in a directory no nginx glob reaches, so
+// "include it" was never one step away. Anything that did enforce at the web-server
+// layer would also be unrecoverable from the panel itself, which the backend check —
+// clearable with one SQL statement, documented — is not.
+//
+// A stale copy of that file may still exist on an upgraded box. It is inert, it
+// always was, and nothing here reads or removes it.

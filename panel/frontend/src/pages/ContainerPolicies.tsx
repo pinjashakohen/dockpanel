@@ -13,6 +13,7 @@ interface Policy {
   allowed_images: string | null;
   created_at: string;
   updated_at: string;
+  used: number;
 }
 
 interface User {
@@ -23,10 +24,14 @@ interface User {
 
 export default function ContainerPolicies() {
   const { user: authUser } = useAuth();
+  // Ahead of the loader effect: a redirect is an effect too, so a guard below it
+  // lets the mount spend its requests on a 403 first.
+  if (authUser?.role !== "admin") return <Navigate to="/" replace />;
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState({ text: "", type: "" });
+  const [unreachableServers, setUnreachableServers] = useState(0);
 
   // Form state
   const [showForm, setShowForm] = useState(false);
@@ -40,13 +45,20 @@ export default function ContainerPolicies() {
 
   const loadPolicies = async () => {
     try {
-      const data = await api.get<{ policies: Policy[] }>("/container-policies");
+      const data = await api.get<{ policies: Policy[]; servers_unreachable: number }>("/container-policies");
       setPolicies(data.policies || []);
+      setUnreachableServers(data.servers_unreachable || 0);
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Failed to load policies", type: "error" });
     } finally {
       setLoading(false);
     }
+  };
+
+  const usagePct = (used: number, max: number) => max ? Math.min(100, Math.round((used / max) * 100)) : 0;
+  const usageBarColor = (used: number, max: number) => {
+    const p = max ? (used / max) * 100 : 0;
+    return p >= 90 ? "bg-danger-500" : p >= 70 ? "bg-warn-500" : "bg-rust-500";
   };
 
   const loadUsers = async () => {
@@ -60,8 +72,6 @@ export default function ContainerPolicies() {
     loadPolicies();
     loadUsers();
   }, []);
-
-  if (authUser?.role !== "admin") return <Navigate to="/" replace />;
 
   const resetForm = () => {
     setEditUserId("");
@@ -92,7 +102,9 @@ export default function ContainerPolicies() {
           max_containers: maxContainers,
           max_memory_mb: maxMemory,
           max_cpu_percent: maxCpu,
-          allowed_images: allowedImages || null,
+          // Empty clears the allow-list (back to "any image"); null would
+          // have meant "leave it", which is why it could never be undone.
+          allowed_images: allowedImages,
         });
         setMessage({ text: "Policy updated", type: "success" });
       } else {
@@ -234,6 +246,12 @@ export default function ContainerPolicies() {
         </div>
       )}
 
+      {unreachableServers > 0 && (
+        <div className="px-4 py-2 text-xs text-warn-400 bg-warn-500/10 border border-warn-500/20 rounded-lg">
+          {unreachableServers} server{unreachableServers === 1 ? "" : "s"} did not respond — the usage counts below are a floor, not exact.
+        </div>
+      )}
+
       {/* Policies Table */}
       <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
         <table className="w-full text-sm">
@@ -258,7 +276,17 @@ export default function ContainerPolicies() {
                     <p className="text-dark-100">{p.user_email || "Unknown"}</p>
                     <p className="text-xs text-dark-400 font-mono">{p.user_id.slice(0, 8)}...</p>
                   </td>
-                  <td className="text-center px-4 py-3 text-dark-200">{p.max_containers}</td>
+                  <td className="text-center px-4 py-3 text-dark-200">
+                    <div className="inline-flex flex-col items-center gap-1 w-16">
+                      <span className="font-mono">{p.used}/{p.max_containers}</span>
+                      <div className="w-full h-1.5 bg-dark-700 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full ${usageBarColor(p.used, p.max_containers)} rounded-full transition-all`}
+                          style={{ width: `${usagePct(p.used, p.max_containers)}%` }}
+                        />
+                      </div>
+                    </div>
+                  </td>
                   <td className="text-center px-4 py-3 text-dark-200">{p.max_memory_mb >= 1024 ? `${(p.max_memory_mb / 1024).toFixed(1)}GB` : `${p.max_memory_mb}MB`}</td>
                   <td className="text-center px-4 py-3 text-dark-200">{p.max_cpu_percent}%</td>
                   <td className="text-right px-4 py-3">
@@ -276,10 +304,17 @@ export default function ContainerPolicies() {
       <div className="bg-dark-800 rounded-lg border border-dark-500 p-5">
         <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest mb-3">How It Works</h3>
         <div className="space-y-2 text-sm text-dark-200">
-          <p><strong className="text-dark-100">Container limits</strong> — Maximum number of Docker containers a user can deploy.</p>
-          <p><strong className="text-dark-100">Memory &amp; CPU</strong> — Maximum resources per container deployment.</p>
-          <p><strong className="text-dark-100">Allowed images</strong> — Restrict which Docker images a user can deploy. Leave empty for no restriction.</p>
-          <p className="text-xs text-dark-400 mt-2">Users without a policy have no container limits applied.</p>
+          <p><strong className="text-dark-100">Container limits</strong> — Maximum number of Docker containers a user can deploy, counted across every server they can reach, not just one. Counted when deploying from a template; a Compose file or a stack is not counted against it.</p>
+          <p><strong className="text-dark-100">Memory &amp; CPU</strong> — Maximum resources per container deployment, applied to template deploys.</p>
+          <p><strong className="text-dark-100">Allowed images</strong> — Comma-separated. Checked wherever an image is chosen: template deploys, changing an app&rsquo;s image, Compose and stacks. Leave empty for no restriction.</p>
+          <p className="text-xs text-dark-400">
+            An entry matches the whole reference (<span className="font-mono">nginx:1.27</span>), or the repository it
+            tags (<span className="font-mono">nginx</span> allows <span className="font-mono">nginx:1.27</span> but not
+            <span className="font-mono"> evil/nginx-backdoor</span>), or a repository prefix ending in
+            <span className="font-mono"> /*</span> (<span className="font-mono">ghcr.io/myorg/*</span>). A template&rsquo;s
+            own id is also accepted, exactly. <span className="font-mono">*</span> allows everything.
+          </p>
+          <p className="text-xs text-dark-400 mt-2">Users without a policy have no container limits applied. Only administrators can deploy containers, so a policy on any other account has nothing to restrict.</p>
         </div>
       </div>
     </div>

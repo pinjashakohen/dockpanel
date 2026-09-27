@@ -7,7 +7,7 @@
 #   GET /api/backup-orchestrator/chain-report/{kind}/{id}/pdf    (PDF, lazy-installs typst)
 # where {kind} ∈ {site, database, volume}.
 #
-# Auth strategy mirrors tier2-pin-e2e.sh: prefer DOCKPANEL_TEST_PASSWORD;
+# Auth strategy mirrors tier2-certpin-e2e.sh: prefer DOCKPANEL_TEST_PASSWORD;
 # otherwise mint a short-lived admin JWT from /etc/dockpanel/api.env.
 #
 # typst lazy-installs on the first PDF render (~30MB tarball, ~30s on a
@@ -154,12 +154,12 @@ assert_kind() {
 
     if [ "$PDF_STATUS" = "200" ]; then
         green "$kind: PDF 200"
-        if echo "$PDF_HEADERS" | grep -qi "content-type: application/pdf"; then
+        if echo "$PDF_HEADERS" | grep -ci "content-type: application/pdf" >/dev/null; then
             green "$kind: PDF Content-Type"
         else
             red "$kind: PDF Content-Type wrong/missing"
         fi
-        if echo "$PDF_HEADERS" | grep -qi "content-disposition:.*attachment"; then
+        if echo "$PDF_HEADERS" | grep -ci "content-disposition:.*attachment" >/dev/null; then
             green "$kind: PDF Content-Disposition: attachment"
         else
             red "$kind: PDF Content-Disposition missing"
@@ -168,7 +168,7 @@ assert_kind() {
         PDF_OUT="/tmp/chain_report_${kind}.pdf"
         curl -s --max-time "$PDF_TIMEOUT" -o "$PDF_OUT" "${AUTH[@]}" \
             "$API/api/backup-orchestrator/chain-report/$kind/$BACKUP_ID/pdf" 2>/dev/null
-        if head -c 4 "$PDF_OUT" | grep -q "^%PDF"; then
+        if head -c 4 "$PDF_OUT" | grep -c "^%PDF" >/dev/null; then
             green "$kind: PDF body has %PDF magic"
         else
             red "$kind: PDF body missing %PDF magic"

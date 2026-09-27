@@ -27,7 +27,31 @@ struct PolicyRow {
     last_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Derive the symmetric key used to encrypt AND decrypt policy-driven DB backups.
+/// v1 backup-encryption passphrase: a literal substring of `JWT_SECRET`.
+///
+/// ⚠ SECURITY (s434): weak by construction — it hands anyone who learns a
+/// backup passphrase 32 bytes of the same secret every session token is
+/// HMAC-signed with, coupling "one old backup file leaked" to "every session
+/// on this install can be forged." Kept ONLY so `derive_backup_encryption_key_for_version`
+/// can still decrypt a backup written before v2 existed. Never call this
+/// directly and never use it for a new encrypt — see
+/// [`crate::services::secrets_crypto::derive_backup_encryption_key_v2`] for
+/// the current derivation and the full account of what was wrong with this one.
+fn derive_backup_encryption_key_v1(jwt_secret: &str) -> String {
+    format!("backup-enc-{}", &jwt_secret[..32.min(jwt_secret.len())])
+}
+
+/// The backup-encryption key version every NEW encrypted backup is written
+/// with. Bump this — and add a new `vN` derivation plus a match arm in
+/// [`derive_backup_encryption_key_for_version`] — if the derivation ever
+/// needs to change again. Never repurpose an existing version number: a
+/// `database_backups.encryption_key_version` row is a permanent record of
+/// which derivation actually produced that file, and reusing a number would
+/// make a past backup silently unrestorable rather than restorable-by-version.
+pub const CURRENT_BACKUP_KEY_VERSION: i16 = 2;
+
+/// Derive the symmetric passphrase used to encrypt AND decrypt policy-driven
+/// DB backups, for a SPECIFIC recorded version.
 ///
 /// This is the SINGLE SOURCE OF TRUTH for the derivation. The encrypt side
 /// (`execute_policy`) and the decrypt side (`routes::backup_orchestrator::restore_db_backup`)
@@ -36,9 +60,27 @@ struct PolicyRow {
 /// encrypted DB backup was permanently unrestorable and DR was silently broken in encrypted
 /// mode (lesson #70: resolve by the value that actually produced the artifact, not a
 /// re-derived phantom). Keyed on the process JWT secret (`config.jwt_secret`, == the
-/// `JWT_SECRET` env the executor is handed), so both sides agree byte-for-byte.
+/// `JWT_SECRET` env the executor is handed), so both sides agree byte-for-byte — PROVIDED
+/// both sides ask for the same `version`. Restore reads `database_backups.encryption_key_version`
+/// (written at encrypt time) rather than assuming [`CURRENT_BACKUP_KEY_VERSION`], so a backup
+/// written under an older derivation stays restorable after the derivation changes.
+pub fn derive_backup_encryption_key_for_version(version: i16, jwt_secret: &str) -> String {
+    match version {
+        1 => derive_backup_encryption_key_v1(jwt_secret),
+        // Unknown/future version numbers fall through to the current
+        // derivation rather than panicking — a corrupt or downgraded-reader
+        // scenario then fails LOUDLY (openssl rejects the wrong passphrase)
+        // instead of crashing the executor.
+        _ => crate::services::secrets_crypto::derive_backup_encryption_key_v2(jwt_secret),
+    }
+}
+
+/// The passphrase a NEW encrypted backup is written with — always
+/// [`CURRENT_BACKUP_KEY_VERSION`]. Restoring an EXISTING backup must call
+/// [`derive_backup_encryption_key_for_version`] with that row's own recorded
+/// version instead of this function.
 pub fn derive_backup_encryption_key(jwt_secret: &str) -> String {
-    format!("backup-enc-{}", &jwt_secret[..32.min(jwt_secret.len())])
+    derive_backup_encryption_key_for_version(CURRENT_BACKUP_KEY_VERSION, jwt_secret)
 }
 
 /// A policy's off-site destination, resolved once per run.
@@ -242,7 +284,8 @@ async fn tick(db: &PgPool, agents: &AgentRegistry, jwt_secret: &str) -> Result<(
 
         let stale: Vec<(String,)> = sqlx::query_as(
             "SELECT s.domain FROM sites s WHERE s.status = 'active' \
-             AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.site_id = s.id AND b.created_at > NOW() - INTERVAL '48 hours')"
+             AND NOT EXISTS (SELECT 1 FROM backups b WHERE b.site_id = s.id AND b.created_at > NOW() - INTERVAL '48 hours' \
+                             AND (b.destination_id IS NULL OR b.uploaded))"
         ).fetch_all(db).await.unwrap_or_default();
 
         if !stale.is_empty() {
@@ -269,10 +312,14 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
 
     // A failed upload counts as a FAILURE (so the policy reports partial/failed
     // and the backup_failure alert fires) but the local file is still recorded.
-    // This deliberately differs from `backup_scheduler`, which drops the row
-    // entirely: these tables carry the sha256 integrity chain, and a missing row
-    // would break `previous_hash` for every backup after it. Recording the file
-    // with `uploaded = FALSE` keeps the chain intact and keeps the UI honest.
+    // The reasons are the sha256 integrity chain, which a missing row breaks for
+    // every backup after it, and retention, which enumerates rows and can never
+    // reap a file no row names.
+    //
+    // `backup_scheduler` used to drop the row entirely and this comment used to
+    // name that divergence. It no longer exists: the scheduler records the
+    // archive local-only and fails the run afterwards, so both writers now agree
+    // that an archive on disk gets a row whatever happened to the upload.
     let mut upload_failures = 0;
 
     // Circuit breaker. Each upload retries three times with 5s/15s/30s backoff,
@@ -356,6 +403,21 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
                     let filename = resp.get("filename").and_then(|v| v.as_str()).unwrap_or("");
                     let size_bytes = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
 
+                    // Same read the database and volume branches below already do
+                    // off their own agent responses. This branch had the field in
+                    // scope and never looked at it, so a site archived by a policy
+                    // carried no integrity hash while its db and volume siblings
+                    // in this very function did (#114). Read before the upload, as
+                    // they do.
+                    let sha256_hash = resp
+                        .get("sha256")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT sha256_hash FROM backups WHERE site_id = $1 ORDER BY created_at DESC LIMIT 1"
+                    ).bind(site_id).fetch_optional(db).await.unwrap_or(None).flatten();
+
                     let mut uploaded = false;
                     if let (Some(dest), false) = (&destination, destination_down) {
                         let filepath = format!("/var/backups/dockpanel/{domain}/{filename}");
@@ -379,9 +441,14 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
                                     if let Some(msg) = resp.get("message").and_then(|v| v.as_str()) {
                                         if !remote_prune_warned {
                                             remote_prune_warned = true;
+                                            // "warning", not "warn" — the API filters and
+                                            // counts on the former, so a "warn" row was
+                                            // uncountable in the Warnings tile and grey in
+                                            // the list. Its sibling at backup_scheduler.rs
+                                            // already spelled it the long way twice.
                                             crate::services::system_log::log_event(
                                                 db,
-                                                "warn",
+                                                "warning",
                                                 "backup_policy_executor",
                                                 &format!("Policy '{}': remote retention was not enforced", policy.name),
                                                 Some(msg),
@@ -410,13 +477,15 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
                     // deleting a backup destination mid-run, which makes every
                     // remaining insert in that run a foreign-key violation.
                     match sqlx::query(
-                        "INSERT INTO backups (site_id, filename, size_bytes, destination_id, uploaded, databases_included, databases_expected) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                        "INSERT INTO backups (site_id, filename, size_bytes, destination_id, uploaded, databases_included, databases_expected, sha256_hash, previous_hash) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
                     )
                     .bind(site_id).bind(filename).bind(size_bytes)
                     .bind(destination.as_ref().map(|d| d.id)).bind(uploaded)
                     .bind(resp.get("databases_included").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) as i32)
                     .bind(db_expected)
+                    .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
+                    .bind(previous_hash.as_deref())
                     .execute(db).await {
                         Ok(_) => successes += 1,
                         Err(e) => {
@@ -435,19 +504,38 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
 
     // Backup databases
     if policy.backup_databases {
-        // `s.server_id` comes free from the join this query already makes — the same
+        // `server_id` comes free from the join this query already makes — the same
         // shape `create_db_backup` uses. Without it the panel `docker exec`s whatever
         // answers to `dockpanel-db-{name}` on ITS OWN host, and that name is unique
-        // only per site, so the dump can be another tenant's database entirely.
-        let databases: Vec<(Uuid, String, String, String, String, Uuid)> = sqlx::query_as(
-            "SELECT d.id, d.name, d.engine, d.db_user, d.db_password_enc, s.server_id \
-             FROM databases d JOIN sites s ON d.site_id = s.id WHERE s.user_id = $1"
+        // only per owner, so the dump can be another tenant's database entirely.
+        //
+        // LEFT JOIN both owner tables + COALESCE, same pattern as databases.rs's
+        // list()/get() — a plain `JOIN sites` here silently dropped every
+        // stack-owned database (site_id IS NULL for those rows since v2.242.0's
+        // standalone-DB-for-stacks ship), so they got zero backup coverage,
+        // scheduled or manual, with no error anywhere in the chain.
+        let databases: Vec<(Uuid, String, String, String, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT d.id, d.name, d.engine, d.db_user, d.db_password_enc, \
+             COALESCE(s.server_id, st.server_id) \
+             FROM databases d \
+             LEFT JOIN sites s ON d.site_id = s.id \
+             LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+             WHERE COALESCE(s.user_id, st.user_id) = $1"
         )
         .bind(policy.user_id)
         .fetch_all(db).await.unwrap_or_default();
 
         for (db_id, db_name, engine, user, password_enc, db_server_id) in &databases {
-            let agent = match agents.for_server(*db_server_id).await {
+            let Some(db_server_id) = *db_server_id else {
+                failures += 1;
+                tracing::warn!(
+                    "Policy '{}': skipping database {db_name} — its owner (site or \
+                     stack) row has no server_id.",
+                    policy.name
+                );
+                continue;
+            };
+            let agent = match agents.for_server(db_server_id).await {
                 Ok(a) => a,
                 Err(e) => {
                     failures += 1;
@@ -484,9 +572,9 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
                     let encrypted = encryption_key.is_some();
 
                     let sha256_hash = resp.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let previous_hash: Option<String> = sqlx::query_scalar(
+                    let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
                         "SELECT sha256_hash FROM database_backups WHERE database_id = $1 ORDER BY created_at DESC LIMIT 1"
-                    ).bind(db_id).fetch_optional(db).await.unwrap_or(None);
+                    ).bind(db_id).fetch_optional(db).await.unwrap_or(None).flatten();
 
                     let mut uploaded = false;
                     if let (Some(dest), false) = (&destination, destination_down) {
@@ -503,11 +591,11 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
                     }
 
                     match sqlx::query(
-                        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, policy_id, destination_id, uploaded, sha256_hash, previous_hash, chain_valid) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE)"
+                        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, encryption_key_version, policy_id, destination_id, uploaded, sha256_hash, previous_hash, chain_valid) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, TRUE)"
                     )
-                    .bind(db_id).bind(*db_server_id).bind(&filename).bind(size_bytes)
-                    .bind(engine).bind(db_name).bind(encrypted).bind(policy.id)
+                    .bind(db_id).bind(db_server_id).bind(&filename).bind(size_bytes)
+                    .bind(engine).bind(db_name).bind(encrypted).bind(CURRENT_BACKUP_KEY_VERSION).bind(policy.id)
                     .bind(destination.as_ref().map(|d| d.id)).bind(uploaded)
                     .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
                     .bind(previous_hash.as_deref())
@@ -612,9 +700,9 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
                                             let size_bytes = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
 
                                             let sha256_hash = resp.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                            let previous_hash: Option<String> = sqlx::query_scalar(
+                                            let previous_hash: Option<String> = sqlx::query_scalar::<_, Option<String>>(
                                                 "SELECT sha256_hash FROM volume_backups WHERE container_id = $1 AND volume_name = $2 ORDER BY created_at DESC LIMIT 1"
-                                            ).bind(container_id).bind(vol_name).fetch_optional(db).await.unwrap_or(None);
+                                            ).bind(container_id).bind(vol_name).fetch_optional(db).await.unwrap_or(None).flatten();
 
                                             let mut uploaded = false;
                                             if let (Some(dest), false) = (&destination, destination_down) {
@@ -727,6 +815,7 @@ async fn execute_policy(db: &PgPool, agents: &AgentRegistry, policy: &PolicyRow,
         notifications::fire_alert(
             db, policy.user_id, policy.server_id, None,
             "backup_failure",
+            "",
             // An off-site copy that didn't happen is serious but recoverable on the
             // next run, and the data is still on disk. Don't page at the same
             // urgency as "the backup did not happen at all".
@@ -806,18 +895,18 @@ mod tests {
     // the backup key from the same single source of truth. These pin that derivation so the two
     // sides can never drift back into the incompatible-key bug that made encrypted restores 400.
     #[test]
-    fn backup_key_derivation_is_stable_and_prefixed() {
+    fn backup_key_derivation_is_stable() {
         let jwt = "abcdefghijklmnopqrstuvwxyz0123456789EXTRA";
         let k = derive_backup_encryption_key(jwt);
-        // Deterministic + uses only the first 32 bytes of the secret.
-        assert_eq!(k, "backup-enc-abcdefghijklmnopqrstuvwxyz012345");
-        assert_eq!(derive_backup_encryption_key(jwt), k);
+        assert_eq!(derive_backup_encryption_key(jwt), k, "same jwt_secret must derive the same key every time");
     }
 
     #[test]
     fn backup_key_derivation_handles_short_secret() {
-        // Must not panic on a secret shorter than 32 bytes (32.min(len)).
-        assert_eq!(derive_backup_encryption_key("short"), "backup-enc-short");
+        // Must not panic on a secret shorter than 32 bytes — v1's own
+        // 32.min(len) guard existed for exactly this; HKDF has no such limit,
+        // but the guard against a panic on short input still matters.
+        let _ = derive_backup_encryption_key("short");
     }
 
     #[test]
@@ -829,5 +918,56 @@ mod tests {
             derive_backup_encryption_key(secret),
             derive_backup_encryption_key(secret),
         );
+    }
+
+    // ── s434: versioned derivation, migration safety ───────────────────────
+
+    #[test]
+    fn version_1_reproduces_the_exact_legacy_format() {
+        // A backup written before s434 has encryption_key_version = 1 (the
+        // migration's DEFAULT). Restore must reproduce EXACTLY what v1 wrote,
+        // byte for byte, or every pre-existing encrypted backup becomes
+        // permanently unrestorable the moment this ships.
+        let jwt = "abcdefghijklmnopqrstuvwxyz0123456789EXTRA";
+        assert_eq!(
+            derive_backup_encryption_key_for_version(1, jwt),
+            "backup-enc-abcdefghijklmnopqrstuvwxyz012345",
+        );
+        // And the short-secret shape v1's own 32.min(len) guard existed for.
+        assert_eq!(derive_backup_encryption_key_for_version(1, "short"), "backup-enc-short");
+    }
+
+    #[test]
+    fn current_version_constant_matches_the_default_derivation() {
+        let jwt = "some-jwt-secret";
+        assert_eq!(
+            derive_backup_encryption_key_for_version(CURRENT_BACKUP_KEY_VERSION, jwt),
+            derive_backup_encryption_key(jwt),
+            "derive_backup_encryption_key must always mean 'the CURRENT version', \
+             or a new encrypt and a version-aware restore of that same backup would disagree",
+        );
+    }
+
+    #[test]
+    fn version_1_and_version_2_derive_different_keys() {
+        // THE property this whole migration exists for: the old (leaky) and
+        // new (safe) derivations must not collide, or restore could silently
+        // decrypt with the wrong-but-matching key.
+        let jwt = "same-jwt-secret-both-versions";
+        assert_ne!(
+            derive_backup_encryption_key_for_version(1, jwt),
+            derive_backup_encryption_key_for_version(2, jwt),
+        );
+    }
+
+    #[test]
+    fn unknown_version_falls_through_to_current_not_a_panic() {
+        // A row from a future/downgraded reader naming a version this build
+        // doesn't recognise must not crash the executor — it should derive
+        // SOME key (which will then correctly fail to decrypt, a loud and
+        // recoverable failure) rather than panic and take the whole run down.
+        let jwt = "some-jwt-secret";
+        let result = std::panic::catch_unwind(|| derive_backup_encryption_key_for_version(99, jwt));
+        assert!(result.is_ok(), "an unrecognised version must not panic");
     }
 }

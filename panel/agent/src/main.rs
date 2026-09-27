@@ -4,6 +4,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod routes;
 pub mod safe_cmd;
 mod services;
+pub mod site_lock;
 mod tls;
 
 use axum::{middleware, Router};
@@ -73,7 +74,24 @@ async fn main() {
     std::fs::create_dir_all("/var/backups/dockpanel").ok();
     std::fs::create_dir_all("/var/backups/dockpanel/databases").ok();
     std::fs::create_dir_all("/var/backups/dockpanel/volumes").ok();
+
+    // The backup tree is root-only, and this repairs what is already on disk.
+    // `create_dir_all` above made these 0755 and every writer's redirect made
+    // the files 0644, so on a panel host that also serves sites the panel's own
+    // database dump — agent tokens in cleartext — was readable by www-data, the
+    // uid every hosted site's PHP runs as. Both panel services run as root, so
+    // nothing legitimate loses access. See the function's own docs.
+    services::backups::secure_backup_tree();
     std::fs::create_dir_all("/var/www/acme/.well-known/acme-challenge").ok();
+
+    // One-shot migration, idempotent: give static vhosts already on disk the denies
+    // v2.68.0 added to the template. The template alone reaches a site only when
+    // something re-renders its vhost, and nothing re-renders on upgrade — so an
+    // already-switched site keeps serving its PHP source. update.sh carries the same
+    // retrofit, but its own header records that an agent-only box never runs it, so
+    // this is the copy that reaches a fleet member. Awaited deliberately: it must
+    // finish before the agent starts serving vhost writes of its own.
+    services::nginx::retrofit_static_denies().await;
 
     // Load auth token: prefer AGENT_TOKEN env var, then file, then generate new
     let token_path = format!("{CONFIG_DIR}/agent.token");
@@ -171,6 +189,7 @@ async fn main() {
         .merge(routes::system::router())
         .merge(routes::nginx::router())
         .merge(routes::ssl::router())
+        .merge(routes::ssl_registry::router())
         .merge(routes::database::router())
         .merge(routes::files::router())
         .merge(routes::backups::router())
@@ -198,6 +217,7 @@ async fn main() {
         .merge(routes::panel_update::router())
         .merge(routes::diagnostics::router())
         .merge(routes::mail::router())
+        .merge(routes::sftp::router())
         .merge(routes::migration::router())
         .merge(routes::service_installer::router())
         .merge(routes::server_utils::router())

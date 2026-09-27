@@ -22,12 +22,14 @@ The drawer lists every vulnerability from the latest scan: CVE ID, severity, aff
 
 ## Deploy gate
 
-When the deploy gate is set to `critical`, `high`, or `medium`, new deploys check the template's image against the latest stored scan:
+When the deploy gate is set to `critical`, `high`, or `medium`, every door that puts an image on a host checks it against the latest stored scan for that host — deploying a template, changing an app's image, deploying a compose file, and creating or editing a stack (each service in the file is checked):
 
 - If the last scan is within the past 7 days and exceeds the threshold, the deploy is refused with a clear message naming the counts and the image.
 - If no recent scan exists, the deploy is allowed and a best-effort background scan starts. The next attempt of the same image will be gated.
 
 The gate is intentionally soft on first contact — it never blocks the very first deploy of an image on a cold database, so operators aren't stuck waiting 30–180 s on a blocking scan the first time they use a template.
+
+**Updating an app is deliberately exempt.** `Update` re-pulls the reference the app already runs, so the only scan on file is a scan of the image being *replaced*. Gating on it would refuse the update exactly when the running image is vulnerable — which is the update that fixes it. The background sweep rescans the new image afterwards, and the badge on the Apps page reflects it.
 
 ## API
 
@@ -43,6 +45,10 @@ All endpoints require admin auth.
 | `POST` | `/api/apps/:name/scan` | Scan the image used by a specific app |
 | `GET` | `/api/apps/:name/scan` | Latest stored scan for an app's image |
 | `GET` | `/api/image-scan/recent` | Latest row per scanned image |
+
+## Alerts
+
+A critical or high-severity finding fires an `image_scan` alert to every administrator, keyed per image so unrelated images never resolve or suppress each other's alert. It clears itself automatically the next time that image scans clean — no manual acknowledgement needed. Mute or route it like any other alert type from **Settings → Notifications**.
 
 ## Storage
 

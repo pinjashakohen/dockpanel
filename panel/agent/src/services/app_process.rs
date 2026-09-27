@@ -54,7 +54,23 @@ pub fn create_app_service(
     command_filter::is_safe_exec_start(command, runtime)?;
 
     let svc = service_name(domain);
-    let working_dir = format!("/var/www/{domain}/public");
+    let site_dir = format!("/var/www/{domain}");
+
+    // A managed process has to start where its code is. `document_root_for` is the
+    // one place that knows where that is per runtime — node/python/proxy keep the
+    // site root, static and php nest under `public/` — and it is what the vhost,
+    // the git clone and `EnvironmentFile` below all already agree on.
+    //
+    // This used to hardcode `{site_dir}/public` for every runtime, and this
+    // function only ever runs for node and python (`routes/nginx.rs`, the
+    // node|python branch). So every managed process was started in a directory the
+    // panel itself created EMPTY two lines before `systemctl enable --now`.
+    // `node server.js` (rc=1, MODULE_NOT_FOUND) and `python3 app.py` (rc=2) both
+    // resolve their entry point against the cwd, and `Restart=always` below turns
+    // that into a permanent crash loop. `npm start` is the exception that hid it
+    // for so long: npm walks up to the nearest package.json and re-roots the cwd
+    // there, and it is the first of the three examples the site form offers.
+    let working_dir = crate::services::nginx::document_root_for(&site_dir, runtime);
 
     // Determine the ExecStart based on runtime
     let exec_start = match runtime {
@@ -167,11 +183,26 @@ WantedBy=multi-user.target
 
     // Create working directory if it doesn't exist
     std::fs::create_dir_all(&working_dir).ok();
-    // Set ownership
-    safe_command_sync("chown")
-        .args(["-R", "www-data:www-data", &format!("/var/www/{domain}")])
-        .output()
-        .ok();
+    // Set ownership — everything except `.git`, which stays root's. A git-deployed
+    // Node/Python app runs this on every (re)create; handing `.git` to www-data
+    // gives the app `config`/`hooks/` that `deploy.rs::clone_or_pull` runs as root
+    // on the next deploy. Mirrors `deploy.rs::hand_tree_to_web_user`.
+    let site_dir = format!("/var/www/{domain}");
+    if let Ok(entries) = std::fs::read_dir(&site_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let _ = safe_command_sync("chown")
+                .args(["-R", "www-data:www-data", &entry.path().to_string_lossy()])
+                .output();
+        }
+    }
+    let git_dir = format!("{site_dir}/.git");
+    if std::path::Path::new(&git_dir).exists() {
+        let _ = safe_command_sync("chown").args(["-R", "root:root", &git_dir]).output();
+        let _ = safe_command_sync("chmod").args(["-R", "go-rwx", &git_dir]).output();
+    }
 
     // Reload systemd and enable+start the service
     safe_command_sync("systemctl")

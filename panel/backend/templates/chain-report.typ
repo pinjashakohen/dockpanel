@@ -64,10 +64,18 @@
 
 // ── Header ──────────────────────────────────────────────────────────────
 
-#let kind_label = if data.backup.kind == "site" { "Site" }
+// The braces are load-bearing, not style. A `#`-expression written in MARKUP mode
+// ends at the first line break that leaves it syntactically complete, so a bare
+// `if …{}` here bound only the first branch and the `else if` lines below it were
+// re-lexed as a paragraph and PRINTED above the masthead. Wrapping the chain in a
+// code block makes newlines trivia, exactly as `humanbytes` and `status_pill` above
+// already do — they were never broken for that reason alone.
+#let kind_label = {
+  if data.backup.kind == "site" { "Site" }
   else if data.backup.kind == "database" { "Database" }
   else if data.backup.kind == "volume" { "Volume" }
   else { upper(data.backup.kind) }
+}
 
 #align(left)[
   #text(size: 22pt, weight: "bold", fill: dp_brand)[DockPanel]
@@ -101,11 +109,6 @@
 #kv("Size", humanbytes(data.backup.size_bytes))
 #kv("SHA-256", mono(if data.backup.sha256_hash != none { data.backup.sha256_hash } else { "—" }))
 #kv("Previous hash", mono(if data.backup.previous_hash != none { data.backup.previous_hash } else { "—" }))
-#kv("Chain valid", if data.backup.chain_valid {
-  text(fill: dp_pass, weight: "bold")[YES]
-} else {
-  text(fill: dp_fail, weight: "bold")[NO]
-})
 
 // ── Verifications ───────────────────────────────────────────────────────
 
@@ -165,9 +168,11 @@
       text(size: 8.5pt)[#if d.http_status != none { str(d.http_status) } else { "—" }],
       text(size: 8.5pt)[#duration_ms(d.duration_ms)],
       text(size: 8.5pt, fill: if d.error_message != none { dp_fail } else { dp_dim })[
-        #if d.error_message != none { d.error_message }
-        else if d.body_excerpt != none { d.body_excerpt }
-        else { "—" }
+        #{
+          if d.error_message != none { d.error_message }
+          else if d.body_excerpt != none { d.body_excerpt }
+          else { "—" }
+        }
       ],
     )).flatten()
   )
@@ -178,11 +183,6 @@
 #v(1em)
 == Chain Integrity
 
-#kv("Chain valid", if data.chain_integrity.chain_valid {
-  text(fill: dp_pass, weight: "bold")[YES]
-} else {
-  text(fill: dp_fail, weight: "bold")[NO]
-})
 #kv("Verifications passed", [#data.chain_integrity.verifications_passed of #data.verifications.len()])
 #kv("Drills passed", [#data.chain_integrity.drills_passed of #data.drills.len()])
 
@@ -190,8 +190,8 @@
 #text(size: 8pt, fill: dp_dim)[
   This report is a point-in-time snapshot of one #lower(kind_label) backup
   and its full verification + restore-drill history. Hashes are SHA-256 over
-  the backup artifact bytes. Chain validity links each backup to its
-  predecessor; a break in the chain indicates either a missing intermediate
-  backup or a tampered artifact. Restore drills end-to-end probe a real
-  restore into a scratch container.
+  the backup artifact bytes, recorded when the backup was taken and not
+  re-computed since — this document reports what was recorded, and does not
+  itself attest that the stored artifact still matches its hash. Restore
+  drills end-to-end probe a real restore into a scratch container.
 ]

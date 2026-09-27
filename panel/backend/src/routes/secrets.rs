@@ -5,7 +5,7 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::auth::{AuthUser, ServerScope};
+use crate::auth::AuthUser;
 use crate::error::{internal_error, err, agent_error, ApiError};
 use crate::services::activity;
 use crate::services::extensions::fire_event;
@@ -77,6 +77,58 @@ pub struct CreateVaultRequest {
 pub struct UpdateVaultRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+    /// A double option, deliberately. The `COALESCE($n, col)` shape the two fields
+    /// above use can SET a value and can never CLEAR one — the client sends null for
+    /// "none", the handler folds it back onto the stored value, and the save answers
+    /// green having changed nothing. That is the notification-destination defect
+    /// v2.120.0 shipped a fix for, and a link that cannot be removed is worse here
+    /// than a name that cannot be blanked: it decides whose site gets the secrets.
+    ///
+    /// Absent key = leave the link alone. Explicit `null` = unlink.
+    #[serde(default, deserialize_with = "explicit_option")]
+    pub site_id: Option<Option<Uuid>>,
+}
+
+/// Distinguishes "key absent" from "key present and null" for [`UpdateVaultRequest`].
+/// `#[serde(default)]` supplies the outer `None` when the key is missing; this only
+/// ever runs when the key IS present, so it wraps whatever it finds — including null.
+pub(crate) fn explicit_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+/// A vault may only be linked to a site the caller may already reach.
+///
+/// The deploy-time injector matches vaults to sites on `v.site_id = $1` ALONE, with no
+/// owner test — safe only for as long as nothing can write the column, which was true
+/// while the create form omitted it and stops being true the moment an operator gets a
+/// site picker. Validating on the write side is what keeps that join sound, and it is
+/// the same predicate the rest of the panel uses to decide which sites a caller sees.
+async fn assert_site_reachable(
+    state: &AppState,
+    site_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let found: Option<(Uuid,)> = sqlx::query_as(&format!(
+        "SELECT s.id FROM sites s WHERE {}",
+        crate::helpers::SITE_CALLER_PREDICATE
+    ))
+    .bind(site_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("verify vault site", e))?;
+
+    if found.is_none() {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "That site does not exist, or it belongs to another account.",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -105,27 +157,40 @@ pub struct PaginationQuery {
 
 const VALID_TYPES: &[&str] = &["env", "api_key", "password", "certificate", "custom"];
 
-/// Derive a dedicated encryption key separate from the JWT secret.
-/// Uses SECRETS_ENCRYPTION_KEY env var if set, otherwise derives one via SHA-256.
-/// Derive the vault encryption key. `pub(crate)` so provisioning paths that
-/// generate credentials (site creation writing the CMS admin password into the
-/// site's auto-created vault) encrypt with the SAME key the Secrets Manager
-/// decrypts with — a second derivation here would store values the UI can't read.
+/// Derive the vault encryption key to WRITE with. `pub(crate)` so provisioning
+/// paths that generate credentials (site creation writing the CMS admin password
+/// into the site's auto-created vault) encrypt with the SAME key the Secrets
+/// Manager decrypts with — a second derivation here would store values the UI
+/// can't read.
+///
+/// ⚠ READERS MUST NOT USE THIS. It returns one source, and a value written
+/// before `SECRETS_ENCRYPTION_KEY` was set is not readable under it. Decrypt
+/// through `secrets_crypto::decrypt_vault`, which tries every source the value
+/// could have been written under. Handing this single string to
+/// `secrets_crypto::decrypt` is what made setting that variable a one-way door
+/// for the whole vault.
+///
+/// The empty-string case (`SECRETS_ENCRYPTION_KEY=` exported but blank) is
+/// handled inside `vault_key_primary` and treated as unset, matching what the
+/// credential path has always done — carried as an open nit since s328.
 pub(crate) fn get_encryption_key(jwt_secret: &str) -> String {
-    std::env::var("SECRETS_ENCRYPTION_KEY").unwrap_or_else(|_| {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(b"dockpanel-secrets-encryption:");
-        hasher.update(jwt_secret.as_bytes());
-        hex::encode(hasher.finalize())
-    })
+    secrets_crypto::vault_key_primary(jwt_secret)
 }
 
+/// Byte-slicing (`&value[..4]`) panics whenever byte offset 4 doesn't land on a
+/// UTF-8 char boundary — reachable from any secret value containing a
+/// multi-byte character (e.g. a pasted passphrase), and every masking call
+/// site hits it: `create_secret`/`update_secret`'s response, and every
+/// default (`reveal=false`) `list_secrets` call thereafter, since the value
+/// is stored regardless of whether the response that reports it panics.
+/// Walking chars instead of bytes can't straddle a boundary by construction.
 fn mask_value(value: &str) -> String {
-    if value.len() <= 4 {
+    let mut chars = value.chars();
+    let prefix: String = chars.by_ref().take(4).collect();
+    if chars.next().is_none() {
         "••••••••".to_string()
     } else {
-        format!("{}••••••••", &value[..4])
+        format!("{prefix}••••••••")
     }
 }
 
@@ -156,6 +221,10 @@ pub async fn create_vault(
         return Err(err(StatusCode::BAD_REQUEST, "Name must be 1-100 characters"));
     }
 
+    if let Some(site_id) = req.site_id {
+        assert_site_reachable(&state, site_id, claims.sub).await?;
+    }
+
     let vault: SecretVault = sqlx::query_as(
         "INSERT INTO secret_vaults (user_id, name, description, site_id) VALUES ($1, $2, $3, $4) RETURNING *"
     )
@@ -168,7 +237,7 @@ pub async fn create_vault(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "vault.create",
-        Some("vault"), Some(&req.name), None, None,
+        Some("vault"), Some(&req.name), None, None, claims.key_id,
     ).await;
 
     Ok((StatusCode::CREATED, Json(vault)))
@@ -205,14 +274,23 @@ pub async fn update_vault(
         }
     }
 
+    if let Some(Some(site_id)) = req.site_id {
+        assert_site_reachable(&state, site_id, claims.sub).await?;
+    }
+
+    // `$5` carries "was the key present at all", so an explicit null unlinks while an
+    // absent key leaves the existing link untouched. COALESCE cannot express that.
     let vault: Option<SecretVault> = sqlx::query_as(
         "UPDATE secret_vaults SET name = COALESCE($1, name), description = COALESCE($2, description), \
+         site_id = CASE WHEN $5 THEN $6::uuid ELSE site_id END, \
          updated_at = NOW() WHERE id = $3 AND user_id = $4 RETURNING *"
     )
     .bind(&req.name)
     .bind(&req.description)
     .bind(id)
     .bind(claims.sub)
+    .bind(req.site_id.is_some())
+    .bind(req.site_id.flatten())
     .fetch_optional(&state.db).await
     .map_err(|e| internal_error("update vault", e))?;
 
@@ -220,7 +298,7 @@ pub async fn update_vault(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "vault.update",
-        Some("vault"), Some(&vault.name), None, None,
+        Some("vault"), Some(&vault.name), None, None, claims.key_id,
     ).await;
 
     Ok(Json(vault))
@@ -249,7 +327,8 @@ pub async fn list_secrets(
 ) -> Result<Json<Vec<SecretEntry>>, ApiError> {
     verify_vault(&state, vault_id, claims.sub).await?;
 
-    let encryption_key = get_encryption_key(&state.config.jwt_secret);
+    // Read path: every key source, not just the one we would write with.
+    let jwt = &state.config.jwt_secret;
     let reveal = params.reveal.unwrap_or(false);
 
     let rows: Vec<SecretRow> = sqlx::query_as(
@@ -261,9 +340,9 @@ pub async fn list_secrets(
 
     let entries: Vec<SecretEntry> = rows.into_iter().map(|r| {
         let value = if reveal {
-            secrets_crypto::decrypt(&r.encrypted_value, &encryption_key).unwrap_or_else(|_| "••••••••".into())
+            secrets_crypto::decrypt_vault(&r.encrypted_value, jwt).unwrap_or_else(|_| "••••••••".into())
         } else {
-            let decrypted = secrets_crypto::decrypt(&r.encrypted_value, &encryption_key).unwrap_or_default();
+            let decrypted = secrets_crypto::decrypt_vault(&r.encrypted_value, jwt).unwrap_or_default();
             mask_value(&decrypted)
         };
 
@@ -333,7 +412,7 @@ pub async fn create_secret(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "secret.create",
-        Some("secret"), Some(&req.key), None, None,
+        Some("secret"), Some(&req.key), None, None, claims.key_id,
     ).await;
 
     Ok((StatusCode::CREATED, Json(SecretEntry {
@@ -412,7 +491,9 @@ pub async fn update_secret(
         .bind(secret_id).fetch_one(&state.db).await
         .map_err(|e| internal_error("update secret", e))?;
 
-    let decrypted = secrets_crypto::decrypt(&row.encrypted_value, &encryption_key).unwrap_or_default();
+    let decrypted =
+        secrets_crypto::decrypt_vault(&row.encrypted_value, &state.config.jwt_secret)
+            .unwrap_or_default();
 
     Ok(Json(SecretEntry {
         id: row.id, vault_id: row.vault_id, key: row.key,
@@ -476,18 +557,17 @@ pub async fn inject_to_site(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path((vault_id, site_id)): Path<(Uuid, Uuid)>,
-    ServerScope(_server_id, agent): ServerScope,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     verify_vault(&state, vault_id, claims.sub).await?;
 
-    let encryption_key = get_encryption_key(&state.config.jwt_secret);
-
-    // Get domain for site
-    let domain: (String,) = sqlx::query_as("SELECT domain FROM sites WHERE id = $1 AND user_id = $2")
-        .bind(site_id).bind(claims.sub)
-        .fetch_optional(&state.db).await
-        .map_err(|e| internal_error("inject to site", e))?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    // This writes DECRYPTED secrets into a site's nginx env on whichever host the
+    // handle points at. Taking that from the caller's selection meant one tenant's
+    // secrets could be written into the env of a machine their site does not run on
+    // — the one member of this family where a misdispatch is a disclosure and not
+    // merely a wrong answer. The row names the host.
+    let (domain, agent) =
+        crate::helpers::site_agent_for_caller(&state, site_id, &claims).await?;
 
     // Get all auto-inject secrets
     let rows: Vec<SecretRow> = sqlx::query_as(
@@ -504,29 +584,44 @@ pub async fn inject_to_site(
     // Decrypt and build env content
     let mut env_pairs = Vec::new();
     for row in &rows {
-        let value = secrets_crypto::decrypt(&row.encrypted_value, &encryption_key)
+        let value = secrets_crypto::decrypt_vault(&row.encrypted_value, &state.config.jwt_secret)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
         env_pairs.push(serde_json::json!({ "key": row.key, "value": value }));
     }
 
     // Write to site via agent
     let body = serde_json::json!({ "vars": env_pairs });
-    agent.put(&format!("/nginx/env/{}", domain.0), body).await
+    agent.put(&format!("/nginx/env/{}", domain), body).await
         .map_err(|e| agent_error("Inject secrets", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "secrets.inject",
-        Some("site"), Some(&domain.0), Some(&format!("{} secrets", rows.len())), None,
+        Some("site"), Some(&domain), Some(&format!("{} secrets", rows.len())), ip.as_deref(), claims.key_id,
+    ).await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "secrets.inject",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("site"),
+        Some(&domain),
+        Some(&format!("{} secrets", rows.len())),
+        None,
+        "warning",
+        claims.key_id,
     ).await;
 
     fire_event(&state.db, "secrets.injected", serde_json::json!({
-        "site_id": site_id, "domain": &domain.0, "count": rows.len(),
+        "site_id": site_id, "domain": &domain, "count": rows.len(),
     }));
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "injected": rows.len(),
-        "domain": domain.0,
+        "domain": domain,
     })))
 }
 
@@ -540,7 +635,7 @@ pub async fn pull(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     verify_vault(&state, vault_id, claims.sub).await?;
 
-    let encryption_key = get_encryption_key(&state.config.jwt_secret);
+    let jwt = &state.config.jwt_secret;
 
     let rows: Vec<SecretRow> = sqlx::query_as(
         "SELECT * FROM secrets WHERE vault_id = $1 ORDER BY key"
@@ -550,7 +645,7 @@ pub async fn pull(
     .map_err(|e| internal_error("pull", e))?;
 
     let entries: Vec<serde_json::Value> = rows.into_iter().map(|r| {
-        let value = secrets_crypto::decrypt(&r.encrypted_value, &encryption_key).unwrap_or_default();
+        let value = secrets_crypto::decrypt_vault(&r.encrypted_value, jwt).unwrap_or_default();
         serde_json::json!({ "key": r.key, "value": value, "type": r.secret_type })
     }).collect();
 
@@ -631,4 +726,72 @@ pub async fn import_vault(
     }
 
     Ok(Json(serde_json::json!({ "ok": true, "imported": imported })))
+}
+
+#[cfg(test)]
+mod mask_value_tests {
+    use super::mask_value;
+
+    /// The exact scenario `&value[..4]` panicked on: byte offset 4 lands
+    /// mid-character in the 3-byte 日, which is NOT a char boundary. This is
+    /// executed, not asserted — a byte-slicing regression here panics the
+    /// test itself rather than merely failing an assertion.
+    #[test]
+    fn a_multibyte_value_straddling_the_old_byte_offset_does_not_panic() {
+        assert_eq!(mask_value("aa日BBBB"), "aa日B••••••••");
+    }
+
+    /// A value that's ENTIRELY multi-byte, so every char boundary the old
+    /// code could have picked is still not byte offset 4 (three 3-byte
+    /// characters place boundaries at 0/3/6/9, never 4).
+    #[test]
+    fn an_all_multibyte_value_does_not_panic() {
+        assert_eq!(mask_value("日本語です"), "日本語で••••••••");
+    }
+
+    #[test]
+    fn short_values_are_fully_masked() {
+        assert_eq!(mask_value(""), "••••••••");
+        assert_eq!(mask_value("ab"), "••••••••");
+        assert_eq!(mask_value("abcd"), "••••••••"); // exactly 4 chars — still fully masked
+    }
+
+    #[test]
+    fn ascii_values_keep_the_four_char_prefix() {
+        assert_eq!(mask_value("abcde"), "abcd••••••••");
+        assert_eq!(mask_value("supersecretvalue"), "supe••••••••");
+    }
+}
+
+#[cfg(test)]
+mod vault_key_tests {
+    use super::get_encryption_key;
+    use crate::services::secrets_crypto::{decrypt, encrypt};
+
+    /// The premise behind the s306 auto-inject fix, executed rather than
+    /// asserted: the vault key is DERIVED from the JWT secret and is never
+    /// equal to it, so a caller that hands the cipher a JWT secret cannot read
+    /// anything the panel wrote.
+    ///
+    /// The third assertion is the one that explains four and a half months of
+    /// silence. AES-GCM is authenticated, so the wrong key does not yield
+    /// plausible-looking rubbish a caller might notice — it yields `Err`. A
+    /// reader that discarded that error had nothing left to report.
+    #[test]
+    fn the_vault_key_is_not_the_jwt_secret() {
+        let jwt = "0123456789abcdef0123456789abcdef";
+        let key = get_encryption_key(jwt);
+        assert_ne!(key, jwt, "the vault key must not be the JWT secret itself");
+
+        let sealed = encrypt("hunter2", &key).expect("sealing with the derived key");
+        assert_eq!(
+            decrypt(&sealed, &key).expect("opening with the derived key"),
+            "hunter2"
+        );
+        assert!(
+            decrypt(&sealed, jwt).is_err(),
+            "the JWT secret must not open the vault — if it ever does, the two \
+             key spaces have collapsed and the derivation is decorative"
+        );
+    }
 }

@@ -152,7 +152,7 @@ fi
 # section that stayed green while the defect it names was present.
 if [ -z "$AGENT_FIELD" ] || [ -z "$PANEL_KEY" ]; then
   bad "cannot compare spellings: agent field='$AGENT_FIELD' panel key='$PANEL_KEY' — one side was not discovered, which is not a pass"
-elif printf '%s\n%s\n' "$AGENT_FIELD" "$AGENT_ALIASES" | grep -qx -- "$PANEL_KEY"; then
+elif printf '%s\n%s\n' "$AGENT_FIELD" "$AGENT_ALIASES" | grep -cx -- "$PANEL_KEY" >/dev/null; then
   ok "'$PANEL_KEY' is a spelling the agent accepts"
 else
   bad "the panel sends '$PANEL_KEY' and the agent accepts only: $(printf '%s %s' "$AGENT_FIELD" "$AGENT_ALIASES") — this is #94 exactly"
@@ -251,7 +251,14 @@ else
   ok "the destination check no longer inner-joins on a column that is always NULL"
 fi
 
-if hasre "$BSCHEDR_RS" 'bd\.server_id IS NULL'; then
+# s351 repointed this arm rather than relaxing it. The rule moved into a shared
+# constant next to the route that LISTS the same set, because the writer admitted
+# unscoped destinations while the only reader was administrator-only, so a site
+# owner was granted a choice nothing could show them. The arm follows the code
+# (lesson #150) and keeps asking the same question of it; that the writer still
+# REACHES the constant is asserted next door, in client-surface-gating.
+DEST_RS=panel/backend/src/routes/backup_destinations.rs
+if hasre "$DEST_RS" 'DESTINATION_CALLER_PREDICATE.*bd\.server_id IS NULL'; then
   ok "an unscoped (shared) destination is accepted"
 else
   bad "the check does not accept a NULL server_id — destinations created through the API have no server"
@@ -318,6 +325,131 @@ if hasre "$ORCH_TSX" 'function tabFromSearch' && hasre "$ORCH_TSX" 'URLSearchPar
   ok "the page reads ?tab= — the remediation link lands where it says"
 else
   bad "BackupOrchestrator ignores ?tab=, so every link the panel already emits opens Overview instead"
+fi
+
+echo
+echo "§10 a vault read derives its key — the raw JWT secret is not the vault key (s306)"
+
+# Same shape as #94 at the top of this file, one layer down: the git deploy's
+# environment was assembled correctly and never arrived, because the only reader
+# of auto-inject secrets unlocked them with the wrong key material. AES-GCM
+# authenticates, so a wrong key cannot yield garbage — it yields an Err, which a
+# bare `if let Ok` discarded, leaving the agent call and the only log line inside
+# an `if !env_pairs.is_empty()` that could not be entered.
+#
+# THE SUBJECTS ARE DERIVED, NOT LISTED. `secrets_crypto` exposes two families:
+# the vault pair `encrypt`/`decrypt`, whose key is `secrets::get_encryption_key`,
+# and the `*_credential*` family, whose key IS the JWT secret. Only the first is
+# in scope. A hardcoded list of its call sites is precisely the arm that cannot
+# see the next one (lesson #182) — this defect sat in a file such a list would
+# never have named.
+#
+# s358 SPLIT THE READ PATH, so this section's subject moved (lesson #150) and
+# the shape it used to require of a reader is now itself the defect. A vault
+# READ goes through `secrets_crypto::decrypt_vault`, which tries every key
+# source a value could have been written under. Deriving ONE source with
+# `get_encryption_key` and handing it to the low-level `decrypt` is exactly what
+# made adding `SECRETS_ENCRYPTION_KEY` strand every vault secret on an install
+# that already held data — so writers must still derive, and readers must not.
+VAULT_CALL='secrets_crypto::(encrypt|decrypt)\('
+VAULT_SURFACE='secrets_crypto::(encrypt|decrypt|decrypt_vault)\('
+VAULT_FILES=()
+while IFS= read -r f; do
+  [ -n "$f" ] && VAULT_FILES+=("$f")
+done < <(grep -rlE "$VAULT_SURFACE" panel/backend/src --include=*.rs 2>/dev/null | sort)
+
+if [ "${#VAULT_FILES[@]}" -lt 3 ]; then
+  bad "enumerated only ${#VAULT_FILES[@]} files on the vault surface — implausible, so every arm below would pass having examined nothing"
+else
+  ok "enumerated ${#VAULT_FILES[@]} files on the vault surface"
+
+  for f in "${VAULT_FILES[@]}"; do
+    writes=$(countre "$f" 'secrets_crypto::encrypt\(')
+    if [ "$writes" -gt 0 ]; then
+      if [ "$(countre "$f" 'get_encryption_key')" -gt 0 ]; then
+        ok "$(basename "$f") derives the vault key before writing"
+      else
+        bad "$(basename "$f") writes with the vault cipher without ever deriving the key — its values are unreadable by every other caller"
+      fi
+    else
+      ok "$(basename "$f") does not write to the vault, so it owes no derivation"
+    fi
+  done
+
+  # THE NEW INVARIANT, as an absence over the whole backend: outside the crypto
+  # module itself, nothing may call the SINGLE-SOURCE `decrypt`. That call
+  # cannot see a value written under a different key source, which is the
+  # one-way door this section now exists to keep shut.
+  SINGLE_SOURCE_READ='secrets_crypto::decrypt\('
+  SS_HITS=0
+  for f in "${VAULT_FILES[@]}"; do
+    case "$f" in *services/secrets_crypto.rs) continue ;; esac
+    n=$(countre "$f" "$SINGLE_SOURCE_READ")
+    if [ "$n" -gt 0 ]; then
+      SS_HITS=$((SS_HITS + n))
+      bad "$(basename "$f") reads the vault with the single-source cipher — a value written under any other key source is invisible to it"
+    fi
+  done
+  # POSITIVE CONTROL for the absence above: the same matcher, same corpus, must
+  # still find the multi-source read. Otherwise "found no violations" and "the
+  # grep never ran" are the same output (lesson #480).
+  MS_HITS=0
+  for f in "${VAULT_FILES[@]}"; do
+    MS_HITS=$((MS_HITS + $(countre "$f" 'secrets_crypto::decrypt_vault\(')))
+  done
+  if [ "$MS_HITS" -lt 1 ]; then
+    bad "control failed: found 0 multi-source vault reads, so the absence arm above proves nothing"
+  else
+    ok "control: $MS_HITS multi-source vault read(s) found, so the matcher works"
+  fi
+  if [ "$SS_HITS" -eq 0 ]; then
+    ok "no caller outside secrets_crypto reads the vault single-source"
+  fi
+fi
+
+# The defect itself, as a negative over the whole backend rather than over the
+# enumeration above: the vault cipher may never be handed a JWT secret. This is
+# the arm that would have been red for the four and a half months the feature
+# was advertised and inert.
+JWT_AS_VAULT_KEY='secrets_crypto::(encrypt|decrypt)\([^;]*,[[:space:]]*&?[A-Za-z_.]*jwt_secret'
+JWT_KEYED=0
+for f in $(grep -rlE "$VAULT_CALL" panel/backend/src --include=*.rs 2>/dev/null); do
+  n=$(countre "$f" "$JWT_AS_VAULT_KEY")
+  if [ "$n" -gt 0 ]; then
+    JWT_KEYED=$((JWT_KEYED + n))
+    bad "$(basename "$f") unlocks the vault with the JWT secret instead of the derived key"
+  fi
+done
+if [ "$JWT_KEYED" -eq 0 ]; then
+  ok "no vault read or write is keyed on the JWT secret"
+fi
+
+# The working sibling is the reason this is a correctness bug and not a design
+# question: the manual Inject button runs the same query against the same rows
+# and PUTs the same body to the same agent route. If it ever stops doing so, the
+# arm above loses the reference implementation it is measured against.
+SECRETS_RS=panel/backend/src/routes/secrets.rs
+DEPLOY_RS=panel/backend/src/routes/deploy.rs
+for f in "$SECRETS_RS" "$DEPLOY_RS"; do
+  [ -f "$f" ] || { bad "missing file: $f"; continue; }
+  assert_readable "$f" || continue
+  if [ "$(countre "$f" 'auto_inject = TRUE')" -gt 0 ] && [ "$(countre "$f" '/nginx/env/')" -gt 0 ]; then
+    ok "$(basename "$f") still selects the auto-inject rows and pushes them to the agent"
+  else
+    bad "$(basename "$f") no longer performs the auto-inject it is pinned against"
+  fi
+done
+
+# A skipped secret must be sayable, and the arm has to be keyed on THIS path's
+# own diagnostics: `deploy.rs` is a large file with warnings all over it, so an
+# arm asking only whether the file can warn at all is green on the broken tree
+# too — it would have passed for the whole time the feature was dead. The
+# `Auto-inject:` prefix belongs to this block alone; the success line reads
+# `Auto-injected`, so it cannot satisfy this on its own.
+if [ "$(countf "$DEPLOY_RS" '"Auto-inject: ')" -gt 0 ]; then
+  ok "deploy.rs reports the secrets it could not decrypt"
+else
+  bad "deploy.rs swallows decrypt failures again — an inert auto-inject looks exactly like an empty vault"
 fi
 
 echo

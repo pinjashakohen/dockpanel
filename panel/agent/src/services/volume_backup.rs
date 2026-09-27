@@ -87,6 +87,15 @@ pub async fn restore_volume(
     container_name: &str,
     filename: &str,
 ) -> Result<(), String> {
+    // Held for the full duration — this does an unconditional rm-rf-then-
+    // extract against a live, potentially-mounted Docker volume, an even
+    // sharper hazard than a config-file race with no rollback if it
+    // interleaves with another operation on the same volume. Keyed
+    // separately from the domain namespace (there's no domain here),
+    // mirroring git_build.rs's `git-deploy:{name}` non-domain key. See
+    // site_lock's module doc.
+    let _guard = crate::site_lock::lock_site(&format!("volume:{volume_name}")).await;
+
     if !is_safe_filename(filename) {
         return Err("Invalid backup filename".into());
     }
@@ -119,7 +128,16 @@ pub async fn restore_volume(
                 // the whole archive (catches gzip-CRC/truncation) without touching /volume;
                 // only on success do we clear + extract. `filename` is is_safe_filename-
                 // validated (alnum + -_. only), so it is safe to interpolate into the shell.
-                &format!("tar tzf /backup/{filename} >/dev/null 2>&1 || {{ echo 'backup archive is corrupt or truncated — volume left untouched' >&2; exit 3; }}; rm -rf /volume/* /volume/..?* /volume/.[!.]* 2>/dev/null; tar xzf /backup/{filename} -C /volume"),
+                //
+                // The corruption check above catches a bad archive but NOT a syntactically
+                // valid, gzip-CRC-clean archive with zero members — `tar tzf` exits 0 on an
+                // empty tar, so the wipe below would still run and leave the volume empty
+                // with no rollback. A second, separate `tar tzf | wc -l` re-run (kept apart
+                // from the corruption check rather than folded into one pipeline, so an
+                // early SIGPIPE on `grep -q`-style short-circuiting can never mask a
+                // mid-listing failure as "found a line") requires at least one archive
+                // member before the wipe is allowed to proceed.
+                &format!("tar tzf /backup/{filename} >/dev/null 2>&1 || {{ echo 'backup archive is corrupt or truncated — volume left untouched' >&2; exit 3; }}; n=$(tar tzf /backup/{filename} 2>/dev/null | wc -l); [ $n -gt 0 ] || {{ echo 'backup archive is empty — volume left untouched' >&2; exit 3; }}; rm -rf /volume/* /volume/..?* /volume/.[!.]* 2>/dev/null; tar xzf /backup/{filename} -C /volume"),
             ])
             .output(),
     )

@@ -129,7 +129,14 @@ jobs:
           cat > /tmp/install-fetch-deps.sh <<'DEPS'
           set -eux
           if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -qq
+            # -o Acquire::Check-Valid-Until=false: debian:11 (bullseye) is past its
+            # support window, so deb.debian.org/debian-security's Release file is
+            # PERMANENTLY expired, not transiently stale — apt refuses to use it by
+            # default ("Release file ... is expired"), which no retry count fixes.
+            # This is the standard, narrow workaround for reaching an EOL archive
+            # deliberately; it does not weaken anything on a still-supported distro,
+            # since apt only ever has an expired Release file to complain about here.
+            apt-get update -qq -o Acquire::Check-Valid-Until=false
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates file >/dev/null
           elif command -v dnf >/dev/null 2>&1; then
             # --allowerasing is load-bearing on amazonlinux:2023: the image ships
@@ -176,11 +183,29 @@ jobs:
 
       - name: Download published binaries (amd64)
         run: |
-          set -eux
+          set -eu
           TAG='${{ needs.resolve.outputs.tag }}'
           BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          # Retried in a shell loop rather than with `curl --retry`: a connection
+          # reset by the asset CDN is not one of the "transient errors" plain
+          # --retry covers, and --retry-all-errors needs curl 7.71 while
+          # ubuntu:20.04 in this same matrix ships 7.68. v2.106.0's release ran
+          # red on exactly this — `curl: (35) OpenSSL SSL_connect: Connection
+          # reset by peer` against release-assets.githubusercontent.com — on the
+          # step directly BELOW the package install that was given retries in
+          # bfbad47. The hardening stopped one step short.
           for b in agent api cli; do
-            curl -fsSL "${BASE}/dockpanel-${b}-linux-amd64" -o "dockpanel-${b}"
+            n=0
+            until curl -fsSL --connect-timeout 20 --max-time 300 \
+                       "${BASE}/dockpanel-${b}-linux-amd64" -o "dockpanel-${b}"; do
+              n=$((n+1))
+              if [ "$n" -ge 5 ]; then
+                echo "FAIL: could not download dockpanel-${b}-linux-amd64 after ${n} attempts."
+                exit 1
+              fi
+              echo "::warning::download of dockpanel-${b}-linux-amd64 failed (attempt ${n}) - retrying"
+              sleep $((n * 3))
+            done
             chmod +x "dockpanel-${b}"
           done
 
@@ -189,7 +214,7 @@ jobs:
           set -eux
           for b in agent api cli; do
             file "dockpanel-${b}"
-            if ! file "dockpanel-${b}" | grep -q "statically linked"; then
+            if ! file "dockpanel-${b}" | grep -c "statically linked" >/dev/null; then
               echo "FAIL: dockpanel-${b} is NOT statically linked on ${{ matrix.distro }} — would reintroduce the #70 glibc break."
               exit 1
             fi
@@ -213,14 +238,14 @@ jobs:
             out="$(timeout 6 ./dockpanel-$b --version 2>&1)"; rc=$?
             echo "--- dockpanel-$b (rc=$rc) ---"
             printf '%s\n' "$out" | head -4
-            if printf '%s' "$out" | grep -qiE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error"; then
+            if printf '%s' "$out" | grep -ciE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error" >/dev/null; then
               echo "FAIL: loader/ABI error for dockpanel-$b on ${{ matrix.distro }} — the #70 break."
               fail=1
             fi
           done
           # Positive proof that at least one binary reaches main() on this distro:
           # the CLI has a real --version path that prints and exits 0.
-          if ! ./dockpanel-cli --version | grep -qi dockpanel; then
+          if ! timeout 6 ./dockpanel-cli --version | grep -ci dockpanel >/dev/null; then
             echo "FAIL: dockpanel-cli --version did not print a version on ${{ matrix.distro }}"
             fail=1
           fi
@@ -245,11 +270,29 @@ jobs:
 
       - name: Download published binaries (arm64)
         run: |
-          set -eux
+          set -eu
           TAG='${{ needs.resolve.outputs.tag }}'
           BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          # Retried in a shell loop rather than with `curl --retry`: a connection
+          # reset by the asset CDN is not one of the "transient errors" plain
+          # --retry covers, and --retry-all-errors needs curl 7.71 while
+          # ubuntu:20.04 in this same matrix ships 7.68. v2.106.0's release ran
+          # red on exactly this — `curl: (35) OpenSSL SSL_connect: Connection
+          # reset by peer` against release-assets.githubusercontent.com — on the
+          # step directly BELOW the package install that was given retries in
+          # bfbad47. The hardening stopped one step short.
           for b in agent api cli; do
-            curl -fsSL "${BASE}/dockpanel-${b}-linux-arm64" -o "dockpanel-${b}"
+            n=0
+            until curl -fsSL --connect-timeout 20 --max-time 300 \
+                       "${BASE}/dockpanel-${b}-linux-arm64" -o "dockpanel-${b}"; do
+              n=$((n+1))
+              if [ "$n" -ge 5 ]; then
+                echo "FAIL: could not download dockpanel-${b}-linux-arm64 after ${n} attempts."
+                exit 1
+              fi
+              echo "::warning::download of dockpanel-${b}-linux-arm64 failed (attempt ${n}) - retrying"
+              sleep $((n * 3))
+            done
             chmod +x "dockpanel-${b}"
           done
 
@@ -258,7 +301,7 @@ jobs:
           set -eux
           for b in agent api cli; do
             file "dockpanel-${b}"
-            if ! file "dockpanel-${b}" | grep -q "statically linked"; then
+            if ! file "dockpanel-${b}" | grep -c "statically linked" >/dev/null; then
               echo "FAIL: dockpanel-${b} (arm64) is NOT statically linked — would reintroduce the #70 glibc break."
               exit 1
             fi
@@ -279,13 +322,13 @@ jobs:
             out="$(run_arm64 timeout 30 ./dockpanel-$b --version 2>&1)"; rc=$?
             echo "--- dockpanel-$b (arm64, rc=$rc) ---"
             printf '%s\n' "$out" | head -4
-            if printf '%s' "$out" | grep -qiE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error"; then
+            if printf '%s' "$out" | grep -ciE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error" >/dev/null; then
               echo "FAIL: loader/ABI error for dockpanel-$b (arm64) — the #70 break."
               fail=1
             fi
           done
           # Positive proof the arm64 CLI reaches main(): --version prints and exits 0.
-          if ! run_arm64 ./dockpanel-cli --version | grep -qi dockpanel; then
+          if ! run_arm64 timeout 30 ./dockpanel-cli --version | grep -ci dockpanel >/dev/null; then
             echo "FAIL: dockpanel-cli --version (arm64) did not print a version"
             fail=1
           fi

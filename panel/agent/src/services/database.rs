@@ -1,4 +1,4 @@
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, DockerEnvFile};
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
@@ -18,18 +18,44 @@ pub struct DbContainer {
 }
 
 /// Create a database container (MySQL or PostgreSQL).
+///
+/// `stack_id`, when set (GH #64: standalone DB provisioning for a Docker Stack
+/// instead of a Site), puts the container on that stack's OWN private bridge
+/// network — the same one `compose::deploy_stack` already gives the stack's other
+/// containers, which is how they reach each other by name — instead of the shared,
+/// ICC-disabled `dockpanel-db` bridge every site-owned database joins. Mirrors
+/// `app_sidecar.rs`'s own design: host-port publishing does not care which
+/// bridge-driver network a container is on, so the existing `127.0.0.1:{port}`
+/// publish below keeps working unchanged either way, and every panel-side
+/// query/backup/credential operation reaches the container via `docker exec`
+/// (never a TCP connection to that published port), which is unaffected by
+/// network membership too. A stack's network is single-tenant by construction
+/// (one `user_id` owns the stack), so this introduces no new cross-tenant
+/// exposure — it simply swaps one single-purpose bridge for another.
 pub async fn create_database(
     name: &str,
     engine: &str,
     password: &str,
     port: u16,
+    stack_id: Option<&str>,
 ) -> Result<DbContainer, String> {
     let docker =
         Docker::connect_with_local_defaults().map_err(|e| format!("Docker connect failed: {e}"))?;
 
-    // Ensure the shared DB bridge exists AND has inter-container communication
-    // disabled (H2: block cross-tenant lateral movement between DB containers).
-    ensure_network(&docker).await?;
+    let network_mode = match stack_id {
+        Some(sid) => {
+            let network = crate::services::compose::stack_network_name(Some(sid));
+            crate::services::compose::ensure_stack_network(&docker, &network, Some(sid)).await?;
+            network
+        }
+        None => {
+            // Ensure the shared DB bridge exists AND has inter-container
+            // communication disabled (H2: block cross-tenant lateral movement
+            // between DB containers).
+            ensure_network(&docker).await?;
+            DB_NETWORK.to_string()
+        }
+    };
 
     // M1: for postgres the container's bootstrap superuser (`postgres`) gets a
     // random, immediately-discarded password. The tenant NEVER connects as the
@@ -93,7 +119,7 @@ pub async fn create_database(
 
     let host_config = bollard::service::HostConfig {
         port_bindings: Some(port_bindings),
-        network_mode: Some(DB_NETWORK.to_string()),
+        network_mode: Some(network_mode),
         restart_policy: Some(bollard::service::RestartPolicy {
             name: Some(bollard::service::RestartPolicyNameEnum::UNLESS_STOPPED),
             ..Default::default()
@@ -115,11 +141,25 @@ pub async fn create_database(
         env: Some(env.clone()),
         exposed_ports: Some(exposed_ports),
         host_config: Some(host_config),
-        labels: Some(HashMap::from([
-            ("dockpanel.managed".to_string(), "true".to_string()),
-            ("dockpanel.db.name".to_string(), name.to_string()),
-            ("dockpanel.db.engine".to_string(), engine.to_string()),
-        ])),
+        labels: Some({
+            let mut labels = HashMap::from([
+                ("dockpanel.managed".to_string(), "true".to_string()),
+                ("dockpanel.db.name".to_string(), name.to_string()),
+                ("dockpanel.db.engine".to_string(), engine.to_string()),
+            ]);
+            // This label does NOT make stack teardown find this container — it is
+            // deliberately absent from `list_deployed_apps()` (no `dockpanel.app.*`
+            // labels, same "operator manages exactly one thing" exclusion
+            // `app_sidecar.rs`'s sidecar containers use), so the backend's own
+            // stack-delete route removes it explicitly by `databases.stack_id`
+            // instead. Labelled here for operator visibility (`docker inspect`/
+            // `docker ps --filter`) and so a future stack-scoped tool has
+            // something to key on.
+            if let Some(sid) = stack_id {
+                labels.insert("dockpanel.stack_id".to_string(), sid.to_string());
+            }
+            labels
+        }),
         ..Default::default()
     };
 
@@ -138,10 +178,15 @@ pub async fn create_database(
         .start_container(&container.id, None::<StartContainerOptions<String>>)
         .await
     {
+        // This engine declares its data directory as an image VOLUME and the panel
+        // binds nothing here, so the container carries an anonymous volume. It never
+        // started, so that volume is empty — and the sibling teardown a few lines
+        // below (role provisioning failed) already takes it. Match it.
         let _ = docker
             .remove_container(
                 &container.id,
                 Some(bollard::container::RemoveContainerOptions {
+                    v: true,
                     force: true,
                     ..Default::default()
                 }),
@@ -187,6 +232,28 @@ pub async fn create_database(
 pub async fn remove_database(container_id: &str) -> Result<(), String> {
     let docker =
         Docker::connect_with_local_defaults().map_err(|e| format!("Docker connect failed: {e}"))?;
+
+    // Refuse to act on a container this module didn't create. The backend only ever
+    // sources `container_id` from its own DB row (written once, from this module's own
+    // create response), so this is defense-in-depth, not a live-reachable gap — but every
+    // OTHER destructive-by-id surface (docker_apps.rs's require_managed(), v2.15.0) already
+    // carries this same `dockpanel.managed=true` boundary, and this module never did. A
+    // stray unmanaged container sharing this exact id would otherwise be force-removed
+    // with its volumes.
+    let info = docker
+        .inspect_container(container_id, None)
+        .await
+        .map_err(|e| format!("Failed to inspect container: {e}"))?;
+    let managed = info
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.as_ref())
+        .and_then(|l| l.get("dockpanel.managed"))
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !managed {
+        return Err("not a dockpanel-managed container".to_string());
+    }
 
     // Stop first
     docker
@@ -290,18 +357,28 @@ pub async fn execute_query(
 
     // Build the docker-exec command. kill_on_drop ensures a timed-out (dropped) future
     // actually terminates the docker exec child rather than leaking an orphaned process.
+    //
+    // The credential goes in via `--env-file`, NOT `-e KEY=value`: a `-e`
+    // argument is literal `docker` argv, world-readable via `ps`/`/proc/<pid>/
+    // cmdline` for the life of the child (no `hidepid=` assumed). See
+    // `DockerEnvFile` — `dockpanel-fanout` s445 completeness critic.
+    let env_file = match engine {
+        "mysql" | "mariadb" => DockerEnvFile::new(&[("MYSQL_PWD", password)]),
+        _ => DockerEnvFile::new(&[("PGPASSWORD", password)]),
+    }
+    .map_err(|e| format!("Failed to prepare credentials: {e}"))?;
     let mut cmd = safe_command("docker");
     match engine {
         "mysql" | "mariadb" => {
             cmd.arg("exec")
-                .arg("-e").arg(format!("MYSQL_PWD={password}"))
+                .arg("--env-file").arg(env_file.path())
                 .arg(container)
                 .arg("mariadb").arg("-u").arg(user).arg(database)
                 .arg("-e").arg(sql).arg("--batch").arg("--column-names");
         }
         _ => {
             cmd.arg("exec")
-                .arg("-e").arg(format!("PGPASSWORD={password}"))
+                .arg("--env-file").arg(env_file.path())
                 .arg(container)
                 .arg("psql").arg("-U").arg(user).arg("-d").arg(database)
                 .arg("-c").arg(sql).arg("--csv");
@@ -495,11 +572,45 @@ fn parse_csv(output: &str) -> (Vec<String>, Vec<Vec<String>>) {
     (columns, records)
 }
 
+/// Escape a value for use inside a single-quoted SQL string literal, MariaDB rules.
+///
+/// The two engines need DIFFERENT escaping, which is why this is not one shared
+/// helper: MariaDB treats `\` as an escape character inside string literals, so a
+/// literal backslash must be doubled. Doing the same to PostgreSQL would STORE two
+/// backslashes, because it runs with `standard_conforming_strings = on` (the default
+/// since 9.1) and `\` there is an ordinary character. Backslashes are doubled first
+/// so the `''` produced by the quote pass is never re-escaped.
+fn mysql_string_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
+}
+
+/// Escape a value for use inside a single-quoted SQL string literal, PostgreSQL rules.
+/// See [`mysql_string_escape`] for why the backslash is deliberately left alone.
+fn pg_string_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Reset the password for a database user inside a running container.
 ///
-/// For MariaDB/MySQL: connects as root via the unix socket (no password needed
-/// inside the container) and runs ALTER USER.
-/// For PostgreSQL: connects with the old password and runs ALTER USER.
+/// Both engines authenticate AS THE TENANT and let the server change its own
+/// account, so `old_password` is the thing that decides whether the reset is
+/// allowed to happen at all.
+///
+/// ⚠ The MariaDB arm used to connect as the container's root account with no
+/// credential, on the stated premise that root can authenticate over the unix
+/// socket inside the container. That premise was never true of a container THIS
+/// FILE creates: `create_database` asks the image for a random root password,
+/// which gives `root@localhost` a random `mysql_native_password` and does NOT
+/// enable the `unix_socket` plugin. Every MariaDB/MySQL password reset therefore
+/// died on `ERROR 1045 … Access denied for user 'root'@'localhost'` and surfaced
+/// to the operator as a 500. Measured on `mariadb:11` with exactly the env
+/// `create_database` sets. `SET PASSWORD` needs no privilege beyond being the
+/// account, and this is the same connection shape `execute_query` already uses in
+/// production.
+///
+/// The exact flag and env spellings are deliberately NOT written here:
+/// `db-credential-auth-pin-e2e.sh` §B greps this tree for them, and a pin that
+/// matches the comment narrating it is no pin at all.
 pub async fn reset_password(
     container: &str,
     engine: &str,
@@ -509,21 +620,28 @@ pub async fn reset_password(
 ) -> Result<(), String> {
     let output = match engine {
         "mysql" | "mariadb" => {
-            // MariaDB root can auth via unix socket inside the container.
+            // `SET PASSWORD` with no FOR clause targets CURRENT_USER(), which is the
+            // account we authenticated as — the same `'{user}'@'%'` row the old
+            // ALTER USER named. Verified: a socket connection reports `user@localhost`
+            // for USER() while CURRENT_USER() resolves to `user@%`.
             let sql = format!(
-                "ALTER USER '{}'@'%' IDENTIFIED BY '{}';",
-                user.replace('\'', "''").replace('\\', "\\\\"),
-                new_password.replace('\'', "''").replace('\\', "\\\\"),
+                "SET PASSWORD = PASSWORD('{}');",
+                mysql_string_escape(new_password),
             );
+            let env_file = match DockerEnvFile::new(&[("MYSQL_PWD", old_password)]) {
+                Ok(f) => f,
+                Err(e) => return Err(format!("Failed to prepare credentials: {e}")),
+            };
             tokio::time::timeout(
                 std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
                 safe_command("docker")
                     .arg("exec")
+                    .arg("--env-file")
+                    .arg(env_file.path())
                     .arg(container)
                     .arg("mariadb")
                     .arg("-u")
-                    .arg("root")
-                    .arg("--skip-password")
+                    .arg(user)
                     .arg("-e")
                     .arg(&sql)
                     .output(),
@@ -531,18 +649,35 @@ pub async fn reset_password(
             .await
         }
         _ => {
-            // PostgreSQL: connect with old password, then ALTER USER.
+            // PostgreSQL: connect as the tenant and ALTER its own role.
+            //
+            // ⚠ Honest scope limit, measured rather than assumed: the official
+            // `postgres:16-alpine` image ships a pg_hba.conf whose `local`, `127.0.0.1/32`
+            // and `::1/128` lines are all `trust` — only non-loopback hosts reach the
+            // `scram-sha-256` line. Since this runs INSIDE the container, PGPASSWORD is
+            // accepted but never checked. So `old_password` is real authority on the
+            // MariaDB arm and decorative on this one. It is deliberately NOT "fixed" by
+            // forcing a non-loopback connection: the tenant boundary for this route is
+            // the panel's ownership check in `databases::reset_password`, and making the
+            // agent enforce it here would turn a working feature into one that breaks
+            // permanently the moment a tenant changes their own password through the SQL
+            // console (the panel has no recovery path — the bootstrap superuser password
+            // is random and discarded by `create_database`).
             let sql = format!(
                 "ALTER USER \"{}\" WITH PASSWORD '{}';",
-                user.replace('"', "\\\""),
-                new_password.replace('\'', "''"),
+                user.replace('"', "\"\""),
+                pg_string_escape(new_password),
             );
+            let env_file = match DockerEnvFile::new(&[("PGPASSWORD", old_password)]) {
+                Ok(f) => f,
+                Err(e) => return Err(format!("Failed to prepare credentials: {e}")),
+            };
             tokio::time::timeout(
                 std::time::Duration::from_secs(QUERY_TIMEOUT_SECS),
                 safe_command("docker")
                     .arg("exec")
-                    .arg("-e")
-                    .arg(format!("PGPASSWORD={old_password}"))
+                    .arg("--env-file")
+                    .arg(env_file.path())
                     .arg(container)
                     .arg("psql")
                     .arg("-U")
@@ -565,7 +700,20 @@ pub async fn reset_password(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Password reset failed: {}", stderr.trim()));
+        let stderr = stderr.trim();
+        // Name the one failure an operator cannot otherwise diagnose. The reset now
+        // authenticates as the tenant, so a rejected login means the panel's stored
+        // credential is no longer the database's real one — which a tenant can cause
+        // themselves by running SET PASSWORD/ALTER USER in the SQL console. The generic
+        // "Access denied" gives no hint that the panel, not the request, is the stale party.
+        if stderr.contains("Access denied") || stderr.contains("password authentication failed") {
+            return Err(format!(
+                "Password reset failed: the database rejected the current password stored by \
+                 the panel, so the two are out of sync (this happens if the password was \
+                 changed outside the panel, e.g. via the SQL console). Original error: {stderr}"
+            ));
+        }
+        return Err(format!("Password reset failed: {stderr}"));
     }
 
     tracing::info!("Database password reset for user '{user}' in container '{container}'");
@@ -581,14 +729,19 @@ async fn provision_postgres_tenant_role(
     admin_password: &str,
     tenant_password: &str,
 ) -> Result<(), String> {
+    // One env-file for the whole function: `admin_password` doesn't change
+    // across the readiness loop or the provisioning call below.
+    let env_file = DockerEnvFile::new(&[("PGPASSWORD", admin_password)])
+        .map_err(|e| format!("Failed to prepare credentials: {e}"))?;
+
     // Wait until postgres accepts connections to the tenant DB (mirrors backup_verify).
     let mut ready = false;
     for _ in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let ok = safe_command("docker")
             .arg("exec")
-            .arg("-e")
-            .arg(format!("PGPASSWORD={admin_password}"))
+            .arg("--env-file")
+            .arg(env_file.path())
             .arg(container)
             .arg("psql")
             .arg("-U")
@@ -613,8 +766,8 @@ async fn provision_postgres_tenant_role(
     let sql = tenant_role_sql(db_name, tenant_password);
     let output = safe_command("docker")
         .arg("exec")
-        .arg("-e")
-        .arg(format!("PGPASSWORD={admin_password}"))
+        .arg("--env-file")
+        .arg(env_file.path())
         .arg(container)
         .arg("psql")
         .arg("-U")
@@ -692,30 +845,42 @@ async fn ensure_network(docker: &Docker) -> Result<(), String> {
 
 /// Create the shared DB bridge with inter-container communication disabled.
 async fn create_db_network(docker: &Docker) -> Result<(), String> {
+    create_db_network_at(docker, DB_NETWORK).await
+}
+
+async fn create_db_network_at(docker: &Docker, network: &str) -> Result<(), String> {
     use bollard::network::CreateNetworkOptions;
     docker
         .create_network(CreateNetworkOptions {
-            name: DB_NETWORK,
+            name: network,
             driver: "bridge",
             options: HashMap::from([("com.docker.network.bridge.enable_icc", "false")]),
             ..Default::default()
         })
         .await
         .map_err(|e| format!("Failed to create network: {e}"))?;
-    tracing::info!("Created Docker network: {DB_NETWORK} (enable_icc=false)");
+    tracing::info!("Created Docker network: {network} (enable_icc=false)");
     Ok(())
 }
 
 /// Recreate `dockpanel-db` with ICC disabled, reconnecting every attached DB container.
 /// One-time reconcile for pre-s242 installs whose network still has ICC enabled.
 async fn reconcile_network_icc(docker: &Docker, attached: &[String]) -> Result<(), String> {
+    reconcile_network_icc_at(docker, DB_NETWORK, attached).await
+}
+
+async fn reconcile_network_icc_at(
+    docker: &Docker,
+    network: &str,
+    attached: &[String],
+) -> Result<(), String> {
     use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
     // Disconnect so the network can be removed. Published 127.0.0.1 ports are
     // re-established from the container's HostConfig on reconnect (lab-verified).
     for cid in attached {
         let _ = docker
             .disconnect_network(
-                DB_NETWORK,
+                network,
                 DisconnectNetworkOptions {
                     container: cid.as_str(),
                     force: true,
@@ -724,24 +889,52 @@ async fn reconcile_network_icc(docker: &Docker, attached: &[String]) -> Result<(
             .await;
     }
     docker
-        .remove_network(DB_NETWORK)
+        .remove_network(network)
         .await
         .map_err(|e| format!("Failed to remove legacy DB network for ICC reconcile: {e}"))?;
-    create_db_network(docker).await?;
+    create_db_network_at(docker, network).await?;
+
+    // Best-effort, not abort-on-first-failure: the network was already torn
+    // down and recreated above, so a container this loop never REACHES has
+    // ZERO network attachment — its published port stops routing, a silent
+    // live outage for whichever tenant owns it, who may have nothing to do
+    // with the request that triggered this reconcile. The old `?` here
+    // meant the first Docker-daemon hiccup left every LATER container in
+    // `attached` orphaned with no record of which ones. Known residual
+    // limitation, not fixed here: once this function returns (however many
+    // reconnects failed), `ensure_network`'s `icc_off` check short-circuits
+    // true on every future call — a container that failed to reconnect has
+    // no automatic retry and needs the manual command below.
+    let mut failed: Vec<String> = Vec::new();
     for cid in attached {
-        docker
+        if let Err(e) = docker
             .connect_network(
-                DB_NETWORK,
+                network,
                 ConnectNetworkOptions {
                     container: cid.as_str(),
                     endpoint_config: Default::default(),
                 },
             )
             .await
-            .map_err(|e| format!("Failed to reconnect {cid} to hardened DB network: {e}"))?;
+        {
+            tracing::error!("Failed to reconnect {cid} to hardened DB network: {e}");
+            failed.push(cid.clone());
+        }
     }
+
+    if !failed.is_empty() {
+        return Err(format!(
+            "Reconciled {network} to enable_icc=false, but {} of {} container(s) failed to \
+             reconnect and are now offline (no network attached): {}. Reconnect manually: \
+             `docker network connect {network} <container>`.",
+            failed.len(),
+            attached.len(),
+            failed.join(", "),
+        ));
+    }
+
     tracing::info!(
-        "Reconciled {DB_NETWORK} to enable_icc=false ({} container(s) reconnected)",
+        "Reconciled {network} to enable_icc=false ({} container(s) reconnected)",
         attached.len()
     );
     Ok(())
@@ -768,5 +961,115 @@ mod tests {
     fn tenant_role_sql_escapes_password_quote() {
         let sql = tenant_role_sql("app", "a'b");
         assert!(sql[0].contains("PASSWORD 'a''b'"));
+    }
+
+    /// s455: `reconcile_network_icc_at` used to abort on the FIRST reconnect
+    /// failure, silently orphaning every container later in `attached` — its
+    /// network was already torn down, so a container the loop never reached
+    /// had ZERO attachment. Proven against a REAL, fully disposable Docker
+    /// network (never the real `dockpanel-db`, so this cannot touch
+    /// production networking on this box): two real containers straddle a
+    /// third id that cannot possibly connect, forcing a real mid-loop
+    /// failure. Both real containers must still end up connected, and the
+    /// error must name exactly the bad id.
+    #[tokio::test]
+    #[ignore = "creates real containers and a real (disposable) network; run with cargo test -p dockpanel-agent reconcile_network_icc -- --ignored --nocapture"]
+    async fn reconcile_network_icc_reconnects_every_container_despite_one_bad_id() {
+        use bollard::container::{Config, CreateContainerOptions, RemoveContainerOptions};
+        use bollard::network::{ConnectNetworkOptions, CreateNetworkOptions};
+
+        let docker = Docker::connect_with_local_defaults().expect("docker connect");
+        let tag = uuid::Uuid::new_v4();
+        let network = format!("dp-test-reconcile-net-{tag}");
+        let name_a = format!("dp-test-reconcile-a-{tag}");
+        let name_b = format!("dp-test-reconcile-b-{tag}");
+
+        for name in [&name_a, &name_b] {
+            docker
+                .create_container(
+                    Some(CreateContainerOptions { name: name.as_str(), platform: None }),
+                    Config {
+                        image: Some("alpine:latest".to_string()),
+                        // Never started; connect/disconnect only needs the
+                        // container to exist, not to be running.
+                        cmd: Some(vec!["dockpanel-test-probe".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create test container");
+        }
+
+        // `reconcile_network_icc_at` mirrors the real `ensure_network` flow,
+        // which only ever calls it when the network ALREADY exists (just
+        // with the wrong ICC setting) — set that up for real here too.
+        docker
+            .create_network(CreateNetworkOptions {
+                name: network.as_str(),
+                driver: "bridge",
+                ..Default::default()
+            })
+            .await
+            .expect("create disposable test network");
+        for name in [&name_a, &name_b] {
+            docker
+                .connect_network(
+                    &network,
+                    ConnectNetworkOptions { container: name.as_str(), endpoint_config: Default::default() },
+                )
+                .await
+                .expect("attach test container to disposable network");
+        }
+
+        // Cannot possibly exist — forces connect_network to fail for exactly
+        // this one entry, in the MIDDLE of the batch, so an abort-on-first-
+        // failure loop would silently orphan name_b.
+        let fake_id = format!("dp-test-nonexistent-{tag}");
+        let attached = vec![name_a.clone(), fake_id.clone(), name_b.clone()];
+
+        let result = reconcile_network_icc_at(&docker, &network, &attached).await;
+
+        let mut orphaned: Vec<String> = Vec::new();
+        for name in [&name_a, &name_b] {
+            let connected = docker
+                .inspect_container(name, None)
+                .await
+                .ok()
+                .and_then(|c| c.network_settings)
+                .and_then(|ns| ns.networks)
+                .map(|nets| nets.contains_key(network.as_str()))
+                .unwrap_or(false);
+            if !connected {
+                orphaned.push(name.clone());
+            }
+        }
+
+        // Cleanup runs regardless of what the assertions below find — this
+        // must never leave a disposable test container/network OR its
+        // anonymous volume behind, so `v: true` is explicit here.
+        for name in [&name_a, &name_b] {
+            let _ = docker
+                .remove_container(
+                    name,
+                    Some(RemoveContainerOptions {
+                        v: true,
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+        let _ = docker.remove_network(&network).await;
+
+        assert!(result.is_err(), "expected an aggregated error naming the bad id");
+        let msg = result.unwrap_err();
+        assert!(msg.contains(&fake_id), "error must name the failed container: {msg}");
+        assert!(!msg.contains(&name_a), "must not blame a container that actually succeeded: {msg}");
+        assert!(!msg.contains(&name_b), "must not blame a container that actually succeeded: {msg}");
+        assert!(
+            orphaned.is_empty(),
+            "these real containers — on either side of the bad id in the same batch — were \
+             never reconnected: {orphaned:?} (an abort-on-first-failure loop is back)"
+        );
     }
 }

@@ -1,7 +1,8 @@
 import { useAuth } from "../context/AuthContext";
+import { useServer } from "../context/ServerContext";
 import { Navigate } from "react-router-dom";
 import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
 import { PrereqList, usePrereqs } from "../components/Prerequisite";
 import { FieldHelp } from "../components/FieldHelp";
@@ -19,6 +20,9 @@ interface EnvVar {
   default: string;
   required: boolean;
   secret: boolean;
+  /** Server fills this in from the domain claimed above; the catalogue default
+   *  shown here is the no-domain fallback. See TEMPLATE_DOMAIN_ENV in the agent. */
+  domain_derived?: boolean;
 }
 
 interface AppTemplate {
@@ -60,6 +64,13 @@ interface DeployedApp {
   image: string | null;
   volumes: string[];
   stack_id: string | null;
+  // Set by the panel (not the agent) when this container is stopped because
+  // something asked it to be: 'operator_stop' | 'manual_sleep' | 'auto_sleep' |
+  // 'stack_stop' | 'recreate_in_progress'. Absent means the panel has no
+  // record of a deliberate stop, which for an exited container means it went
+  // down on its own.
+  expected_stop_reason?: string;
+  expected_stop_by?: string;
 }
 
 interface StackInfo {
@@ -68,6 +79,13 @@ interface StackInfo {
   service_count: number;
   domain: string | null;
   ssl_email: string | null;
+  // The STORED mode, honoured by the agent on every redeploy. The link scheme
+  // below keys on this and never on ssl_email: a stack served by a registered
+  // certificate has no email, and inferring "no TLS" from that absence is the
+  // defect that put a plain-HTTP link beside an HSTS-pinned domain.
+  tls_mode: "none" | "acme" | "provided";
+  /** Registry alias; provided mode only. */
+  tls_certificate: string | null;
   running: number;
   total: number;
   status: string;
@@ -136,7 +154,7 @@ const categoryColors: Record<string, string> = {
   Tools: "bg-dark-500/15",
   Development: "bg-accent-400/15",
   Analytics: "bg-accent-600/15",
-  Storage: "bg-sky-500/15",
+  Storage: "bg-accent-500/15",
   Security: "bg-danger-500/15",
   Media: "bg-accent-600/15",
   Networking: "bg-rust-500/15",
@@ -151,9 +169,6 @@ const appIcons: Record<string, ReactNode> = {
   ),
   ghost: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><path fill="#212121" d="M64 0C38.6 0 18 20.6 18 46v74c0 4.4 5.3 6.6 8.5 3.5 4-4 10.6-4 14.6 0 4 4 10.6 4 14.6 0 4-4 10.6-4 14.6 0 4 4 10.6 4 14.6 0 4-4 10.6-4 14.6 0 3.2 3.2 8.5.9 8.5-3.5V46C110 20.6 89.4 0 64 0z"/><circle fill="#fff" cx="48" cy="46" r="10"/><circle fill="#fff" cx="80" cy="46" r="10"/></svg>
-  ),
-  strapi: (
-    <svg className="w-6 h-6" viewBox="0 0 128 128"><path fill="#4945ff" d="M43 2h83v83H85V44H43V2z"/><path fill="#4945ff" opacity=".4" d="M2 43h41v42h42v41H43c-22.6 0-41-18.4-41-41V43z"/><path fill="#4945ff" opacity=".7" d="M43 2v42h42l-42-42z"/></svg>
   ),
   directus: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><path fill="#6644ff" d="M64 4c-2.8 0-5.2 1.6-6.4 4L6.4 100c-1.6 3.2.4 7 4 7h24c2.4 0 4.4-1.2 5.6-3.2L64 64l23.6 39.6c1.2 2 3.4 3.4 5.8 3.4h24.2c3.6 0 5.6-3.8 4-7L70.4 8c-1.2-2.4-3.6-4-6.4-4z"/><path fill="#6644ff" opacity=".5" d="M64 44L44.4 78h39.2L64 44z"/></svg>
@@ -203,9 +218,6 @@ const appIcons: Record<string, ReactNode> = {
   // ─── Tools ───────────────────────────────────────────────────
   adminer: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#22c55e" width="128" height="128"/><path fill="#fff" d="M64 20c-22 0-40 7.2-40 16v56c0 8.8 18 16 40 16s40-7.2 40-16V36c0-8.8-18-16-40-16z" opacity=".15"/><ellipse fill="#fff" cx="64" cy="36" rx="36" ry="12" opacity=".9"/><path d="M28 48c0 6.6 16.1 12 36 12s36-5.4 36-12" opacity=".6" stroke="#fff" strokeWidth="2" fill="none"/><path d="M28 68c0 6.6 16.1 12 36 12s36-5.4 36-12" opacity=".4" stroke="#fff" strokeWidth="2" fill="none"/><path fill="none" stroke="#fff" strokeWidth="2" opacity=".3" d="M28 36v56M100 36v56"/></svg>
-  ),
-  portainer: (
-    <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#13bef9" width="128" height="128"/><path fill="#fff" d="M40 36h20v20H40zm24 0h20v20H64zm-24 24h20v20H40zm24 0h20v20H64zm-24 24h20v20H40z" opacity=".9"/><path fill="#fff" d="M64 84h20v20H64z" opacity=".5"/><rect fill="#fff" x="88" y="60" width="20" height="20" opacity=".3"/></svg>
   ),
   pgadmin: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#336791" width="128" height="128"/><path fill="#fff" d="M64 18c-18.8 0-34 13.6-34 30.4 0 10.8 6.4 20.2 16 25.6V96c0 4.4 3.6 8 8 8h20c4.4 0 8-3.6 8-8V74c9.6-5.4 16-14.8 16-25.6C98 31.6 82.8 18 64 18z" opacity=".2"/><path fill="#fff" d="M64 24c-15.2 0-27.6 11-27.6 24.6 0 9.4 5.8 17.6 14.4 21.6l2.2 1V88h22V71.2l2.2-1c8.6-4 14.4-12.2 14.4-21.6C91.6 35 79.2 24 64 24zM56 54a5 5 0 110-10 5 5 0 010 10zm16 0a5 5 0 110-10 5 5 0 010 10z" opacity=".9"/><path fill="#fff" d="M53 88h22v6H53z" opacity=".6"/><circle fill="#fff" cx="92" cy="28" r="6" opacity=".7"/><path fill="#fff" d="M92 34v16" stroke="#fff" strokeWidth="3" opacity=".5"/><path fill="#fff" d="M84 42h16" stroke="#fff" strokeWidth="3" opacity=".5"/></svg>
@@ -284,9 +296,6 @@ const appIcons: Record<string, ReactNode> = {
   rocketchat: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#f5455c" width="128" height="128"/><path fill="#fff" d="M64 20c-26.5 0-48 16.6-48 37 0 11 5.8 20.9 15 27.8L28 104l18-10c5.8 2.2 12.2 3.4 18 3.4 26.5 0 48-16.6 48-37S90.5 20 64 20z" opacity=".9"/><circle fill="#f5455c" cx="48" cy="58" r="5"/><circle fill="#f5455c" cx="64" cy="58" r="5"/><circle fill="#f5455c" cx="80" cy="58" r="5"/></svg>
   ),
-  discourse: (
-    <svg className="w-6 h-6" viewBox="0 0 128 128"><circle fill="#231f20" cx="64" cy="64" r="60"/><path fill="#fff" d="M64 24c-22 0-40 16.6-40 37s18 37 40 37l32 10-12-18c8-7 12-17 12-29 0-20.4-14.3-37-32-37z" opacity=".15"/><path fill="#87ceeb" d="M42 52h44v6H42z" opacity=".9"/><path fill="#f0c040" d="M42 64h36v6H42z" opacity=".9"/><path fill="#e45735" d="M42 76h28v6H42z" opacity=".9"/></svg>
-  ),
   // ─── Media (additional) ───────────────────────────────────────
   immich: (
     <svg className="w-6 h-6" viewBox="0 0 128 128"><rect rx="16" fill="#4250af" width="128" height="128"/><rect fill="#fff" x="20" y="28" width="88" height="72" rx="8" opacity=".15"/><circle fill="#fff" cx="52" cy="56" r="16" opacity=".7"/><circle fill="#4250af" cx="52" cy="56" r="8"/><path fill="#fff" d="M68 44h28v28H68z" opacity=".5" rx="4"/><path fill="#fff" d="M20 84l28-20 16 12 20-16 24 18v14c0 4.4-3.6 8-8 8H28c-4.4 0-8-3.6-8-8V84z" opacity=".6"/></svg>
@@ -330,6 +339,26 @@ const appIcons: Record<string, ReactNode> = {
   ),
 };
 
+/// What the panel knows about a deliberate stop, in words an operator can act on.
+/// Falls through to a neutral sentence rather than inventing a cause for a reason
+/// string a newer backend might send that this bundle has not heard of.
+function stopReasonLabel(reason?: string): string {
+  switch (reason) {
+    case "operator_stop":
+      return "you stopped it";
+    case "manual_sleep":
+      return "put to sleep";
+    case "auto_sleep":
+      return "auto-slept while idle";
+    case "stack_stop":
+      return "stopped with its stack";
+    case "recreate_in_progress":
+      return "recreating (update in progress)";
+    default:
+      return "stopped by the panel";
+  }
+}
+
 const statusColors: Record<string, string> = {
   running: "bg-rust-500/15 text-rust-400",
   exited: "bg-danger-500/15 text-danger-400",
@@ -339,7 +368,31 @@ const statusColors: Record<string, string> = {
 
 export default function Apps() {
   const { user } = useAuth();
+  const { activeServer } = useServer();
   if (!user || user.role !== "admin") return <Navigate to="/" replace />;
+
+  // Where a port-only app can actually be reached.
+  //
+  // An app with a domain links to that domain. One published on a bare port has
+  // no name to link to, so the host has to come from the machine the container
+  // runs on — and that is `ServerContext`'s active server, because this page's
+  // list is fetched under `X-Server-Id` and is therefore already scoped to it.
+  // NOT `window.location`: on a fleet the panel and the container are different
+  // machines, and substituting the panel's own host is precisely how a link ends
+  // up pointing at the wrong box. That is the defect the backend spent v2.79.0
+  // removing from 71 handlers; re-introducing it in the UI would be the same bug
+  // with a nicer font.
+  //
+  // The local server is the one case where the panel's own hostname IS the right
+  // answer — the panel is served from that box — and it is also the case where
+  // `ip_address` is legitimately null, so it is resolved first rather than
+  // treated as a missing address. A REMOTE server with no recorded address gets
+  // no link at all, mirroring `agent_for_site_server`'s rule on the server side:
+  // refuse rather than substitute, because a link to a guessed host is worse
+  // than no link.
+  const appHost = !activeServer || activeServer.is_local
+    ? window.location.hostname
+    : activeServer.ip_address;
   const [templates, setTemplates] = useState<AppTemplate[]>([]);
   const [apps, setApps] = useState<DeployedApp[]>([]);
   const [loading, setLoading] = useState(true);
@@ -424,7 +477,11 @@ export default function Apps() {
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([]);
   const [envLoading, setEnvLoading] = useState(false);
   const [envEditing, setEnvEditing] = useState(false);
-  const [envEditValues, setEnvEditValues] = useState<Record<string, string>>({});
+  // Rows, not a keyed record: a record cannot express an added variable (every
+  // new row would collide on the empty-string key) nor a removed one, which is
+  // why the modal could only ever edit the values of keys the container already
+  // had (GitHub #111).
+  const [envEditRows, setEnvEditRows] = useState<{ key: string; value: string }[]>([]);
   const [envSaving, setEnvSaving] = useState(false);
   // Update SSE state
   const [updateDeployId, setUpdateDeployId] = useState<string | null>(null);
@@ -438,6 +495,8 @@ export default function Apps() {
   const [shellContainer, setShellContainer] = useState<{ id: string; name: string } | null>(null);
   const [shellCmd, setShellCmd] = useState("");
   const [shellOutput, setShellOutput] = useState("");
+  const [shellInfo, setShellInfo] = useState<{ has_bash: boolean; has_sh: boolean } | null>(null);
+  const [shellInfoLoading, setShellInfoLoading] = useState(false);
   const shellOutputRef = useRef<HTMLDivElement>(null);
 
   // Volume browser state
@@ -462,7 +521,30 @@ export default function Apps() {
   const [composeName, setComposeName] = useState("");
   const [composeDomain, setComposeDomain] = useState("");
   const [composeSslEmail, setComposeSslEmail] = useState("");
+  // Default `none` is today's blank-email behaviour spelled out: the operator
+  // now picks a mode instead of the panel inferring one from an empty box.
+  const [composeTlsMode, setComposeTlsMode] = useState<"none" | "acme" | "provided">("none");
+  const [composeTlsCertificate, setComposeTlsCertificate] = useState("");
+  // null = not asked yet. Fetched only when "Registered certificate" is chosen,
+  // so a form that never uses the registry never pays for the request.
+  const [registeredCerts, setRegisteredCerts] = useState<{ id: string; alias: string; dns_names: string[] }[] | null>(null);
+  const [registeredCertsError, setRegisteredCertsError] = useState("");
   const [composeChecks, setComposeChecks] = useState<ComposeValidation | null>(null);
+
+  // Stack edit state. `PUT /api/stacks/{id}` (redeploy with domain/TLS
+  // replanning, rollback on failure) had zero frontend caller until s414 —
+  // the field set mirrors the create modal above (minus name, which is
+  // immutable) since GET /api/stacks/{id} already returns everything needed
+  // to prefill it.
+  const [editingStack, setEditingStack] = useState<StackInfo | null>(null);
+  const [editYaml, setEditYaml] = useState("");
+  const [editLoading, setEditLoading] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState("");
+  const [editDomain, setEditDomain] = useState("");
+  const [editSslEmail, setEditSslEmail] = useState("");
+  const [editTlsMode, setEditTlsMode] = useState<"none" | "acme" | "provided">("none");
+  const [editTlsCertificate, setEditTlsCertificate] = useState("");
 
   // Image management state (Feature #6)
   const [showImages, setShowImages] = useState(false);
@@ -529,10 +611,14 @@ export default function Apps() {
     });
   }, []);
 
-  const rescanApp = async (containerId: string, image: string) => {
-    setScanRescanning(containerId);
+  // Keyed by the app's NAME, not its container id. `/api/apps/{name}/scan` and
+  // `/api/apps/{name}/sbom` resolve the image by matching the agent's `name`
+  // field; every other `/api/apps/{container_id}/…` route takes the hex id, and
+  // passing that here matched nothing and answered 404 for every app.
+  const rescanApp = async (appName: string, image: string) => {
+    setScanRescanning(appName);
     try {
-      const result = await api.post<ScanFinding>(`/apps/${containerId}/scan`, {});
+      const result = await api.post<ScanFinding>(`/apps/${encodeURIComponent(appName)}/scan`, {});
       setScanFindings(prev => ({ ...prev, [image]: result }));
       setMessage({ text: `Scanned ${image}`, type: "success" });
     } catch (e) {
@@ -546,19 +632,35 @@ export default function Apps() {
     setScanDrawerImage(image);
   };
 
-  const downloadSbom = async (containerId: string, image: string) => {
-    setSbomLoading(containerId);
+  const downloadSbom = async (appName: string, image: string, forceRegenerate = false) => {
+    setSbomLoading(appName);
     try {
-      const result = await api.post<{ image: string; generated_at: string; spdx: unknown }>(
-        `/apps/${containerId}/sbom`,
-        {}
-      );
-      const blob = new Blob([JSON.stringify(result.spdx, null, 2)], {
+      // A GET here serves the already-stored document instantly — no syft
+      // run — via download_app_sbom. Only fall back to the generating POST
+      // when there's no cached SBOM yet (404) or the caller explicitly asked
+      // to regenerate. Previously this always POSTed, forcing a 180-240s
+      // syft run on every click even when a fresh SBOM already existed.
+      let spdx: unknown;
+      if (!forceRegenerate) {
+        try {
+          spdx = await api.get(`/apps/${encodeURIComponent(appName)}/sbom`);
+        } catch (e) {
+          if (!(e instanceof ApiError) || e.status !== 404) throw e;
+        }
+      }
+      if (spdx === undefined) {
+        const result = await api.post<{ image: string; generated_at: string; spdx: unknown }>(
+          `/apps/${encodeURIComponent(appName)}/sbom`,
+          {}
+        );
+        spdx = result.spdx;
+      }
+      const blob = new Blob([JSON.stringify(spdx, null, 2)], {
         type: "application/json",
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      const safe = containerId.replace(/[^A-Za-z0-9._-]/g, "_");
+      const safe = appName.replace(/[^A-Za-z0-9._-]/g, "_");
       a.href = url;
       a.download = `${safe}.spdx.json`;
       document.body.appendChild(a);
@@ -579,7 +681,7 @@ export default function Apps() {
     if (!f) return "bg-dark-700 text-dark-300";
     if (f.critical_count > 0) return "bg-danger-500/15 text-danger-400";
     if (f.high_count > 0) return "bg-warn-500/15 text-warn-400";
-    if (f.medium_count > 0) return "bg-warn-500/10 text-warn-300";
+    if (f.medium_count > 0) return "bg-warn-500/10 text-warn-500";
     if (f.low_count + f.unknown_count > 0) return "bg-accent-500/10 text-accent-400";
     return "bg-rust-500/15 text-rust-400";
   };
@@ -756,15 +858,37 @@ export default function Apps() {
 
   const handleEnvSave = async () => {
     if (!envTarget) return;
+    // A blank key is an added row the operator never filled in — dropping it is
+    // what "Add variable then change your mind" has to mean.
+    const rows = envEditRows.filter(r => r.key.trim() !== "");
+    const names = rows.map(r => r.key.trim());
+    const duplicate = names.find((n, i) => names.indexOf(n) !== i);
+    if (duplicate) {
+      // Refused rather than silently collapsed: building the record from
+      // duplicate rows would keep the last one and discard the other without
+      // saying so, and the operator cannot see which value survived.
+      setMessage({ text: `Duplicate variable name: ${duplicate}`, type: "error" });
+      return;
+    }
     setEnvSaving(true);
     try {
-      await api.put(`/apps/${envTarget}/env`, { env: envEditValues });
+      const payload: Record<string, string> = {};
+      rows.forEach(r => { payload[r.key.trim()] = r.value; });
+      await api.put(`/apps/${envTarget}/env`, { env: payload });
       setMessage({ text: "Environment variables updated. Container was recreated.", type: "success" });
       setEnvTarget(null);
       setEnvEditing(false);
       loadApps();
     } catch (e) {
-      setMessage({ text: e instanceof Error ? e.message : "Failed to update env vars", type: "error" });
+      // This recreate can legitimately take up to 15 minutes (large images,
+      // slow uplinks), well past a proxy's own origin timeout — a network-level
+      // failure (not an ApiError, so the backend never got to answer) means the
+      // connection was cut, not that the update failed. The server keeps
+      // running it in the background regardless.
+      const text = !(e instanceof ApiError)
+        ? "Connection lost while saving — the update continues in the background. Refresh in a minute before retrying."
+        : e instanceof Error ? e.message : "Failed to update env vars";
+      setMessage({ text, type: "error" });
     } finally {
       setEnvSaving(false);
     }
@@ -792,6 +916,17 @@ export default function Apps() {
     setShellContainer({ id: containerId, name });
     setShellCmd("");
     setShellOutput("");
+    setShellInfo(null);
+    setShellInfoLoading(true);
+    try {
+      const info = await api.get<{ has_bash: boolean; has_sh: boolean }>(`/apps/${containerId}/shell-info`);
+      setShellInfo(info);
+    } catch {
+      // Probe failed — fall back to letting the user try anyway.
+      setShellInfo(null);
+    } finally {
+      setShellInfoLoading(false);
+    }
   };
 
   const handleVolumes = async (containerId: string) => {
@@ -871,11 +1006,25 @@ export default function Apps() {
         info[u.container_id] = { update_available: u.update_available, check_error: u.check_error || undefined };
       }
       setUpdateInfo(info);
+      // A registry that never answered scores `update_available: false`, exactly like
+      // an image that is genuinely current, so the count alone cannot tell "nothing to
+      // do" from "nothing could be asked". Reporting the second as success is how an
+      // operator walks away from unpatched images believing the fleet is up to date —
+      // and it needs nothing on the box to be broken: an anonymous registry rate limit,
+      // a private registry, a deleted tag or a DNS blip all land here. The per-row
+      // badges below already carry each reason; the summary has to stop contradicting
+      // them.
+      const unchecked = result.updates.filter(u => u.check_error).length;
+      const n = result.updates_available;
+      const plural = (c: number) => (c > 1 ? "s" : "");
       setMessage({
-        text: result.updates_available > 0
-          ? `${result.updates_available} update${result.updates_available > 1 ? "s" : ""} available`
-          : "All containers are up to date",
-        type: result.updates_available > 0 ? "warning" : "success",
+        text: n > 0
+          ? `${n} update${plural(n)} available` +
+            (unchecked > 0 ? ` · ${unchecked} image${plural(unchecked)} could not be reached` : "")
+          : unchecked > 0
+            ? `No updates found, but ${unchecked} image${plural(unchecked)} could not be reached — see the badge on each row`
+            : "All containers are up to date",
+        type: n > 0 || unchecked > 0 ? "warning" : "success",
       });
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Update check failed", type: "error" });
@@ -934,6 +1083,18 @@ export default function Apps() {
     }
   };
 
+  // The TLS half of the compose form, reset in one place — on success, Cancel
+  // and Escape alike — so a reopened dialog never carries a previous alias, and
+  // the registry list is asked again (a certificate registered in another tab
+  // is otherwise invisible for the life of the page).
+  const resetComposeTls = () => {
+    setComposeSslEmail("");
+    setComposeTlsMode("none");
+    setComposeTlsCertificate("");
+    setRegisteredCerts(null);
+    setRegisteredCertsError("");
+  };
+
   const handleComposeDeploy = async () => {
     if (!composeYaml.trim()) return;
     const stackName = composeName.trim() || `stack-${Date.now()}`;
@@ -945,6 +1106,11 @@ export default function Apps() {
         yaml: composeYaml,
         domain: composeDomain.trim() || null,
         ssl_email: composeSslEmail.trim() || null,
+        // Sent as a plain string, and the alias only in provided mode: neither
+        // is a clearable column, so neither takes the null-for-empty spelling
+        // the two lines above are the file's only allowed uses of.
+        tls_mode: composeTlsMode,
+        ...(composeTlsMode === "provided" ? { tls_certificate: composeTlsCertificate } : {}),
       });
       const failed = result.deploy_result.services.filter(s => s.status === "failed");
       // Refresh either way. A partial failure leaves real containers running
@@ -963,7 +1129,7 @@ export default function Apps() {
         setComposeChecks(null);
         setComposeName("");
         setComposeDomain("");
-        setComposeSslEmail("");
+        resetComposeTls();
         const proxyNote = result.deploy_result.proxy_warning
           ? ` — but the domain could not be set up: ${result.deploy_result.proxy_warning}`
           : result.deploy_result.ssl_warning
@@ -975,6 +1141,11 @@ export default function Apps() {
         });
       }
     } catch (e) {
+      // A refusal can arrive AFTER the stack exists: a registered certificate
+      // that did not reach the vhost answers 502 with the containers running
+      // and the row kept, so the list must show it — or a second Deploy click
+      // makes a second stack under the same name.
+      loadApps();
       setComposeError(e instanceof Error ? e.message : "Deploy failed");
     } finally {
       setComposeDeploying(false);
@@ -996,6 +1167,57 @@ export default function Apps() {
       setMessage({ text: e instanceof Error ? e.message : `Stack ${action} failed`, type: "error" });
     } finally {
       setStackActionLoading(null);
+    }
+  };
+
+  const openEditStack = (stack: StackInfo) => {
+    setEditingStack(stack);
+    setEditError("");
+    setEditYaml("");
+    setEditDomain(stack.domain ?? "");
+    setEditSslEmail(stack.ssl_email ?? "");
+    setEditTlsMode(stack.tls_mode);
+    setEditTlsCertificate(stack.tls_certificate ?? "");
+    if (stack.tls_mode === "provided" && registeredCerts === null) {
+      setRegisteredCertsError("");
+      api.get<{ id: string; alias: string; dns_names: string[] }[]>("/tls-certificates")
+        .then((rows) => setRegisteredCerts(rows))
+        .catch((err) => {
+          setRegisteredCertsError(err instanceof Error ? err.message : "Could not load registered certificates");
+        });
+    }
+    // The list endpoint carries everything but the YAML itself, which is the
+    // one field the create modal never has to fetch (it starts blank here).
+    setEditLoading(true);
+    api.get<{ yaml: string }>(`/stacks/${stack.id}`)
+      .then((detail) => setEditYaml(detail.yaml))
+      .catch((err) => setEditError(err instanceof Error ? err.message : "Could not load the stack's YAML"))
+      .finally(() => setEditLoading(false));
+  };
+
+  const handleStackUpdate = async () => {
+    if (!editingStack) return;
+    setEditSaving(true);
+    setEditError("");
+    try {
+      await api.put(`/stacks/${editingStack.id}`, {
+        yaml: editYaml,
+        domain: editDomain.trim() || null,
+        ssl_email: editSslEmail.trim() || null,
+        tls_mode: editTlsMode,
+        ...(editTlsMode === "provided" ? { tls_certificate: editTlsCertificate } : {}),
+      });
+      setMessage({ text: `Stack "${editingStack.name}" updated`, type: "success" });
+      setEditingStack(null);
+      loadApps();
+    } catch (e) {
+      // A redeploy that fails rolls the stack back to its previous, saved YAML
+      // (the handler's own contract) — the error names why, and the dialog
+      // stays open so the operator can fix the YAML and retry rather than
+      // lose what they typed.
+      setEditError(e instanceof Error ? e.message : "Update failed");
+    } finally {
+      setEditSaving(false);
     }
   };
 
@@ -1229,7 +1451,14 @@ volumes:
   const filteredApps = standaloneApps.filter(a => !tagFilter || appTags[a.container_id] === tagFilter);
 
   // Crashed apps detection (Feature #10)
-  const crashedApps = apps.filter(a => a.status === 'exited' || a.status === 'dead');
+  //
+  // A container the panel itself stopped is not a crash. Calling it one was
+  // always wrong; since v2.144.0 it also matters more, because an expected stop
+  // no longer raises an alert and this page is the only surface that speaks
+  // about it at all.
+  const stoppedApps = apps.filter(a => (a.status === 'exited' || a.status === 'dead'));
+  const crashedApps = stoppedApps.filter(a => !a.expected_stop_reason);
+  const intentionallyStopped = stoppedApps.filter(a => a.expected_stop_reason);
 
   return (
     <div>
@@ -1319,7 +1548,40 @@ volumes:
             {crashedApps.map(a => (
               <div key={a.container_id} className="flex items-center justify-between text-xs">
                 <span className="text-dark-100 font-mono">{a.name} <span className="text-dark-300">({a.status})</span></span>
-                <button onClick={() => handleAction(a.container_id, "start")} className="text-rust-400 hover:text-rust-300 font-medium">Restart</button>
+                <button onClick={() => handleAction(a.container_id, "start")} className="text-rust-400 hover:text-rust-300 font-medium">Start</button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Stopped on purpose — not a crash, and deliberately not styled as one */}
+      {intentionallyStopped.length > 0 && (
+        <div className="bg-dark-800/60 border border-dark-600 rounded-lg p-4 mb-4">
+          <div className="flex items-center gap-2">
+            <svg className="w-5 h-5 text-dark-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span className="text-sm text-dark-200 font-medium">
+              {intentionallyStopped.length} container(s) stopped on purpose — not alerting
+            </span>
+          </div>
+          <div className="mt-2 space-y-1">
+            {intentionallyStopped.map(a => (
+              <div key={a.container_id} className="flex items-center justify-between text-xs">
+                <span className="text-dark-100 font-mono">
+                  {a.name}{" "}
+                  <span className="text-dark-300">
+                    ({stopReasonLabel(a.expected_stop_reason)}
+                    {a.expected_stop_by ? ` — ${a.expected_stop_by}` : ""})
+                  </span>
+                </span>
+                <button
+                  onClick={() => handleAction(a.container_id, "start")}
+                  className="text-rust-400 hover:text-rust-300 font-medium"
+                >
+                  Start
+                </button>
               </div>
             ))}
           </div>
@@ -1357,7 +1619,7 @@ volumes:
                     </span>
                     {stack.domain && (
                       <a
-                        href={`${stack.ssl_email ? "https" : "http"}://${stack.domain}`}
+                        href={`${stack.tls_mode !== "none" ? "https" : "http"}://${stack.domain}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         onClick={(e) => e.stopPropagation()}
@@ -1365,6 +1627,16 @@ volumes:
                       >
                         {stack.domain}
                       </a>
+                    )}
+                    {stack.domain && stack.tls_mode === "acme" && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-dark-700 text-dark-300" title="Certificate ordered from Let's Encrypt">
+                        Let's Encrypt
+                      </span>
+                    )}
+                    {stack.domain && stack.tls_mode === "provided" && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-dark-700 text-dark-300" title="Served by a registered certificate (Monitoring → Certificates)">
+                        cert: {stack.tls_certificate ?? "?"}
+                      </span>
                     )}
                   </div>
                   <div className="flex items-center gap-2">
@@ -1395,6 +1667,13 @@ volumes:
                         {stackActionLoading === `${stack.id}-restart` ? "..." : "Restart"}
                       </button>
                     )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); openEditStack(stack); }}
+                      disabled={stackActionLoading !== null}
+                      className="px-2 py-1 text-xs bg-dark-700 text-dark-200 rounded hover:bg-dark-600 disabled:opacity-50"
+                    >
+                      Edit
+                    </button>
                     {stackRemoveArmed === stack.id ? (
                       <>
                         <button
@@ -1528,6 +1807,19 @@ volumes:
                             Update
                           </span>
                         )}
+                        {/* The agent reports why a version check failed and the
+                            panel used to drop it, so an app whose tag had been
+                            deleted from the registry looked exactly like one that
+                            was up to date — no badge, ordinary Update button. */}
+                        {updateInfo[app.container_id]?.check_error && (
+                          <span
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-warn-500/15 text-warn-400"
+                            title={`Could not check for a newer image: ${updateInfo[app.container_id]?.check_error}`}
+                          >
+                            <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>
+                            Check failed
+                          </span>
+                        )}
                         {app.image && (() => {
                           const f = scanFindings[app.image];
                           const label = scanSeverityLabel(f);
@@ -1572,7 +1864,32 @@ volumes:
                         <span className="text-dark-300">{"\u2014"}</span>
                       )}
                     </td>
-                    <td className="px-5 py-4 text-sm text-dark-200 font-mono hidden sm:table-cell">{app.port || "\u2014"}</td>
+                    {/*
+                      A published port is reachable, so make it reachable. Only
+                      when the app has no domain \u2014 one that does already links
+                      from the column before this, and two links to the same app
+                      is noise. Always plain http: `app.ssl` describes whether
+                      the SERVER terminates TLS for that domain's vhost, which
+                      says nothing about a container's raw published port, so
+                      reusing it here would produce an https:// link to a socket
+                      that speaks http.
+                    */}
+                    <td className="px-5 py-4 text-sm text-dark-200 font-mono hidden sm:table-cell">
+                      {app.port && !app.domain && appHost ? (
+                        <a
+                          href={`http://${appHost}:${app.port}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={e => e.stopPropagation()}
+                          className="text-rust-400 hover:underline"
+                          title={`Open http://${appHost}:${app.port} in a new tab`}
+                        >
+                          {app.port}
+                        </a>
+                      ) : (
+                        app.port || "\u2014"
+                      )}
+                    </td>
                     <td className="px-5 py-4 hidden lg:table-cell">
                       {app.health ? (
                         <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
@@ -1970,7 +2287,7 @@ volumes:
             <button
               key={tmpl.id}
               onClick={() => openDeploy(tmpl)}
-              className="bg-dark-800 rounded-lg border border-dark-500 p-5 text-left hover:border-indigo-300 hover:shadow-sm transition-all group card-interactive hover-lift"
+              className="bg-dark-800 rounded-lg border border-dark-500 p-5 text-left hover:border-accent-500 hover:shadow-sm transition-all group card-interactive hover-lift"
             >
               <div className="flex items-center gap-3 mb-3">
                 <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${categoryColors[tmpl.category] || "bg-dark-700"}`}>
@@ -1984,7 +2301,7 @@ volumes:
                     {tmpl.gpu_recommended && (
                       <span
                         title="GPU recommended — passthrough will be auto-enabled on deploy"
-                        className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+                        className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-rust-500/15 text-rust-400 border border-rust-500/30"
                       >
                         GPU
                       </span>
@@ -2128,7 +2445,7 @@ volumes:
                   />
                   Enable GPU passthrough
                   {selected?.gpu_recommended && (
-                    <span className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                    <span className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-rust-500/15 text-rust-400 border border-rust-500/30">
                       Recommended
                     </span>
                   )}
@@ -2271,6 +2588,15 @@ volumes:
                             </button>
                           )}
                         </div>
+                        {/* Say it rather than let the operator read a localhost
+                            default the deploy is about to replace. Only shown
+                            once a domain is actually claimed, because without
+                            one the default IS what gets used. */}
+                        {v.domain_derived && appDomain.trim() !== "" && (
+                          <p className="text-[10px] text-accent-400 mt-0.5">
+                            Set automatically from {appDomain.trim()} — change it only to override.
+                          </p>
+                        )}
                         {selected.id === "vllm" && v.name === "MODEL" && (
                           <datalist id="vllm-models">
                             <option value="meta-llama/Llama-3.2-1B-Instruct" />
@@ -2343,13 +2669,17 @@ volumes:
                 Environment Variables
               </h3>
               <div className="flex items-center gap-2">
-                {!envEditing && envVars.length > 0 && (
+                {/* Deliberately ungated on how many variables are already set:
+                    a container with none is exactly the case that needs the
+                    editor most, and that gate was half of why an arbitrary key
+                    could never be added. The condition is not spelled in this
+                    comment because a pin arm greps raw source and a quotation
+                    here would satisfy it while the code changed. */}
+                {!envEditing && (
                   <button
                     onClick={() => {
                       setEnvEditing(true);
-                      const vals: Record<string, string> = {};
-                      envVars.forEach(ev => { vals[ev.key] = ev.value; });
-                      setEnvEditValues(vals);
+                      setEnvEditRows(envVars.map(ev => ({ key: ev.key, value: ev.value })));
                     }}
                     className="px-2 py-1 text-xs font-medium bg-accent-600/15 text-accent-400 rounded hover:bg-accent-600/25"
                   >
@@ -2379,23 +2709,61 @@ volumes:
                 <svg className="w-5 h-5 animate-spin mr-2" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
                 Loading...
               </div>
-            ) : envVars.length === 0 ? (
-              <div className="text-center py-8 text-dark-300 text-sm">No environment variables set</div>
             ) : envEditing ? (
+              /* Editing is checked BEFORE the empty case: a container with no
+                 variables set is precisely where Add is needed, and testing
+                 emptiness first would render "none set" over the editor. */
               <div className="space-y-2">
-                {envVars.map((ev, i) => (
+                {envEditRows.map((row, i) => (
                   <div key={i} className="flex gap-2 items-start">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-xs font-mono text-dark-200 truncate">{ev.key}</div>
-                      <input
-                        type="text"
-                        value={envEditValues[ev.key] || ""}
-                        onChange={(e) => setEnvEditValues({ ...envEditValues, [ev.key]: e.target.value })}
-                        className="w-full text-xs font-mono text-dark-100 bg-dark-900 rounded px-2 py-1.5 mt-0.5 border border-dark-600 focus:ring-1 focus:ring-purple-500 focus:border-purple-500"
-                      />
-                    </div>
+                    <input
+                      type="text"
+                      value={row.key}
+                      placeholder="KEY"
+                      spellCheck={false}
+                      onChange={(e) => {
+                        const n = [...envEditRows];
+                        n[i] = { ...n[i], key: e.target.value };
+                        setEnvEditRows(n);
+                      }}
+                      className="w-1/3 text-xs font-mono text-dark-100 bg-dark-900 rounded px-2 py-1.5 border border-dark-600 focus:ring-1 focus:ring-accent-500 focus:border-accent-500"
+                    />
+                    <input
+                      type="text"
+                      value={row.value}
+                      placeholder="value"
+                      spellCheck={false}
+                      onChange={(e) => {
+                        const n = [...envEditRows];
+                        n[i] = { ...n[i], value: e.target.value };
+                        setEnvEditRows(n);
+                      }}
+                      className="flex-1 min-w-0 text-xs font-mono text-dark-100 bg-dark-900 rounded px-2 py-1.5 border border-dark-600 focus:ring-1 focus:ring-accent-500 focus:border-accent-500"
+                    />
+                    <button
+                      onClick={() => setEnvEditRows(envEditRows.filter((_, j) => j !== i))}
+                      aria-label={`Remove ${row.key || "variable"}`}
+                      className="px-1.5 py-1.5 text-danger-400 hover:text-danger-300 text-sm"
+                    >
+                      &times;
+                    </button>
                   </div>
                 ))}
+                <button
+                  onClick={() => setEnvEditRows([...envEditRows, { key: "", value: "" }])}
+                  className="text-xs text-accent-400 hover:text-accent-300"
+                >
+                  + Add variable
+                </button>
+                {/* The container is the only store of an app's environment, so
+                    a value the read masked comes back as the mask and means
+                    "leave this one alone" — the server resolves it. Removing a
+                    row removes the variable. */}
+                <p className="text-[11px] text-dark-400 pt-1">
+                  Saving recreates the container. Values shown as
+                  {" "}<span className="font-mono">{ENV_MASK}</span>{" "}
+                  are unchanged unless you edit them.
+                </p>
                 <div className="flex justify-end gap-2 mt-4 pt-3 border-t border-dark-600">
                   <button onClick={() => setEnvEditing(false)} className="px-3 py-1.5 text-xs text-dark-300 border border-dark-600 rounded hover:text-dark-100">
                     Cancel
@@ -2409,6 +2777,8 @@ volumes:
                   </button>
                 </div>
               </div>
+            ) : envVars.length === 0 ? (
+              <div className="text-center py-8 text-dark-300 text-sm">No environment variables set</div>
             ) : (
               <div className="space-y-2">
                 {envVars.map((ev, i) => (
@@ -2470,11 +2840,17 @@ volumes:
             <div ref={shellOutputRef} className="flex-1 overflow-y-auto p-4 bg-dark-950 font-mono text-xs text-dark-200 whitespace-pre-wrap min-h-[300px]">
               {shellOutput || "Type a command and press Enter.\n"}
             </div>
+            {shellInfo && !shellInfo.has_bash && !shellInfo.has_sh && (
+              <div className="px-4 py-2 border-t border-dark-600 bg-danger-500/10 text-danger-400 text-xs">
+                No shell available in this image — neither bash nor sh could be found.
+              </div>
+            )}
             <div className="px-4 py-3 border-t border-dark-600 flex gap-2 items-center">
               <span className="text-rust-400 font-mono text-sm">$</span>
               <input
                 value={shellCmd}
                 onChange={(e) => setShellCmd(e.target.value)}
+                disabled={!!shellInfo && !shellInfo.has_bash && !shellInfo.has_sh}
                 onKeyDown={async (e) => {
                   if (e.key === "Enter" && shellCmd.trim()) {
                     const cmd = shellCmd;
@@ -2488,9 +2864,9 @@ volumes:
                     }
                   }
                 }}
-                placeholder="Enter command..."
+                placeholder={shellInfoLoading ? "Checking shell availability..." : "Enter command..."}
                 autoFocus
-                className="flex-1 bg-transparent text-dark-100 font-mono text-sm outline-none"
+                className="flex-1 bg-transparent text-dark-100 font-mono text-sm outline-none disabled:opacity-50"
               />
             </div>
           </div>
@@ -2644,9 +3020,9 @@ volumes:
                       onClick={() => { setPruneArmed(false); handlePruneImages(); }}
                       disabled={imagePruning}
                       className="px-3 py-1.5 text-xs font-medium bg-danger-500 text-white rounded disabled:opacity-50"
-                      title="Removes ALL unused images host-wide — irreversible"
+                      title="Removes dangling (untagged) images host-wide — irreversible. Rollback and snapshot images stay tagged, so they're kept."
                     >
-                      {imagePruning ? "Pruning..." : "Confirm — prune all unused"}
+                      {imagePruning ? "Pruning..." : "Confirm — prune dangling images"}
                     </button>
                     <button
                       onClick={() => setPruneArmed(false)}
@@ -2661,7 +3037,7 @@ volumes:
                     onClick={() => setPruneArmed(true)}
                     disabled={imagePruning}
                     className="px-3 py-1.5 text-xs font-medium bg-warn-500/10 text-warn-400 rounded hover:bg-warn-500/20 disabled:opacity-50"
-                    title="Removes ALL unused images host-wide — irreversible"
+                    title="Removes dangling (untagged) images host-wide — irreversible. Rollback and snapshot images stay tagged, so they're kept."
                   >
                     {imagePruning ? "Pruning..." : "Prune Unused"}
                   </button>
@@ -2728,7 +3104,7 @@ volumes:
           className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4 dp-modal-overlay"
           role="dialog"
           aria-labelledby="compose-dialog-title"
-          onKeyDown={(e) => { if (e.key === "Escape") { setShowCompose(false); setComposeParsed(null); setComposeError(""); }}}
+          onKeyDown={(e) => { if (e.key === "Escape") { setShowCompose(false); setComposeParsed(null); setComposeError(""); resetComposeTls(); }}}
         >
           <div className="bg-dark-800 rounded-lg shadow-xl p-6 w-full max-w-2xl max-h-[85vh] overflow-y-auto dp-modal">
             <div className="flex items-center justify-between mb-4">
@@ -2827,7 +3203,18 @@ volumes:
                   id="compose-domain"
                   type="text"
                   value={composeDomain}
-                  onChange={(e) => setComposeDomain(e.target.value)}
+                  onChange={(e) => {
+                    setComposeDomain(e.target.value);
+                    // A TLS choice is meaningless without a domain, and the
+                    // backend refuses a mode other than none for one — so
+                    // emptying the box takes the choice with it rather than
+                    // leaving a hidden "acme" behind a disabled select.
+                    if (!e.target.value.trim()) {
+                      setComposeTlsMode("none");
+                      setComposeTlsCertificate("");
+                      setComposeSslEmail("");
+                    }
+                  }}
                   placeholder="watchdog.example.com"
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
                 />
@@ -2836,19 +3223,90 @@ volumes:
                 </p>
               </div>
               <div>
-                <label htmlFor="compose-ssl-email" className="block text-sm font-medium text-dark-100 mb-1">SSL Email <span className="text-dark-400 font-normal">(optional)</span></label>
-                <input
-                  id="compose-ssl-email"
-                  type="email"
-                  value={composeSslEmail}
-                  onChange={(e) => setComposeSslEmail(e.target.value)}
-                  placeholder="admin@example.com"
+                <label htmlFor="compose-tls-mode" className="block text-sm font-medium text-dark-100 mb-1">HTTPS</label>
+                <select
+                  id="compose-tls-mode"
+                  value={composeTlsMode}
                   disabled={!composeDomain.trim()}
-                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500 disabled:opacity-50"
-                />
-                <p className="text-xs text-dark-300 mt-1">
-                  Requests a Let's Encrypt certificate. Leave blank to serve plain HTTP.
-                </p>
+                  onChange={(e) => {
+                    const mode = e.target.value as "none" | "acme" | "provided";
+                    setComposeTlsMode(mode);
+                    // The email is only meaningful to an ACME order. Keeping a
+                    // typed address behind a hidden input would send it with a
+                    // `none` or `provided` stack, where the backend reads its
+                    // presence as nothing but the payload still carries it.
+                    if (mode !== "acme") setComposeSslEmail("");
+                    if (mode !== "provided") setComposeTlsCertificate("");
+                    if (mode === "provided" && registeredCerts === null) {
+                      setRegisteredCertsError("");
+                      api.get<{ id: string; alias: string; dns_names: string[] }[]>("/tls-certificates")
+                        .then((rows) => setRegisteredCerts(rows))
+                        .catch((err) => {
+                          // Left at null so choosing the mode again asks again;
+                          // an empty list here would read as "nothing registered"
+                          // for the life of the page after one failed request.
+                          setRegisteredCertsError(err instanceof Error ? err.message : "Could not load registered certificates");
+                        });
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-dark-800 border border-dark-500 rounded-lg text-sm text-dark-100 focus:ring-2 focus:ring-accent-500 focus:border-accent-500 disabled:opacity-50"
+                >
+                  <option value="none">No HTTPS — plain HTTP, or TLS terminated upstream</option>
+                  <option value="acme">Let's Encrypt certificate</option>
+                  <option value="provided">Registered certificate</option>
+                </select>
+                {composeTlsMode === "acme" && (
+                  <>
+                    <input
+                      id="compose-ssl-email"
+                      type="email"
+                      value={composeSslEmail}
+                      onChange={(e) => setComposeSslEmail(e.target.value)}
+                      placeholder="admin@example.com"
+                      aria-label="SSL Email"
+                      className="mt-2 w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                    />
+                    <p className="text-xs text-dark-300 mt-1">
+                      Account email for the Let's Encrypt order. Required in this mode.
+                    </p>
+                  </>
+                )}
+                {composeTlsMode === "provided" && (
+                  <>
+                    <select
+                      id="compose-tls-certificate"
+                      value={composeTlsCertificate}
+                      onChange={(e) => setComposeTlsCertificate(e.target.value)}
+                      aria-label="Registered certificate"
+                      className="mt-2 w-full px-3 py-2 bg-dark-800 border border-dark-500 rounded-lg text-sm font-mono text-dark-100 focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                    >
+                      <option value="">
+                        {registeredCerts === null ? "Loading…" : "Choose a certificate"}
+                      </option>
+                      {(registeredCerts ?? []).map((c) => (
+                        <option key={c.id} value={c.alias}>
+                          {c.alias}{c.dns_names.length > 0 ? ` — ${c.dns_names.join(", ")}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {registeredCertsError ? (
+                      <p className="text-xs text-danger-400 mt-1">{registeredCertsError}</p>
+                    ) : registeredCerts !== null && registeredCerts.length === 0 ? (
+                      <p className="text-xs text-dark-300 mt-1">
+                        No certificates are registered on this server yet. Register one under Monitoring → Certificates, then pick it here.
+                      </p>
+                    ) : (
+                      <p className="text-xs text-dark-300 mt-1">
+                        The certificate must cover the domain above; the claim is refused otherwise. Served by nginx only.
+                      </p>
+                    )}
+                  </>
+                )}
+                {composeTlsMode === "none" && (
+                  <p className="text-xs text-dark-300 mt-1">
+                    {composeDomain.trim() ? "Serves plain HTTP on the domain." : "Enter a domain to choose how it is served."}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -2868,7 +3326,7 @@ volumes:
             {!composeParsed && (
               <div className="flex justify-end gap-2">
                 <button
-                  onClick={() => { setShowCompose(false); setComposeYaml(""); setComposeParsed(null); setComposeError(""); }}
+                  onClick={() => { setShowCompose(false); setComposeYaml(""); setComposeParsed(null); setComposeError(""); resetComposeTls(); }}
                   className="px-4 py-2 text-dark-300 border border-dark-600 rounded-lg text-sm font-medium hover:text-dark-100 hover:border-dark-400"
                 >
                   Cancel
@@ -2966,7 +3424,14 @@ volumes:
                   </button>
                   <button
                     onClick={handleComposeDeploy}
-                    disabled={composeDeploying}
+                    // The backend refuses acme without an email and provided
+                    // without an alias; refusing here too keeps the dialog
+                    // from round-tripping a deploy it already knows will fail.
+                    disabled={
+                      composeDeploying ||
+                      (composeTlsMode === "acme" && !composeSslEmail.trim()) ||
+                      (composeTlsMode === "provided" && !composeTlsCertificate)
+                    }
                     className="px-4 py-2 bg-rust-600 text-white rounded-lg text-sm font-medium hover:bg-rust-700 disabled:opacity-50 flex items-center gap-2"
                   >
                     {composeDeploying && (
@@ -2981,6 +3446,155 @@ volumes:
               </>
             )}
             </>)}
+          </div>
+        </div>
+      )}
+
+      {/* Edit stack — reuses the create modal's field set (minus name, which
+          PUT /api/stacks/{id} keeps immutable) since GET already returns
+          everything needed to prefill it. */}
+      {editingStack && (
+        <div
+          className="fixed inset-0 bg-black/30 flex items-center justify-center z-50 p-4 dp-modal-overlay"
+          role="dialog"
+          aria-labelledby="edit-stack-dialog-title"
+          onKeyDown={(e) => { if (e.key === "Escape" && !editSaving) setEditingStack(null); }}
+        >
+          <div className="bg-dark-800 rounded-lg shadow-xl p-6 w-full max-w-2xl max-h-[85vh] overflow-y-auto dp-modal">
+            <h3 id="edit-stack-dialog-title" className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest mb-4">
+              Edit Stack — {editingStack.name}
+            </h3>
+
+            {editError && (
+              <div className="mb-4 px-4 py-3 rounded-lg text-sm border bg-danger-500/10 text-danger-400 border-danger-500/20">
+                {editError}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              <div>
+                <label htmlFor="edit-stack-domain" className="block text-sm font-medium text-dark-100 mb-1">Domain <span className="text-dark-400 font-normal">(optional)</span></label>
+                <input
+                  id="edit-stack-domain"
+                  type="text"
+                  value={editDomain}
+                  onChange={(e) => {
+                    setEditDomain(e.target.value);
+                    if (!e.target.value.trim()) {
+                      setEditTlsMode("none");
+                      setEditTlsCertificate("");
+                      setEditSslEmail("");
+                    }
+                  }}
+                  placeholder="watchdog.example.com"
+                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-stack-tls-mode" className="block text-sm font-medium text-dark-100 mb-1">HTTPS</label>
+                <select
+                  id="edit-stack-tls-mode"
+                  value={editTlsMode}
+                  disabled={!editDomain.trim()}
+                  onChange={(e) => {
+                    const mode = e.target.value as "none" | "acme" | "provided";
+                    setEditTlsMode(mode);
+                    if (mode !== "acme") setEditSslEmail("");
+                    if (mode !== "provided") setEditTlsCertificate("");
+                    if (mode === "provided" && registeredCerts === null) {
+                      setRegisteredCertsError("");
+                      api.get<{ id: string; alias: string; dns_names: string[] }[]>("/tls-certificates")
+                        .then((rows) => setRegisteredCerts(rows))
+                        .catch((err) => {
+                          setRegisteredCertsError(err instanceof Error ? err.message : "Could not load registered certificates");
+                        });
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-dark-800 border border-dark-500 rounded-lg text-sm text-dark-100 focus:ring-2 focus:ring-accent-500 focus:border-accent-500 disabled:opacity-50"
+                >
+                  <option value="none">No HTTPS — plain HTTP, or TLS terminated upstream</option>
+                  <option value="acme">Let's Encrypt certificate</option>
+                  <option value="provided">Registered certificate</option>
+                </select>
+                {editTlsMode === "acme" && (
+                  <input
+                    type="email"
+                    value={editSslEmail}
+                    onChange={(e) => setEditSslEmail(e.target.value)}
+                    placeholder="admin@example.com"
+                    aria-label="SSL Email"
+                    className="mt-2 w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                  />
+                )}
+                {editTlsMode === "provided" && (
+                  <>
+                    <select
+                      value={editTlsCertificate}
+                      onChange={(e) => setEditTlsCertificate(e.target.value)}
+                      aria-label="Registered certificate"
+                      className="mt-2 w-full px-3 py-2 bg-dark-800 border border-dark-500 rounded-lg text-sm font-mono text-dark-100 focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                    >
+                      <option value="">
+                        {registeredCerts === null ? "Loading…" : "Choose a certificate"}
+                      </option>
+                      {(registeredCerts ?? []).map((c) => (
+                        <option key={c.id} value={c.alias}>
+                          {c.alias}{c.dns_names.length > 0 ? ` — ${c.dns_names.join(", ")}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {registeredCertsError && (
+                      <p className="text-xs text-danger-400 mt-1">{registeredCertsError}</p>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="mb-4">
+              <label htmlFor="edit-stack-yaml" className="block text-sm font-medium text-dark-100 mb-1">docker-compose.yml</label>
+              <textarea
+                id="edit-stack-yaml"
+                value={editYaml}
+                onChange={(e) => setEditYaml(e.target.value)}
+                rows={12}
+                disabled={editLoading}
+                className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500 disabled:opacity-50"
+                spellCheck={false}
+              />
+              <p className="text-xs text-dark-300 mt-1">
+                Saving redeploys the stack with this YAML. If no service in the new definition stays running, the previous stack is redeployed and this YAML change is not kept.
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setEditingStack(null)}
+                disabled={editSaving}
+                className="px-4 py-2 text-dark-300 border border-dark-600 rounded-lg text-sm font-medium hover:text-dark-100 hover:border-dark-400 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleStackUpdate}
+                disabled={
+                  editSaving ||
+                  editLoading ||
+                  !editYaml.trim() ||
+                  (editTlsMode === "acme" && !editSslEmail.trim()) ||
+                  (editTlsMode === "provided" && !editTlsCertificate)
+                }
+                className="px-4 py-2 bg-rust-600 text-white rounded-lg text-sm font-medium hover:bg-rust-700 disabled:opacity-50 flex items-center gap-2"
+              >
+                {editSaving && (
+                  <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                )}
+                {editSaving ? "Saving..." : "Save & Redeploy"}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -3020,8 +3634,8 @@ volumes:
                       <div className="text-[10px] uppercase font-mono text-warn-400 tracking-widest">High</div>
                     </div>
                     <div className="bg-warn-500/5 rounded p-3 text-center">
-                      <div className="text-2xl font-bold text-warn-300">{finding.medium_count}</div>
-                      <div className="text-[10px] uppercase font-mono text-warn-300 tracking-widest">Medium</div>
+                      <div className="text-2xl font-bold text-warn-500">{finding.medium_count}</div>
+                      <div className="text-[10px] uppercase font-mono text-warn-500 tracking-widest">Medium</div>
                     </div>
                     <div className="bg-accent-500/10 rounded p-3 text-center">
                       <div className="text-2xl font-bold text-accent-400">{finding.low_count}</div>
@@ -3040,20 +3654,29 @@ volumes:
                     <div className="flex gap-2 mb-4">
                       <button
                         type="button"
-                        onClick={() => rescanApp(matchedApp.container_id, scanDrawerImage)}
-                        disabled={scanRescanning === matchedApp.container_id}
+                        onClick={() => rescanApp(matchedApp.name, scanDrawerImage)}
+                        disabled={scanRescanning === matchedApp.name}
                         className="px-3 py-1.5 text-xs font-medium bg-rust-600 text-white rounded hover:bg-rust-700 disabled:opacity-50"
                       >
-                        {scanRescanning === matchedApp.container_id ? "Scanning..." : "Rescan now"}
+                        {scanRescanning === matchedApp.name ? "Scanning..." : "Rescan now"}
                       </button>
                       <button
                         type="button"
-                        onClick={() => downloadSbom(matchedApp.container_id, scanDrawerImage)}
-                        disabled={sbomLoading === matchedApp.container_id}
-                        title="Generate and download an SPDX 2.3 SBOM for this image (syft)"
+                        onClick={() => downloadSbom(matchedApp.name, scanDrawerImage)}
+                        disabled={sbomLoading === matchedApp.name}
+                        title="Download the stored SPDX 2.3 SBOM for this image, generating one first if none exists yet"
                         className="px-3 py-1.5 text-xs font-medium bg-dark-600 text-dark-50 rounded hover:bg-dark-500 disabled:opacity-50"
                       >
-                        {sbomLoading === matchedApp.container_id ? "Generating SBOM..." : "Download SBOM"}
+                        {sbomLoading === matchedApp.name ? "Generating SBOM..." : "Download SBOM"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => downloadSbom(matchedApp.name, scanDrawerImage, true)}
+                        disabled={sbomLoading === matchedApp.name}
+                        title="Force a fresh SBOM scan (syft) instead of using the stored one"
+                        className="px-3 py-1.5 text-xs font-medium bg-dark-600 text-dark-50 rounded hover:bg-dark-500 disabled:opacity-50"
+                      >
+                        Regenerate
                       </button>
                     </div>
                   )}
@@ -3075,7 +3698,7 @@ volumes:
                             const sevClass =
                               sev === "critical" ? "bg-danger-500/15 text-danger-400" :
                               sev === "high" ? "bg-warn-500/15 text-warn-400" :
-                              sev === "medium" ? "bg-warn-500/10 text-warn-300" :
+                              sev === "medium" ? "bg-warn-500/10 text-warn-500" :
                               sev === "low" ? "bg-accent-500/10 text-accent-400" :
                               "bg-dark-700 text-dark-300";
                             const isCveId = /^CVE-\d{4}-\d{4,}$/i.test(v.cve);
@@ -3120,11 +3743,11 @@ volumes:
                   {matchedApp && (
                     <button
                       type="button"
-                      onClick={() => rescanApp(matchedApp.container_id, scanDrawerImage)}
-                      disabled={scanRescanning === matchedApp.container_id}
+                      onClick={() => rescanApp(matchedApp.name, scanDrawerImage)}
+                      disabled={scanRescanning === matchedApp.name}
                       className="px-4 py-2 text-sm font-medium bg-rust-600 text-white rounded hover:bg-rust-700 disabled:opacity-50"
                     >
-                      {scanRescanning === matchedApp.container_id ? "Scanning..." : "Scan now"}
+                      {scanRescanning === matchedApp.name ? "Scanning..." : "Scan now"}
                     </button>
                   )}
                   {!matchedApp && (
@@ -3235,7 +3858,7 @@ function OllamaModels({ containerId, onClose }: { containerId: string; onClose: 
           </div>
 
           {pullResult.msg && (
-            <div className={`mb-4 px-3 py-2 rounded text-xs ${pullResult.type === "success" ? "bg-emerald-500/10 text-emerald-400" : "bg-danger-500/10 text-danger-400"}`}>
+            <div className={`mb-4 px-3 py-2 rounded text-xs ${pullResult.type === "success" ? "bg-rust-500/10 text-rust-400" : "bg-danger-500/10 text-danger-400"}`}>
               {pullResult.msg}
             </div>
           )}
@@ -3322,7 +3945,7 @@ function OllamaModels({ containerId, onClose }: { containerId: string; onClose: 
                       <p className="text-xs text-dark-400">{m.desc} \u00b7 {m.size}</p>
                     </div>
                     {installed ? (
-                      <span className="text-xs text-emerald-400 font-medium">Installed</span>
+                      <span className="text-xs text-rust-400 font-medium">Installed</span>
                     ) : (
                       <button
                         onClick={() => pullModel(m.name)}

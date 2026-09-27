@@ -107,25 +107,69 @@ DockPanel supports TOTP-based 2FA using any authenticator app (Google Authentica
 
 ### Enable 2FA
 
-1. Go to **Settings** > **Security**
+1. Go to **My Account** (every role has it; administrators can also use **Settings** > **Account**)
 2. Click **Enable 2FA**
 3. Scan the QR code with your authenticator app
 4. Enter the 6-digit code from the app to confirm
-5. Save your **recovery codes** -- these are shown once and cannot be retrieved later
+5. Save your **recovery codes** -- they are shown once and cannot be retrieved later
 
-When 2FA is enabled, login requires your password followed by a TOTP code. The temporary token for the 2FA step expires after 5 minutes. Failed 2FA attempts are rate-limited to 5 per 5 minutes.
+When 2FA is enabled, login requires your password followed by a TOTP code. The temporary token for the 2FA step expires after 5 minutes. Failed 2FA attempts are rate-limited to 5 per 5 minutes, on every route that checks a 2FA code -- signing in, disabling 2FA, and issuing new recovery codes.
+
+> **Upgrading from a release before v2.84.0?** Two fixes in this area change what
+> you should do. Enrolments made before **v2.83.0** never displayed their recovery
+> codes (the panel generated them and stored them, but the block that draws them
+> was never reached), so if you enrolled before then, **you are holding ten codes
+> you have never seen**. Separately, codes issued before **v2.84.0** are half their
+> current width. Either way the repair is the same: open **My Account** and click
+> **New recovery codes** while you still have your authenticator. It does not
+> disturb your enrolment. Until v2.84.0 the disable route was also not rate-limited.
 
 ### Recovery Codes
 
-If you lose access to your authenticator app, use a recovery code to log in. Each code can only be used once. You receive 10 codes when enabling 2FA. Recovery codes are stored as Argon2 hashes -- they cannot be retrieved from the database.
+If you lose access to your authenticator app, use a recovery code -- to log in, and also to turn 2FA off or to issue a fresh set. Each code can only be used once, and you receive 10 when enabling 2FA.
+
+**How many are left** is shown on the 2FA card, and the panel warns you when the set runs low or reaches zero. Before v2.84.0 the count was never surfaced anywhere, so an account could spend its last code without knowing.
+
+**Issuing a new set.** Click **New recovery codes** on the 2FA card and confirm with a TOTP code or one of your remaining recovery codes. The previous set stops working immediately. Use this if you are running low, if you think a code has been seen by someone else, or if you enrolled before v2.83.0 and never received a readable set.
+
+**How they are stored.** Recovery codes are hashed with SHA-256 before being written, so the plaintext is not in the database. SHA-256 is a *fast* hash, which means the width of the code is what actually protects it: from v2.84.0 codes are 16 hex characters (64 bits), which is not searchable. Codes issued **before** v2.84.0 were 8 characters (32 bits) -- small enough that anyone holding a copy of the `users` table, or an old backup, could recover them by exhaustive search. Those codes still work, and that is the second reason to reissue a set: it replaces short codes with long ones. Note that this is not the protection applied to your password, which is Argon2 with a per-user salt.
 
 ### Enforce 2FA
 
-Admins can enforce 2FA for all users by enabling the `enforce_2fa` setting. Users without 2FA will be prompted to set it up on their next login.
+Admins can turn on the `enforce_2fa` setting. **This currently warns rather than refuses:** every user without 2FA sees a persistent banner asking them to enrol, and the login itself still succeeds. Refusing the login outright is deliberately not implemented, because several kinds of account have no second way in (OAuth-provisioned accounts with no password, the bootstrap administrator, non-browser callers), and a refusal they cannot satisfy is a lockout rather than a safeguard.
 
 ### Disable 2FA
 
-Go to **Settings** > **Security** > **Disable 2FA**. You must enter a valid TOTP code to confirm.
+Go to **My Account** > **Two-Factor Authentication** > **Disable 2FA**. Confirm with a TOTP code **or** one of your recovery codes -- accepting only a live TOTP code (the behaviour before v2.83.0) meant a lost authenticator could never be repaired by its owner.
+
+### If a user has lost everything
+
+An administrator can clear another user's 2FA from **Users** -- the shield icon on that user's row, which appears only for accounts that actually have an enrolment. It erases the enrolment and any remaining recovery codes, and signs out every session that user holds; they can then sign in with their password and enrol a new device. It is recorded in the activity log as `user.reset_2fa`.
+
+Two limits worth knowing before you rely on it:
+
+- **You cannot reset your own 2FA this way.** The route refuses it, because doing so would remove the factor without anyone presenting a code -- exactly what the disable flow exists to prevent. Use **My Account** with a TOTP or recovery code.
+- **It does not remove passkeys**, which sign in on their own without the 2FA step. It is a repair for a locked-out account, not an eviction tool: if you are responding to a compromise, review that account's passkeys and sessions as well.
+- **A sole administrator who has lost both their authenticator and their recovery codes cannot be recovered through the panel**, because there is no second administrator to perform the reset. Guard against this in advance: register a passkey (passkey sign-in does not require the 2FA step), keep a second administrator account, or keep your recovery codes somewhere you will still have them. Otherwise the only route back is clearing `totp_enabled`, `totp_secret` and `recovery_codes` for that row directly in PostgreSQL.
+
+### Adding a passkey asks you to confirm who you are
+
+Since v2.85.0, adding a passkey requires you to re-present a credential you already hold — your current password, a code from your authenticator, or one of your recovery codes. **Any one of them is enough**, deliberately: an administrator who has lost their authenticator still knows their password, and the bullet above tells that person to register a passkey. A door that demanded a TOTP code would refuse them at exactly the moment they need it.
+
+The reason for the prompt is that a passkey is the only credential this panel mints that **survives every reset it offers**. Clearing a user's 2FA, resetting their password and signing out all of their sessions leave an enrolled passkey working, and passkey sign-in does not take the 2FA step. So if someone reaches an open session — a shared machine, a stolen cookie — enrolling a passkey would convert that moment into permanent access. Confirming a credential closes that, because a session hijacker holds the session and nothing else.
+
+Two consequences worth knowing:
+
+- **An account that signs in only through an identity provider** (Google, GitHub) has no password to confirm and may have no authenticator. It is asked to sign in again with its provider if its session is more than five minutes old, and is not prompted at all if it has just signed in. This is a weaker check than a password and is not equivalent to one; it bounds a session replayed from another machine, not a script running on the panel's own origin.
+- **You are notified when a passkey is added to your account**, in the panel's notification centre, and passkeys now appear in **Export my data**. If a passkey you do not recognise appears, remove it in **My Account** and change your password.
+
+Removing a passkey is not guarded, and deliberately so: the person who has lost the authenticator holding it is exactly the person who needs to remove it, and a passkey is never an account's only way in — the password and identity-provider doors remain.
+
+### A passkey that verifies you is held to that on every login
+
+Since v2.199.0, **My Account** marks each passkey **Verified** or **Possession-only**. A security key can satisfy WebAuthn's user-presence requirement (a touch) without ever confirming who is touching it — no PIN, no fingerprint, no face. The panel now records, at the moment a passkey is registered, whether its authenticator actually performed that stronger check, and if it did, every future login with that same passkey is required to perform it again. A passkey that has never demonstrated verification — including every passkey registered before this release — keeps working exactly as before: presence alone is enough, same as always.
+
+**Nothing already enrolled is affected.** This is a property of a specific credential, not an account-wide switch: two passkeys on the same account can carry different badges. If a security key you rely on shows **Possession-only** and you want the stronger guarantee, remove it and register it again with a PIN or biometric enabled on the device — the new registration will record verification and your future logins with it will require it.
 
 ## IP Whitelist
 
@@ -139,6 +183,31 @@ The check reads the client address from the `X-Real-IP` header. **If your revers
 
 ```sql
 DELETE FROM settings WHERE key = 'allowed_panel_ips';
+```
+
+## Locked out by "Email not verified"
+
+Sign-in is refused with **"Email not verified. Check your inbox."** when an account is
+unverified *and* an SMTP host is set in Settings. The check is on the setting being
+**present**, not on the mail actually working — so a half-finished or wrong SMTP
+configuration arms the gate just as effectively as a working one.
+
+Before v2.90.0 this could lock out the very first administrator. The account created by
+the initial setup screen was stored unverified and, because it never registered, it
+never held a verification token — so the verification link could not be resent, it could
+not be generated at all, and the password-reset route needed the same broken mail. From
+v2.90.0 the setup screen marks that account verified when it creates it, and upgrading
+also releases any existing account that is unverified and holds no token.
+
+To clear it on a running panel, as an administrator: **Security** > **Approvals**, find
+the account under *Accounts blocked by email verification*, and press **Mark verified**.
+Rows marked `no link exists` cannot verify themselves by any means; rows marked
+`link outstanding` still have a live link that a working SMTP would deliver.
+
+If no administrator can sign in at all, clear it directly in the database:
+
+```sql
+UPDATE users SET email_verified = TRUE WHERE email = 'you@example.com';
 ```
 
 ## SSH Hardening
@@ -160,11 +229,30 @@ Each action is logged in the activity log. Ensure you have an SSH key configured
 
 ## Auto-Fix
 
-The security scanner identifies findings that can be fixed automatically. Click **Fix** next to any auto-fixable finding to apply the remediation. Examples include:
+Two screens offer a one-click **Fix**, and they remediate different things. Each
+list below is the complete set — a finding without a Fix button is one neither
+screen can act on, and it will tell you what to do instead rather than offering a
+button that cannot work.
 
-- Renewing an expiring SSL certificate
-- Fixing file permissions on config files
-- Disabling debug mode in web applications
+**Security** > **Scan** fixes findings about the machine's own posture:
+
+- Blocking an unexpected open port
+- Disabling SSH password authentication
+- Disabling SSH root login
+- Quarantining or deleting a file the malware scan flagged
+
+**System** > **Diagnostics** fixes findings about the panel's own housekeeping:
+
+- Restarting a service that is installed but not running
+- Creating a site's document root when it is missing
+- Clearing rotated logs, `/tmp`, or a site's FastCGI cache
+- Reclaiming unmanaged Docker images, containers and build cache
+- **Renewing an expiring SSL certificate.** This one is applied by the panel
+  rather than by the agent, because renewal needs the site's runtime, document
+  root, PHP version and ACME contact — all of which live in the panel's database.
+  A certificate under `/etc/dockpanel/ssl` with no matching site (a DNS-01
+  wildcard, or one installed by hand) is not renewable here, and the panel says
+  so rather than failing: whatever installed it is what renews it.
 
 Each fix is logged in the activity log with the fix type and target.
 
@@ -217,8 +305,10 @@ See the [Session Management guide](sessions.md) for details on viewing, revoking
 | `POST` | `/api/auth/2fa/setup` | Generate TOTP secret and QR code |
 | `POST` | `/api/auth/2fa/enable` | Verify code and enable 2FA |
 | `POST` | `/api/auth/2fa/verify` | Complete login with TOTP code |
-| `POST` | `/api/auth/2fa/disable` | Disable 2FA |
-| `GET` | `/api/auth/2fa/status` | Check if 2FA is enabled |
+| `POST` | `/api/auth/2fa/disable` | Disable 2FA (TOTP or recovery code) |
+| `POST` | `/api/auth/2fa/recovery-codes` | Issue a fresh set of recovery codes |
+| `GET` | `/api/auth/2fa/status` | 2FA state, enforcement flag, recovery codes remaining |
+| `POST` | `/api/users/{id}/reset-2fa` | Admin: clear another user's 2FA enrolment |
 | `GET` | `/api/auth/export-my-data` | GDPR data export |
 | `POST` | `/api/security/ssh/disable-password` | Disable SSH password auth |
 | `POST` | `/api/security/ssh/enable-password` | Enable SSH password auth |
@@ -251,7 +341,17 @@ The panic button performs an emergency lockdown: kills all active terminal sessi
 
 ### Immutable Audit Log
 
-All security events are written to a tamper-proof audit log. The database uses a PostgreSQL trigger that prevents UPDATE and DELETE operations. Events are also written to append-only files on disk at `/var/lib/dockpanel/audit/`.
+Security events, and every destructive or privilege-sensitive action across the panel — deleting a site, server, or user; promoting or demoting a reseller; resetting another user's password or 2FA; rotating a secret, API key, or server token; disabling SSH password auth; transferring a site — are written to the `security_audit_log` table, and a PostgreSQL trigger rejects `UPDATE` and `DELETE` on it. That trigger is the guarantee — it is what makes the record in the database immutable, and it is what the panel reads. This is deliberately broader than the general activity log (**Sites** and other pages' own activity views, backed by the mutable `activity_logs` table): a compromised admin account or a malicious insider with panel access can edit or delete an `activity_logs` row, but not a `security_audit_log` one.
+
+Every event is **also** appended to a dated file on disk at `/var/lib/dockpanel/audit/`, as a convenience copy for host-level forensics and log shipping. **What this does not do, stated plainly:** those files are written in append mode, but nothing sets a kernel append-only attribute on them, so a process that can write the directory can still rewrite one in place. Treat the on-disk copies as a convenience, not as evidence — the database is the authoritative record. Nothing in DockPanel reads these files back; they are for you and your own tooling.
+
+If you want kernel-enforced protection on the on-disk copies, apply it to the **files**, not the directory:
+
+```bash
+chattr +a /var/lib/dockpanel/audit/*.log     # new files each day need it again
+```
+
+Setting it on the directory instead is a common mistake and does not do what it looks like: it blocks deleting and renaming the logs while still allowing any of them to be truncated and rewritten. It also blocks DockPanel's own 365-day retention sweep, which cannot unlink under that attribute even as root — the panel logs a warning naming the directory when that happens. Either attribute can be cleared by root (`chattr -a`), so neither defends against an attacker who already has it.
 
 View the log in **Security** > **Lockdown** tab (Audit Log section).
 
@@ -297,11 +397,34 @@ One user may create at most **Site Creation Rate Limit** sites per hour (default
 
 ### Canary Files
 
-While **Canary File Monitoring** is on, DockPanel checks hidden canary files in sensitive directories (`/etc/`, `/root/`, `/home/`, `/var/www/`) every 2 minutes and alerts if their access times change. Canary monitoring, suspicious-event ingestion and auto-lockdown expiry run independently of the auto-healer's own switch.
+A canary file is a decoy nobody legitimate reads. While **Canary File Monitoring** is on, DockPanel checks each one every 2 minutes and raises a critical alert — audit-log entry, suspicious event, and a notification to every admin — if its access time has moved. Canary monitoring, suspicious-event ingestion and auto-lockdown expiry run independently of the auto-healer's own switch.
 
-### Backup Integrity Chain
+**The tripwire has to be armed before it can trip.** Press **Arm canary files** in **Settings** > **Account** > **Security Hardening**; the row beside the switch tells you how many paths are actually being watched. DockPanel plants four:
 
-Each backup includes a SHA-256 hash of its contents and a reference to the previous backup's hash, forming an integrity chain. If an attacker tampers with backup files, the chain breaks and alerts fire.
+| Path | Why |
+|------|-----|
+| `/etc/dockpanel/.dockpanel-canary` | where the agent token and panel credentials live |
+| `/var/lib/dockpanel/.dockpanel-canary` | runtime state |
+| `/var/backups/dockpanel/.dockpanel-canary` | panel database dumps |
+| `/var/www/.dockpanel-canary` | web root |
+
+Three older paths — `/etc/.dockpanel-canary`, `/root/.dockpanel-canary` and `/home/.dockpanel-canary` — are still watched if you armed a host by hand before v2.132.0, so upgrading does not stop monitoring a tripwire you were relying on.
+
+**What this does not do, stated plainly:**
+
+- **Before v2.132.0 nothing planted these files at all.** The switch is seeded on, and the endpoint that creates the canaries had no caller anywhere in the panel, so on a stock install the feature watched **zero** files and its silence was indistinguishable from an all-clear. If you are upgrading, arm it — being switched on was never the same as being armed.
+- **`/root/` and `/home/` can never be watched**, whatever is on disk. Both daemons run under `ProtectHome=yes`, which replaces those trees with an empty mount, so the panel does not see a file you place there. Widening the sandbox to reach them would cost more hardening than the tripwire is worth, so DockPanel does not plant them and no longer implies it watches them.
+- **`/etc/.dockpanel-canary` is watched but not planted.** `ProtectSystem=strict` leaves bare `/etc` read-only for the agent, so the panel cannot create it; `/etc/dockpanel/` is used instead.
+- **Repeat reads inside 24 hours may not register.** Linux mounts default to `relatime`, which updates an access time only when it is older than the file's modification time or more than a day stale. The first read after arming is caught — that is the intrusion you care about — but a second read soon after may not raise a separate alert.
+- **It cannot tell an intruder from a backup.** Anything that reads the whole filesystem — a backup agent, an antivirus scan, `updatedb` — moves the access time and trips the alert. Treat a canary alert as a prompt to check the audit log and forensic snapshot, not as proof on its own.
+
+### Backup Integrity Hashes
+
+Backups taken through the panel record a SHA-256 hash of the archive and the hash of the previous backup of the same resource. Both appear in the chain-of-trust report.
+
+**What this does not do, stated plainly:** nothing re-computes those hashes afterwards, so a tampered archive is not detected and no alert fires. The hashes are a record of what was written at the time — useful for comparing against a copy you verify yourself — not tamper detection.
+
+**Every path records one as of v2.118.0.** Until then the two unattended *site* paths — a per-site schedule and a backup policy — did not, while manual site backups and every database and volume backup did. Backups those two paths took before v2.118.0 keep no hash; nothing back-fills one, because the archive's hash has to be taken when the archive is written. A report for a backup with no hash shows `—` rather than a value.
 
 ### Suspicious Command Detection
 

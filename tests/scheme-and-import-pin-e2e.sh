@@ -225,11 +225,15 @@ if S=$(subj "$APPS_BE"); then
 fi
 
 if S=$(subj "$GITDEP"); then
-  W=$(win "$S" 'fn deploy_url\(domain: &str, ssl_email: Option<&str>\)' 6)
-  if derives "$W" 'if ssl_email\.is_some\(\)'; then
-    ok "git deploys resolve their URL in one place, from the ssl_email"
+  # v2.168.0: raw `ssl_email` presence stopped being the truth once
+  # `provided` mode could withhold it entirely (a certificate-registry
+  # deploy has no ACME address at all) — deploy_url now takes the EFFECTIVE
+  # mode (`stacks::effective_tls_mode`), still resolved in this one place.
+  W=$(win "$S" 'fn deploy_url\(domain: &str, tls_mode: &str\)' 6)
+  if derives "$W" 'tls_mode == "acme" \|\| tls_mode == "provided"'; then
+    ok "git deploys resolve their URL in one place, from the effective TLS mode"
   else
-    bad "deploy_url is gone or no longer branches on ssl_email"
+    bad "deploy_url is gone or no longer branches on the effective TLS mode"
   fi
   N=$(count "$S" 'format!\("https://\{?\}?"?, ?domain')
   if [ "$N" = "0" ]; then
@@ -244,9 +248,26 @@ if S=$(subj "$GITDEP"); then
   else
     bad "set_github_status takes a domain again — a caller can hardcode the scheme"
   fi
-  # Every call site must route through the resolver.
+  # Every call site must route through the resolver. Two of the seven (the
+  # success branches, which know what the agent actually served once
+  # `provided` mode can be refused and fall back to plain HTTP) pass
+  # `actual_mode` instead of the merely-requested `effective_mode` — still
+  # the SAME function, never a second hardcoded scheme.
+  #
+  # A caller may also route through a variable computed ONCE via deploy_url
+  # and reused across several calls (the preview-deploy path added at s484,
+  # `github_target`) — same safety property, a DRYer shape. Credit it only
+  # if that variable's OWN definition resolves through deploy_url, never by
+  # name alone — otherwise a future `let github_target = domain.to_string()`
+  # would satisfy this arm while reintroducing exactly the hardcoded scheme
+  # deploy_url exists to prevent.
   CALLS=$(count "$S" 'set_github_status\(')
-  RESOLVED=$(count "$S" 'deploy_url\(d, config\.ssl_email\.as_deref\(\)\)')
+  DIRECT_RESOLVED=$(count "$S" 'deploy_url\(d, (effective_mode|actual_mode)\)')
+  SHARED_RESOLVED=0
+  if has "$S" 'github_target[ ]*=[ ]*preview_domain\.as_deref\(\)\.map\(\|d\|[ ]*deploy_url\(d, (effective_mode|actual_mode)\)\)'; then
+    SHARED_RESOLVED=$(count "$S" 'set_github_status\([^)]*github_target')
+  fi
+  RESOLVED=$((DIRECT_RESOLVED + SHARED_RESOLVED))
   # CALLS counts the definition too, so callers = CALLS - 1.
   if [ "$RESOLVED" -ge "$((CALLS - 1))" ]; then
     ok "all $((CALLS - 1)) set_github_status callers resolve through deploy_url"
@@ -342,7 +363,11 @@ if S=$(subj "$MIG_SVC"); then
   else
     bad "a path-walking parser no longer makes its doc_root archive-relative"
   fi
-  if has "$S" 'doc_root:[^,]*\.(display\(\)|to_string_lossy\(\)|to_str\(\)|into_os_string\(\))'; then
+  # FLATTENED (#383). rustfmt puts a long method chain on its own indented lines,
+  # so `doc_root:` and its `.display()` land on DIFFERENT lines and a line-oriented
+  # grep sees neither. Gap BOUNDED to one statement (`[^;{}]`), never `.*`.
+  SFLAT=$(tr '\n' ' ' <<< "$S" | tr -s ' ')
+  if has "$SFLAT" 'doc_root: *[^;{}]{0,160}\. *(display\(\)|to_string_lossy\(\)|to_str\(\)|into_os_string\(\))'; then
     bad "a parser hands a filesystem path straight to doc_root — import rejects it as traversal"
   else
     ok "no parser hands a filesystem path straight to doc_root"
@@ -351,7 +376,10 @@ if S=$(subj "$MIG_SVC"); then
   # get past them: an inventory path is joined ONTO the archive root by the
   # importer, so it must never already contain it. Interpolating `{root}` is
   # absolute by another name.
-  if has "$S" '(doc_root|file):[^,]*\{root\}'; then
+  # FLATTENED (#383) — same subject, same reason: rustfmt breaks a long `format!(`
+  # so the field name and its literal land on different lines. `[^,]*` still bounds
+  # the match to the field's own initializer, so no `.*` is introduced.
+  if has "$SFLAT" '(doc_root|file): *[^,]*\{root\}'; then
     bad "a parser embeds the archive root in a path the importer will join onto it"
   else
     ok "no parser embeds the archive root in an inventory path"

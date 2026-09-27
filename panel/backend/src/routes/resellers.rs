@@ -110,6 +110,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateResellerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Check user exists
@@ -127,18 +128,27 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "Cannot promote an admin to reseller"));
     }
 
-    // Check if profile already exists
-    if role == "reseller" {
-        let existing: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM reseller_profiles WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| internal_error("create resellers", e))?;
-        if existing.is_some() {
-            return Err(err(StatusCode::CONFLICT, "Reseller profile already exists"));
-        }
+    // Look for an existing profile UNCONDITIONALLY, not only when the account is
+    // still a reseller. `reseller_profiles.user_id` is UNIQUE, and the role and
+    // the profile are written by different doors: changing a reseller's role from
+    // the Users screen updates `users` and leaves the profile behind (users.rs
+    // has no reference to this table at all). So a demoted reseller keeps an
+    // orphan profile, and gating this check on the role meant the next promotion
+    // sailed past it, updated the role, hit the unique constraint on INSERT and
+    // answered 500 — an account an admin could then never promote.
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM reseller_profiles WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("create resellers", e))?;
+
+    // Still a reseller AND already has a profile: a genuine double-create.
+    if role == "reseller" && existing.is_some() {
+        return Err(err(StatusCode::CONFLICT, "Reseller profile already exists"));
     }
+
+    let ip = crate::routes::client_ip(&headers);
 
     // Update user role to reseller (idempotent if already reseller). Clear reseller_id:
     // a reseller is a tenant root and must never remain owned by another reseller, else
@@ -148,6 +158,31 @@ pub async fn create(
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("create resellers", e))?;
+
+    // Re-promotion of an account that kept its profile through a demotion. The
+    // role UPDATE above is the whole of the work; inserting would violate the
+    // unique constraint. Its stored quotas and branding are preserved rather
+    // than silently replaced by whatever this request happened to carry — an
+    // admin restoring a reseller is not asking to reset it.
+    if let Some((existing_id,)) = existing {
+        tracing::info!(
+            "Reseller role restored by {} for {} (profile kept)",
+            claims.email,
+            email
+        );
+        activity::log_activity(
+            &state.db, claims.sub, &claims.email, "reseller.create",
+            Some("reseller"), Some(&email), None, ip.as_deref(), claims.key_id,
+        ).await;
+        crate::services::security_hardening::audit_log(
+            &state.db, "reseller.create", Some(&claims.email), ip.as_deref(),
+            Some("reseller"), Some(&email), None, None, "warning", claims.key_id,
+        ).await;
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": existing_id, "user_id": user_id, "email": email })),
+        ));
+    }
 
     // Insert reseller profile
     let profile: ResellerProfile = sqlx::query_as(
@@ -169,7 +204,11 @@ pub async fn create(
     tracing::info!("User promoted to reseller by {}: {}", claims.email, email);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "reseller.create",
-        Some("reseller"), Some(&email), None, None,
+        Some("reseller"), Some(&email), None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "reseller.create", Some(&claims.email), ip.as_deref(),
+        Some("reseller"), Some(&email), None, None, "warning", claims.key_id,
     ).await;
 
     Ok((
@@ -219,14 +258,14 @@ pub async fn update(
 
     sqlx::query(
         "UPDATE reseller_profiles SET \
-         panel_name = COALESCE($1, panel_name), \
+         panel_name = CASE WHEN $1 = '' THEN NULL ELSE COALESCE($1, panel_name) END, \
          max_users = COALESCE($2, max_users), \
          max_sites = COALESCE($3, max_sites), \
          max_databases = COALESCE($4, max_databases), \
          max_disk_mb = COALESCE($5, max_disk_mb), \
          max_email_accounts = COALESCE($6, max_email_accounts), \
-         logo_url = COALESCE($7, logo_url), \
-         accent_color = COALESCE($8, accent_color), \
+         logo_url = CASE WHEN $7 = '' THEN NULL ELSE COALESCE($7, logo_url) END, \
+         accent_color = CASE WHEN $8 = '' THEN NULL ELSE COALESCE($8, accent_color) END, \
          hide_branding = COALESCE($9, hide_branding), \
          updated_at = NOW() \
          WHERE id = $10",
@@ -254,7 +293,7 @@ pub async fn update(
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "reseller.update",
-        Some("reseller"), Some(&user_email.0), None, None,
+        Some("reseller"), Some(&user_email.0), None, None, claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -264,6 +303,7 @@ pub async fn update(
 pub async fn remove(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Get the profile to find user_id
@@ -316,9 +356,14 @@ pub async fn remove(
         .map_err(|e| internal_error("remove resellers", e))?;
 
     tracing::info!("Reseller demoted by {}: {}", claims.email, user_email.0);
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "reseller.delete",
-        Some("reseller"), Some(&user_email.0), None, None,
+        Some("reseller"), Some(&user_email.0), None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "reseller.delete", Some(&claims.email), ip.as_deref(),
+        Some("reseller"), Some(&user_email.0), None, None, "warning", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true, "email": user_email.0 })))
@@ -350,6 +395,7 @@ pub async fn allocate_server(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<AllocateServerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Verify reseller profile exists and get user_id
@@ -390,9 +436,14 @@ pub async fn allocate_server(
         "Server {} allocated to reseller {} by {}",
         server_name, profile.user_id, claims.email
     );
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "reseller.server.allocate",
-        Some("server"), Some(&server_name), None, None,
+        Some("server"), Some(&server_name), None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "reseller.server.allocate", Some(&claims.email), ip.as_deref(),
+        Some("server"), Some(&server_name), None, None, "warning", claims.key_id,
     ).await;
 
     Ok((
@@ -410,6 +461,7 @@ pub async fn allocate_server(
 pub async fn deallocate_server(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Path((id, server_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Get reseller user_id from profile
@@ -439,9 +491,14 @@ pub async fn deallocate_server(
         "Server {} deallocated from reseller {} by {}",
         server_id, profile.user_id, claims.email
     );
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "reseller.server.deallocate",
-        Some("server"), Some(&server_id.to_string()), None, None,
+        Some("server"), Some(&server_id.to_string()), None, ip.as_deref(), claims.key_id,
+    ).await;
+    crate::services::security_hardening::audit_log(
+        &state.db, "reseller.server.deallocate", Some(&claims.email), ip.as_deref(),
+        Some("server"), Some(&server_id.to_string()), None, None, "info", claims.key_id,
     ).await;
 
     Ok(Json(serde_json::json!({ "ok": true })))

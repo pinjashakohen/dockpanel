@@ -56,8 +56,15 @@ pub struct PruneRequest {
 async fn upload(
     Json(body): Json<UploadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    // Validate filepath
-    if !body.filepath.starts_with("/var/backups/dockpanel/") {
+    // Validate filepath. The prefix check alone is a LEXICAL, not a resolved,
+    // guard -- "/var/backups/dockpanel/../../etc/shadow" satisfies
+    // starts_with() and the OS resolves the ".." on open, same shape as
+    // git_build.rs's is_valid_dockerfile/is_valid_build_context reject
+    // elsewhere in this crate. ProtectSystem=strict blocks writes outside the
+    // agent's ReadWritePaths allowlist, not reads, so an unguarded path here
+    // would be arbitrary root-readable-file exfiltration to an
+    // attacker-supplied S3/SFTP destination, not merely a write bypass.
+    if !body.filepath.starts_with("/var/backups/dockpanel/") || body.filepath.contains("..") {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid backup filepath"));
     }
 
@@ -100,7 +107,20 @@ async fn upload(
                 remote_path,
             )
             .await
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+            .map_err(|e| {
+                // The same rule `test_destination` states below, applied to the
+                // path that matters more. A scheduled upload runs unattended, so
+                // the redacted body IS the whole message an operator ever gets:
+                // v2.99.0 taught the test handler to answer a precondition as a
+                // 4xx and left this one answering 5xx, which means the nightly
+                // failure still reads "your agent broke" on a working agent.
+                let status = if e == remote_backup::SSHPASS_MISSING {
+                    StatusCode::FAILED_DEPENDENCY
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                err(status, &e)
+            })?;
 
             Ok(Json(serde_json::json!({ "success": true, "destination": dest })))
         }
@@ -149,7 +169,18 @@ async fn test_destination(
                 remote_path,
             )
             .await
-            .map_err(|e| err(StatusCode::BAD_GATEWAY, &e))?;
+            .map_err(|e| {
+                // A missing package on this box is a precondition the caller can
+                // act on, not the agent falling over. The panel keeps the body of
+                // a 4xx and replaces the body of a 5xx with an incident id, so
+                // answering 5xx here is what discards the remedy.
+                let status = if e == remote_backup::SSHPASS_MISSING {
+                    StatusCode::FAILED_DEPENDENCY
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                err(status, &e)
+            })?;
 
             Ok(Json(serde_json::json!({ "success": true, "message": "SFTP connection successful" })))
         }

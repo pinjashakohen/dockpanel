@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Navigate, Outlet, NavLink, Link, useLocation } from "react-router-dom";
-import { useLayoutState } from "../hooks/useLayoutState";
+import { useLayoutState, badgeCount } from "../hooks/useLayoutState";
 import { useServer } from "../context/ServerContext";
 import { Icon } from "../data/icons";
 import CommandPalette from "./CommandPalette";
@@ -17,6 +17,7 @@ export default function AtlasLayout() {
     incidentCount,
     notifCount,
     apiHealthy,
+    canSeeHealth,
     twoFaEnforced,
     twoFaEnabled,
     sidebarOpen,
@@ -143,13 +144,19 @@ export default function AtlasLayout() {
                     <Icon name={item.iconName} className="w-4 h-4" />
                     <span>{item.label}</span>
                     {item.to === "/monitoring" && firingCount > 0 && (
-                      <span className="ml-1 px-1.5 py-0.5 text-[10px] font-bold bg-danger-500 text-white rounded-full">
-                        {firingCount}
+                      <span
+                        title={`${firingCount} firing alert${firingCount === 1 ? "" : "s"}`}
+                        className="ml-1 px-1.5 py-0.5 text-[10px] font-bold bg-danger-500 text-white rounded-full"
+                      >
+                        {badgeCount(firingCount)}
                       </span>
                     )}
-                    {item.to === "/incidents" && incidentCount > 0 && (
-                      <span className="ml-1 px-1.5 py-0.5 text-[10px] font-bold bg-warn-500 text-dark-900 rounded-full">
-                        {incidentCount}
+                    {item.to === "/monitoring" && incidentCount > 0 && (
+                      <span
+                        title={`${incidentCount} open incident${incidentCount === 1 ? "" : "s"}`}
+                        className="ml-1 px-1.5 py-0.5 text-[10px] font-bold bg-warn-500 text-dark-900 rounded-full"
+                      >
+                        {badgeCount(incidentCount)}
                       </span>
                     )}
                   </NavLink>
@@ -187,39 +194,42 @@ export default function AtlasLayout() {
             {/* Alert badge */}
             {firingCount > 0 && (
               <Link
-                to="/monitoring"
+                to="/monitoring?tab=alerts"
+                title={`${firingCount} firing alert${firingCount === 1 ? "" : "s"}`}
                 className="px-2 py-1 text-xs font-bold bg-danger-500/15 text-danger-400 rounded-md"
               >
-                {firingCount} alert{firingCount > 1 ? "s" : ""}
+                {badgeCount(firingCount)} alert{firingCount > 1 ? "s" : ""}
               </Link>
             )}
 
-            {/* Health dot */}
-            <div
-              className={`w-2 h-2 rounded-full ${
-                apiHealthy === null
-                  ? "bg-dark-400"
-                  : apiHealthy
-                  ? "bg-rust-500"
-                  : "bg-danger-500 animate-pulse"
-              }`}
-              title={
-                apiHealthy === null
-                  ? "Checking..."
-                  : apiHealthy
-                  ? "Healthy"
-                  : "Health Issue"
-              }
-            />
+            {/* Health dot — admins only; see `canSeeHealth` in useLayoutState. */}
+            {canSeeHealth && (
+              <div
+                className={`w-2 h-2 rounded-full ${
+                  apiHealthy === null
+                    ? "bg-dark-400"
+                    : apiHealthy
+                    ? "bg-rust-500"
+                    : "bg-danger-500 animate-pulse"
+                }`}
+                title={
+                  apiHealthy === null
+                    ? "Checking..."
+                    : apiHealthy
+                    ? "Healthy"
+                    : "Health Issue"
+                }
+              />
+            )}
 
             {/* Notification bell */}
-            <Link to="/notifications" className="relative p-1.5 text-dark-300 hover:text-dark-100 rounded-md hover:bg-dark-700/30" title="Notifications" aria-label="Notifications">
+            <Link to="/notifications" className="relative p-1.5 text-dark-300 hover:text-dark-100 rounded-md hover:bg-dark-700/30" title={notifCount > 0 ? `${notifCount} unread notification${notifCount === 1 ? "" : "s"}` : "Notifications"} aria-label="Notifications">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0" />
               </svg>
               {notifCount > 0 && (
                 <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-danger-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
-                  {notifCount > 9 ? "9+" : notifCount}
+                  {badgeCount(notifCount)}
                 </span>
               )}
             </Link>
@@ -277,7 +287,7 @@ export default function AtlasLayout() {
               <span key={crumb.to} className="flex items-center gap-2">
                 {i > 0 && (
                   <svg
-                    className="w-3 h-3 text-dark-500"
+                    className="w-3 h-3 text-dark-400"
                     fill="none"
                     viewBox="0 0 24 24"
                     stroke="currentColor"
@@ -326,15 +336,15 @@ export default function AtlasLayout() {
               />
             </svg>
             <span className="text-sm text-warn-400 font-medium">
-              Two-factor authentication is required. Please enable 2FA in Settings &rarr; Security.
+              Two-factor authentication is required. Enable it from My Account.
             </span>
           </div>
-          <a
-            href="/settings"
+          <Link
+            to="/account"
             className="px-3 py-1.5 bg-warn-500 text-dark-900 rounded text-xs font-bold hover:bg-warn-400 transition-colors"
           >
             Set Up 2FA
-          </a>
+          </Link>
         </div>
       )}
 
@@ -416,14 +426,27 @@ export default function AtlasLayout() {
                       >
                         <Icon name={item.iconName} className="w-5 h-5" />
                         <span>{item.label}</span>
-                        {item.to === "/monitoring" && firingCount > 0 && (
-                          <span className="ml-auto px-1.5 py-0.5 text-[10px] font-bold bg-danger-500 text-white rounded-full">
-                            {firingCount}
-                          </span>
-                        )}
-                        {item.to === "/incidents" && incidentCount > 0 && (
-                          <span className="ml-auto px-1.5 py-0.5 text-[10px] font-bold bg-warn-500 text-dark-900 rounded-full">
-                            {incidentCount}
+                        {/* One wrapper carries the `ml-auto`: two auto margins in one flex
+                            row split the free space between the pills instead of keeping
+                            them together at the end of it. */}
+                        {item.to === "/monitoring" && (firingCount > 0 || incidentCount > 0) && (
+                          <span className="ml-auto flex items-center gap-1">
+                            {firingCount > 0 && (
+                              <span
+                                title={`${firingCount} firing alert${firingCount === 1 ? "" : "s"}`}
+                                className="px-1.5 py-0.5 text-[10px] font-bold bg-danger-500 text-white rounded-full"
+                              >
+                                {badgeCount(firingCount)}
+                              </span>
+                            )}
+                            {incidentCount > 0 && (
+                              <span
+                                title={`${incidentCount} open incident${incidentCount === 1 ? "" : "s"}`}
+                                className="px-1.5 py-0.5 text-[10px] font-bold bg-warn-500 text-dark-900 rounded-full"
+                              >
+                                {badgeCount(incidentCount)}
+                              </span>
+                            )}
                           </span>
                         )}
                       </NavLink>

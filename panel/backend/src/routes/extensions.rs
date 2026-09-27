@@ -15,65 +15,17 @@ use crate::AppState;
 // SSRF protection: validate webhook URLs
 // ---------------------------------------------------------------------------
 
+/// Extension webhook destinations go through the ONE shared SSRF guard, same as every
+/// other outbound URL. This used to be a second, hand-rolled copy with a strictly weaker
+/// classifier (no CGNAT / ULA / fe80 / IPv4-mapped / NAT64, and the same userinfo-spoof
+/// bug — `http://public:x@169.254.169.254/` read `public` as the host and passed) while
+/// the send-time re-validation in `services/extensions.rs` already used the shared helper.
+/// That split accepted a spoofed URL at write time and then silently dropped every
+/// delivery. Delegating keeps the `webhook_url`-worded error the callers surface.
 async fn validate_webhook_url(url: &str) -> Result<(), String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("webhook_url is required".to_string());
-    }
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("webhook_url must use http or https".to_string());
-    }
-
-    // Extract host from URL (strip scheme, take up to next / or :)
-    let after_scheme = if url.starts_with("https://") { &url[8..] } else { &url[7..] };
-    let host = after_scheme
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
-
-    if host.is_empty() {
-        return Err("webhook_url has no hostname".to_string());
-    }
-
-    // Resolve hostname to IP addresses and check each one.
-    // This prevents bypasses via hex IPs (0x7f000001), decimal IPs (2130706433),
-    // IPv6 (::1), DNS names that resolve to localhost (e.g. localtest.me),
-    // and cloud metadata endpoints (169.254.169.254).
-    let lookup_host = format!("{}:80", host.trim_matches(|c| c == '[' || c == ']'));
-    match tokio::net::lookup_host(&lookup_host).await {
-        Ok(addrs) => {
-            for addr in addrs {
-                let ip = addr.ip();
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return Err("webhook_url resolves to loopback address".to_string());
-                }
-                match ip {
-                    std::net::IpAddr::V4(v4) => {
-                        if v4.is_private() || v4.is_link_local() || v4.octets()[0] == 169 {
-                            return Err(
-                                "webhook_url resolves to private/link-local address".to_string(),
-                            );
-                        }
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        if v6.is_loopback() {
-                            return Err(
-                                "webhook_url resolves to loopback address".to_string(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            return Err("webhook_url hostname could not be resolved".to_string());
-        }
-    }
-
-    Ok(())
+    crate::helpers::validate_url_not_internal(url)
+        .await
+        .map_err(|e| format!("webhook_url: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +131,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateExtensionRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let name = body.name.trim();
@@ -208,6 +161,13 @@ pub async fn create(
         "whsec_{}",
         Uuid::new_v4().to_string().replace('-', "")
     );
+    // Encrypted at rest: `test_webhook` and `services::extensions::emit_event`
+    // both need the plaintext back to sign outbound HMAC deliveries with it.
+    let encrypted_webhook_secret = crate::services::secrets_crypto::encrypt_credential(
+        &webhook_secret,
+        &state.config.jwt_secret,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
     let ext_id = Uuid::new_v4();
 
@@ -224,7 +184,7 @@ pub async fn create(
     .bind(&body.author)
     .bind(&body.version)
     .bind(body.webhook_url.trim())
-    .bind(&webhook_secret)
+    .bind(&encrypted_webhook_secret)
     .bind(&api_key_hash)
     .bind(&api_key_prefix)
     .bind(&body.event_subscriptions)
@@ -233,6 +193,7 @@ pub async fn create(
     .await
     .map_err(|e| internal_error("create extensions", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -241,7 +202,22 @@ pub async fn create(
         Some("extension"),
         Some(name),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "extension.created",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("extension"),
+        Some(name),
         None,
+        None,
+        "info",
+        claims.key_id,
     )
     .await;
 
@@ -370,6 +346,7 @@ pub async fn update(
         Some(updated_name),
         None,
         None,
+        claims.key_id,
     )
     .await;
 
@@ -384,6 +361,7 @@ pub async fn remove(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Fetch name for activity log
     let ext_info: Option<(String,)> =
@@ -413,6 +391,7 @@ pub async fn remove(
         return Err(err(StatusCode::NOT_FOUND, "Extension not found"));
     }
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -421,7 +400,22 @@ pub async fn remove(
         Some("extension"),
         Some(&ext_name),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "extension.deleted",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("extension"),
+        Some(&ext_name),
         None,
+        None,
+        "warning",
+        claims.key_id,
     )
     .await;
 
@@ -447,6 +441,10 @@ pub async fn test_webhook(
 
     let (name, webhook_url, webhook_secret) =
         ext.ok_or_else(|| err(StatusCode::NOT_FOUND, "Extension not found"))?;
+    let webhook_secret = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &webhook_secret,
+        &state.config.jwt_secret,
+    );
 
     let delivery_id = Uuid::new_v4().to_string();
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -475,11 +473,31 @@ pub async fn test_webhook(
         }
     };
 
+    // SSRF re-validation at send time, PINNED to the address it approves —
+    // parity with the delivery path in `services::extensions` and with
+    // `webhook_gateway`.
+    //
+    // ⚠ This route had neither the validation nor the pin at first, and it is
+    // the worse of the two places to lack them: the response body comes back
+    // to the caller in the JSON below, so a stored `webhook_url` that
+    // 3xx-redirects to an internal address was a read oracle rather than a
+    // blind probe. The ad-hoc client set only a timeout, so reqwest's default
+    // `Policy::limited(10)` applied and the redirect was followed — and its
+    // `.unwrap_or_default()` fell back to a plain default client, which would
+    // have re-opened the hole even if a policy had been set on the builder.
+    // `webhook_url` is vetted when it is WRITTEN, which is not the same
+    // instant as when it is resolved — and a shared client's own resolver
+    // would re-resolve it a second, independent time even with the check
+    // above run moments before.
+    let (host, port) = crate::helpers::url_authority(&webhook_url).map_err(|e| {
+        err(StatusCode::BAD_REQUEST, &format!("Webhook URL failed validation: {e}"))
+    })?;
+    let client = crate::helpers::pinned_client(&host, port, crate::services::extensions::webhook_client_builder())
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("Webhook URL failed validation: {e}")))?;
+
     let started = std::time::Instant::now();
-    let result = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default()
+    let result = client
         .post(&webhook_url)
         .header("Content-Type", "application/json")
         .header("X-DockPanel-Event", "test")
@@ -546,6 +564,7 @@ pub async fn rotate_secret(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify extension exists
     let ext: Option<(String,)> =
@@ -560,14 +579,20 @@ pub async fn rotate_secret(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Extension not found"))?;
 
     let new_secret = format!("whsec_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let encrypted_new_secret = crate::services::secrets_crypto::encrypt_credential(
+        &new_secret,
+        &state.config.jwt_secret,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
 
     sqlx::query("UPDATE extensions SET webhook_secret = $1, updated_at = NOW() WHERE id = $2")
-        .bind(&new_secret)
+        .bind(&encrypted_new_secret)
         .bind(id)
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("rotate secret", e))?;
 
+    let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
         &state.db,
         claims.sub,
@@ -576,7 +601,22 @@ pub async fn rotate_secret(
         Some("extension"),
         Some(&ext_name),
         None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "extension.rotate_secret",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("extension"),
+        Some(&ext_name),
         None,
+        None,
+        "info",
+        claims.key_id,
     )
     .await;
 

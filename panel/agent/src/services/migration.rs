@@ -1,8 +1,94 @@
 use serde::Serialize;
 use std::path::Path;
+use tokio::io::AsyncWriteExt;
+use tokio_stream::StreamExt;
 use crate::safe_cmd::safe_command;
 
 const MIGRATION_DIR: &str = "/tmp/dockpanel-migration";
+
+/// Where a URL-fetched archive is staged before analysis — inside the ONE
+/// subtree systemd actually grants this unit write access to
+/// (`ReadWritePaths=... /var/backups/dockpanel ...`, not the bare
+/// `/var/backups/` an operator-copied archive can live under). Landing a new
+/// path outside a granted `ReadWritePaths` entry is the exact EROFS class the
+/// per-site SFTP jail hit (`/var/dockpanel-sftp` didn't exist yet either).
+pub const FETCH_DIR: &str = "/var/backups/dockpanel/migration-fetch";
+
+/// Hard ceiling on a fetched archive's size. Generous for a real cPanel/Plesk/
+/// HestiaCP backup, bounded so a misconfigured or hostile URL cannot fill the
+/// disk via a response that never ends.
+const MAX_FETCH_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
+
+/// How long a fetch may run before this process gives up on it. Matches
+/// `EXTRACT_TIMEOUT_SECS` below — the same "bound the thing that will never
+/// finish, not the one that will" reasoning applies to a slow remote host.
+const FETCH_TIMEOUT_SECS: u64 = 1800;
+
+/// Download a backup archive from `url` into `dest` (the caller has already
+/// validated `dest` sits inside [`FETCH_DIR`] and `url` is not an internal
+/// address). Streams to disk with a hard size cap instead of buffering the
+/// whole response — a real archive can be many gigabytes — and writes to a
+/// `.part` sibling first, renaming into place only once the full response has
+/// landed, so a crash or a cap trip never leaves something `analyze()` could
+/// mistake for a complete archive.
+pub async fn fetch_archive(url: &str, dest: &str) -> Result<u64, String> {
+    if let Some(parent) = Path::new(dest).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
+    }
+
+    let resp = reqwest::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| format!("Fetch failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Fetch failed: HTTP {}", resp.status()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_FETCH_BYTES {
+            return Err(format!(
+                "Archive is {} bytes, over the {} GiB fetch limit",
+                len,
+                MAX_FETCH_BYTES / (1024 * 1024 * 1024)
+            ));
+        }
+    }
+
+    let part_path = format!("{dest}.part");
+    let mut file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|e| format!("Could not create {part_path}: {e}"))?;
+
+    let mut stream = resp.bytes_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Fetch failed mid-download: {e}"))?;
+        written += chunk.len() as u64;
+        if written > MAX_FETCH_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(format!(
+                "Archive exceeded the {} GiB fetch limit and was discarded",
+                MAX_FETCH_BYTES / (1024 * 1024 * 1024)
+            ));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("Write failed: {e}"))?;
+    }
+    file.flush().await.map_err(|e| format!("Write failed: {e}"))?;
+    drop(file);
+
+    tokio::fs::rename(&part_path, dest)
+        .await
+        .map_err(|e| format!("Could not finalize {dest}: {e}"))?;
+
+    Ok(written)
+}
 
 /// Ceiling on unpacking one backup archive — for the WHOLE attempt, not per `tar`.
 ///
@@ -547,11 +633,29 @@ pub async fn import_site_files(
         }
     }
 
-    // Fix ownership
-    let _ = safe_command("chown")
-        .args(["-R", "www-data:www-data", &dest])
-        .output()
-        .await;
+    // Fix ownership — everything except `.git`, which stays root's. For
+    // node/proxy/python, `dest` IS the site root — the same directory
+    // `deploy.rs::clone_or_pull` clones `.git` into, so handing it over here
+    // gives the app `config`/`hooks/` that deploy runs as root next. For
+    // php/static, `dest` nests under `{site_dir}/public`, one level below any
+    // `.git` — this check is then a no-op, applied uniformly for simplicity and
+    // because a stray nested `.git` shouldn't be silently handed over either.
+    if let Ok(mut entries) = tokio::fs::read_dir(&dest).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let _ = safe_command("chown")
+                .args(["-R", "www-data:www-data", &entry.path().to_string_lossy()])
+                .output()
+                .await;
+        }
+    }
+    let git_dir = format!("{dest}/.git");
+    if Path::new(&git_dir).exists() {
+        let _ = safe_command("chown").args(["-R", "root:root", &git_dir]).output().await;
+        let _ = safe_command("chmod").args(["-R", "go-rwx", &git_dir]).output().await;
+    }
 
     Ok(format!("Copied files to {dest}"))
 }

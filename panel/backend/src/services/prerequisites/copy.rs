@@ -680,9 +680,11 @@ pub static MAIL_DNS_NO_PUBLIC_IP: Outcome = Outcome {
     severity: PrereqSeverity::Info,
     title: "Couldn't determine this server's public address",
     title_plural: "",
-    detail: "DockPanel could not detect its own public IP, so it can't tell you which records \
-             this domain needs.",
-    fix: "Nothing to do at the registrar. Confirm the server can reach the internet.",
+    detail: "DockPanel could not determine the public address of the server this domain is on, \
+             so it can't tell you which records the domain needs.",
+    fix: "Nothing to do at the registrar. If the domain is on this server, confirm it can reach \
+          the internet; if it is on another server in the fleet, confirm that server's agent is \
+          online — its address is recorded when the agent checks in.",
     vars: &[],
 };
 
@@ -1038,7 +1040,14 @@ pub static FIELDS: &[Field] = &[
         help: "Where a copy is uploaded after each backup. Leave empty and backups stay on this \
                server's own disk.",
         more: "A backup on the disk it protects covers a bad deploy or a dropped table, and \
-               nothing worse. Destinations are S3-compatible storage or any SFTP server.",
+               nothing worse. Destinations are S3-compatible storage or any SFTP server. \
+               SFTP destinations that authenticate by PASSWORD need sshpass on the server the \
+               backup runs from: fresh installs and servers added through the agent installer \
+               get it automatically, but a panel upgraded in place does not, because update.sh \
+               upgrades binaries and installs no packages. When it is missing, Test Connection \
+               now says so in those words and Settings can install it onto that server for \
+               you — you are no longer asked to run a package manager by hand. \
+               Key-authenticated SFTP and every S3 destination are unaffected.",
         escalates_to: "backups.destination_configured",
     },
     Field {

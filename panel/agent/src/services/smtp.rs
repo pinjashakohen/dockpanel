@@ -1,6 +1,38 @@
 use crate::safe_cmd::{safe_command, safe_command_sync, safe_command_sync_unsandboxed};
 
-const MSMTP_CONFIG: &str = "/etc/msmtprc";
+/// msmtp's own default config path is `/etc/msmtprc` — a BARE FILE at the top of
+/// `/etc`, which `ProtectSystem=strict` makes read-only. `ReadWritePaths` names
+/// `/etc/postfix`, `/etc/dovecot`, `/etc/php` and a dozen more, and it cannot
+/// help here: marking a file that does not exist yet is inert, and CREATING it
+/// would need `/etc` itself writable, which is the whole point of the sandbox.
+///
+/// So `POST /smtp/configure` answered
+/// `Failed to write /etc/msmtprc: Read-only file system (os error 30)` on every
+/// install running the shipped unit — the SMTP relay could never be configured,
+/// and v2.123.0's permission hardening below was hardening a path that never ran.
+///
+/// This is the same shape as `/etc/opendkim.conf`, and takes the same cure the
+/// mail installer already took (`routes/mail.rs`): write into `/etc/dockpanel/`,
+/// which IS in `ReadWritePaths`, and point every reader at it explicitly. Widening
+/// the sandbox to a bare `/etc` file was rejected there for the same reason.
+const MSMTP_CONFIG: &str = "/etc/dockpanel/msmtprc";
+
+/// Named so the route can answer it as a precondition rather than a fault.
+///
+/// Test Email spawned msmtp and reported a failed spawn as a 5xx, which the
+/// panel replaces with an incident id — so an operator whose host simply has no
+/// msmtp concluded their credentials or their relay were wrong and went to debug
+/// the mail provider. Two things make it ordinary rather than exotic: the binary
+/// is installed only by `ensure_msmtp` below, which runs on `configure`, so a
+/// member that was offline when SMTP was saved never got it; and that installer
+/// is **apt-get only**, so on the RHEL family it is never installed at all. The
+/// panel's own precondition check reads a panel-global setting, not per-host
+/// state, so it passes while this host has nothing.
+pub const MSMTP_MISSING: &str =
+    "This server has no msmtp binary, so it cannot send mail yet — your SMTP \
+     settings are not the problem. Save the SMTP settings again while this server \
+     is online to install and configure it. On RHEL-family systems the panel \
+     cannot install msmtp automatically; install it with your package manager.";
 
 /// Install msmtp if not already present.
 fn ensure_msmtp() -> Result<(), String> {
@@ -67,6 +99,19 @@ pub fn configure(
         _ => "off", // "tls" means implicit TLS, not STARTTLS
     };
 
+    // `from_full_name` is the only thing that makes msmtp put a display
+    // name on the `From:` header it auto-adds to outgoing mail (msmtp's
+    // `from` command is envelope-from only — a bare address, never a
+    // display name). Omitted entirely when blank rather than emitted as
+    // `from_full_name ` with nothing after it, since msmtp's own argument
+    // grammar reads "the rest of the line" for this directive and an
+    // absent line is the least surprising way to mean "no display name."
+    let from_name_line = if from_name.is_empty() {
+        String::new()
+    } else {
+        format!("from_full_name  {from_name}\n")
+    };
+
     let config = format!(
         r#"# DockPanel SMTP configuration — managed automatically
 defaults
@@ -80,22 +125,51 @@ account        default
 host           {host}
 port           {port}
 from           {from}
-user           {username}
+{from_name_line}user           {username}
 password       {password}
 "#
     );
 
-    std::fs::write(MSMTP_CONFIG, &config)
-        .map_err(|e| format!("Failed to write {MSMTP_CONFIG}: {e}"))?;
+    // Create the file 0600 from the outset. `fs::write` creates under the umask —
+    // 0644 on every distro the installer supports — and line 6 of what is being
+    // written is the SMTP password, so create-then-chmod published the password to
+    // every local account for the length of the write. The old
+    // `set_permissions(...).ok()` also discarded its own failure, in which case
+    // the file simply stayed 0644 with a password in it and nothing said so.
+    #[cfg(unix)]
+    let written = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(MSMTP_CONFIG)
+            .and_then(|mut f| f.write_all(config.as_bytes()))
+    };
+    #[cfg(not(unix))]
+    let written = std::fs::write(MSMTP_CONFIG, &config);
 
+    written.map_err(|e| format!("Failed to write {MSMTP_CONFIG}: {e}"))?;
+
+    // `.mode()` applies only when the file is CREATED, so a config already on disk
+    // keeps whatever mode it has — including a 0644 left by a pre-v2.123.0 agent,
+    // which is the case an upgrade has to repair. Asserted explicitly, and this
+    // time the failure is returned rather than swallowed: there is no sensible way
+    // to carry on having failed to protect a stored password.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(MSMTP_CONFIG, std::fs::Permissions::from_mode(0o600)).ok();
+        std::fs::set_permissions(MSMTP_CONFIG, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| format!("Failed to restrict {MSMTP_CONFIG}, which holds the SMTP password: {e}"),
+        )?;
     }
 
-    // Also configure PHP to use msmtp as sendmail
-    let php_ini_content = format!("sendmail_path = /usr/bin/msmtp -t\n");
+    // Also configure PHP to use msmtp as sendmail. The config no longer lives at
+    // msmtp's default path, so every reader has to be told where it is — PHP
+    // included, or `mail()` silently falls back to a file that is not there.
+    let php_ini_content = format!("sendmail_path = /usr/bin/msmtp -t --file={MSMTP_CONFIG}\n");
     let msmtp_ini_dir = "/etc/php/mods-available";
     if std::path::Path::new(msmtp_ini_dir).exists() {
         let ini_path = format!("{msmtp_ini_dir}/msmtp.ini");
@@ -117,12 +191,47 @@ password       {password}
         }
     }
 
-    // Create log file
-    std::fs::write("/var/log/msmtp.log", "").ok();
+    // Create the relay log named by `logfile` above. msmtp writes it as whoever
+    // sent the mail: root for the panel's own Test Email, `www-data` for anything
+    // PHP relays through `sendmail_path` (every FPM pool this agent writes runs as
+    // www-data). 0666 was the shortest way to let both — and it also made the log
+    // world-READABLE, which is envelope metadata (who mailed whom, when), and
+    // world-WRITABLE, so any local account could forge entries or fill the disk.
+    //
+    // 0660 owned by root:www-data covers both writers and nobody else. The chown
+    // is attempted FIRST and the mode only follows if it succeeded: on a host with
+    // no www-data group, tightening the mode regardless would take the log away
+    // from msmtp-as-www-data and break relaying to fix a disclosure. Repairing a
+    // loud problem must not manufacture a silent one, so that case keeps the old
+    // mode and says why.
+    // Only CREATE it here — never truncate an existing one. `configure()`
+    // runs on every SMTP settings save (the frontend always re-PUTs all 7
+    // `smtp_*` keys, even on an unrelated field edit, and the backend then
+    // pushes this to every online fleet member), so an unconditional
+    // `fs::write(path, "")` was wiping the real mail relay history on every
+    // save — including the save an operator makes WHILE debugging a mail
+    // problem using this exact log.
+    if !std::path::Path::new("/var/log/msmtp.log").exists() {
+        std::fs::write("/var/log/msmtp.log", "").ok();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions("/var/log/msmtp.log", std::fs::Permissions::from_mode(0o666)).ok();
+        let grouped = safe_command_sync("chown")
+            .args(["root:www-data", "/var/log/msmtp.log"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if grouped {
+            std::fs::set_permissions("/var/log/msmtp.log", std::fs::Permissions::from_mode(0o660))
+                .ok();
+        } else {
+            tracing::warn!(
+                "SMTP: no www-data group to own /var/log/msmtp.log, so it stays \
+                 world-writable — PHP relays keep logging, but envelope metadata in \
+                 it is readable by any local account on this host."
+            );
+        }
     }
 
     tracing::info!("SMTP configured: {host}:{port} from={from}");
@@ -148,13 +257,23 @@ pub async fn send_test(to: &str, from: &str, from_name: &str) -> Result<String, 
          If you received this, your SMTP configuration is working correctly.\r\n"
     );
 
+    // `--file` is not optional: the config is no longer at msmtp's default path,
+    // so without it Test Email reads a file that does not exist and reports the
+    // operator's credentials as wrong — a message about the wrong thing, which is
+    // exactly what MSMTP_MISSING above exists to avoid.
     let mut child = safe_command("msmtp")
-        .args(["--read-envelope-from", to])
+        .args(["--file", MSMTP_CONFIG, "--read-envelope-from", to])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn msmtp: {e}"))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                MSMTP_MISSING.to_string()
+            } else {
+                format!("Failed to spawn msmtp: {e}")
+            }
+        })?;
 
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;

@@ -1,9 +1,115 @@
 import { useState, useEffect, useRef } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
 import UpdatesContent from "./Updates";
 import { timeAgo } from "../utils/format";
+import { applyTheme, readStoredTheme } from "../hooks/useLayoutState";
+import ConfirmDialog from "../components/ConfirmDialog";
+import {
+  TwoFactorCard,
+  PasskeysCard,
+  ChangePasswordCard,
+  SessionsCard,
+  ApiKeysCard,
+  ExportMyDataCard,
+} from "../components/AccountSecurity";
+
+// Every alert type the panel can suppress from external channels, in the order
+// the grid renders them. This list is the frontend half of a pair: the backend
+// rejects a stored value naming anything outside it, so the two must agree
+// exactly, and a pin arm compares them.
+//
+// It was ten entries while the panel had grown to twenty producers, so half the
+// alert types that page an operator had no control here at all — including
+// every certificate-renewal failure. Adding a producer means adding it here.
+//
+// No exemptions: a pin arm compares this list against the alert types the
+// backend actually raises, reading the call sites rather than either list.
+const SUPPRESSIBLE_ALERT_TYPES: { key: string; label: string }[] = [
+  { key: "cpu", label: "CPU" },
+  { key: "memory", label: "Memory" },
+  { key: "disk", label: "Disk" },
+  { key: "disk_forecast", label: "Disk forecast" },
+  { key: "memory_leak", label: "Memory leak" },
+  { key: "offline", label: "Offline" },
+  { key: "service_down", label: "Service" },
+  { key: "container_down", label: "Container down" },
+  { key: "container_crashloop", label: "Container crashloop" },
+  { key: "container_unhealthy", label: "Container unhealthy" },
+  { key: "gpu_utilization", label: "GPU Util" },
+  { key: "gpu_temperature", label: "GPU Temp" },
+  { key: "gpu_vram", label: "GPU VRAM" },
+  { key: "backup_failure", label: "Backup" },
+  { key: "backup_verification_failed", label: "Backup verification" },
+  { key: "cron_failure", label: "Cron" },
+  { key: "ssl_expiry", label: "SSL expiry" },
+  { key: "ssl_renewal_failure", label: "SSL renewal" },
+  { key: "security", label: "Security scan" },
+  { key: "image_scan", label: "Image scan" },
+  { key: "wp_vuln_scan", label: "WordPress vuln scan" },
+  { key: "slow_response", label: "Slow response" },
+];
+
+/** Which `alert_rules` column governs whether a type is RECORDED at all.
+ *
+ * Distinct from muting, and the distinction is the whole point of the two
+ * columns in the grid below. `muted_types` suppresses the external send while
+ * the `alerts` row and the admin bell still happen; these columns are read by
+ * `is_alert_enabled` BEFORE the INSERT, so the event never exists — no row, no
+ * bell, no status-page incident. A type absent from this map has no such
+ * column and is always recorded.
+ *
+ * The three GPU types deliberately share ONE column: the backend maps
+ * gpu_utilization / gpu_temperature / gpu_vram all to `alert_gpu`, so those
+ * three checkboxes move together and the GPU Alert Thresholds card further
+ * down edits the same value.
+ */
+const RECORD_COLUMN_BY_TYPE: Record<string, string> = {
+  cpu: "alert_cpu",
+  memory: "alert_memory",
+  disk: "alert_disk",
+  offline: "alert_offline",
+  service_down: "alert_service_health",
+  backup_failure: "alert_backup_failure",
+  ssl_expiry: "alert_ssl_expiry",
+  gpu_utilization: "alert_gpu",
+  gpu_temperature: "alert_gpu",
+  gpu_vram: "alert_gpu",
+};
+
+
+/** Preview colours for the theme picker and the layout thumbnails.
+ *
+ *  Hand-copied out of index.css, field for field:
+ *    bg → --color-dark-900 · sidebar → --color-dark-950 · card → --color-dark-800
+ *    bar → --color-dark-700 · text → --color-dark-500
+ *    accent → --color-rust-400 on the dark themes, --color-rust-500 on the two
+ *             light ones (arctic, clean) — rust-400 is a light tint there and
+ *             would not clear the 3.0 non-text floor against the swatch card.
+ *
+ *  It is a copy on purpose: a getComputedStyle probe cannot work while terminal's
+ *  ramp lives in @theme on :root with no [data-theme="terminal"] block, because a
+ *  probe element inherits the CURRENT theme and would report ember's colours for
+ *  Terminal while you are on ember. A pin asserts these stay in step with
+ *  index.css — update both together, or the pin goes red.
+ *
+ *  Previously drifted: every one of ember's six fields was invented (none of the
+ *  values appeared in index.css at all), terminal's and midnight's `text` had been
+ *  hand-brightened, arctic's accent still held the pre-retune #0d9488, and the
+ *  layout thumbnails below had no branch for clean or clean-dark and so rendered
+ *  a black terminal preview inside a white card on both. */
+const THEME_SWATCHES = [
+  { id: "terminal", name: "Terminal", desc: "Hacker aesthetic", bg: "#111113", sidebar: "#09090b", accent: "#22c55e", card: "#18181b", text: "#52525b", bar: "#27272a" },
+  { id: "midnight", name: "Midnight", desc: "Deep navy, modern", bg: "#0a1628", sidebar: "#050a18", accent: "#3b82f6", card: "#0f1f3a", text: "#3a5785", bar: "#182d50" },
+  { id: "ember", name: "Ember", desc: "Warm & premium", bg: "#1c1917", sidebar: "#100e0d", accent: "#fb923c", card: "#292524", text: "#78716c", bar: "#3b3533" },
+  { id: "clean-dark", name: "Clean Dark", desc: "GitHub-dark, rounded", bg: "#161b22", sidebar: "#0d1117", accent: "#3b82f6", card: "#1c2333", text: "#636e7b", bar: "#2d333b" },
+  { id: "arctic", name: "Arctic", desc: "Teal & light", bg: "#f7f9fc", sidebar: "#ffffff", accent: "#0d7970", card: "#edf1f7", text: "#8d9bb0", bar: "#dce3ed" },
+  { id: "clean", name: "Clean Light", desc: "Modern SaaS, blue", bg: "#f8fafc", sidebar: "#ffffff", accent: "#2563eb", card: "#f1f5f9", text: "#94a3b8", bar: "#e2e8f0" },
+] as const;
+
+const DEFAULT_SWATCH = THEME_SWATCHES[1]; // midnight — the default theme
 
 interface HealthStatus {
   db: string;
@@ -11,18 +117,6 @@ interface HealthStatus {
   uptime: string;
   database: boolean; // computed
   agentOk: boolean;  // computed
-}
-
-interface Passkey {
-  id: string;
-  name: string;
-  created_at: string;
-}
-
-interface ApiKey {
-  id: string;
-  name: string;
-  created_at: string;
 }
 
 interface ExportConfig {
@@ -34,16 +128,29 @@ interface CleanupResult {
   cleaned?: string[];
 }
 
-/** WebAuthn PublicKeyCredentialCreationOptions as returned by the server (base64url-encoded) */
-interface WebAuthnPublicKeyOptions {
-  challenge: string | ArrayBuffer;
-  user: { id: string | ArrayBuffer; name: string; displayName: string };
-  rp: { name: string; id?: string };
-  pubKeyCredParams: { type: string; alg: number }[];
-  excludeCredentials?: { id: string | ArrayBuffer; type: string }[];
-  [key: string]: unknown;
+/**
+ * `PUT /settings` when SMTP keys were among them.
+ *
+ * The setting is panel-global, so the push is fleet-wide: `smtp` says where the
+ * config actually landed, host by host, and `warning` is the API's own sentence
+ * for the partial case. Everything below `ok` is absent when the save touched no
+ * SMTP key or when no host was configured — hence every field optional.
+ */
+interface SmtpSaveResult {
+  ok: boolean;
+  /** Present only on a partial push. Complete sentence, safe to render as-is. */
+  warning?: string;
+  smtp?: {
+    /** Hosts that took the configuration. */
+    configured: string[];
+    /** Hosts that were asked and refused. */
+    failed: { server: string; error: string }[];
+    /** Registered hosts no agent could be resolved for — never asked at all. */
+    not_asked: { server: string; status: string }[];
+  };
 }
 
+/** WebAuthn PublicKeyCredentialCreationOptions as returned by the server (base64url-encoded) */
 type ServiceStatus = Record<string, { installed?: boolean; running?: boolean; active?: boolean; version?: string | null }>;
 
 interface OAuthRedirects {
@@ -72,13 +179,6 @@ const NOTIF_CHANNELS = [
  *  else is passed through verbatim — an operator typing {{host}} gets "{{host}}". */
 const NOTIF_PLACEHOLDERS = ["{{title}}", "{{message}}", "{{severity}}", "{{timestamp}}"] as const;
 
-/** The plans routes/billing.rs builds `stripe_price_{plan}` from. */
-const STRIPE_PLANS = [
-  { id: "starter", label: "Starter" },
-  { id: "pro", label: "Pro" },
-  { id: "agency", label: "Agency" },
-] as const;
-
 export default function Settings() {
   const { user } = useAuth();
   const [settings, setSettings] = useState<Record<string, string>>({});
@@ -91,10 +191,10 @@ export default function Settings() {
   // matter what the toggle says. Empty on a single-server install.
   const [recordingLagging, setRecordingLagging] = useState<{ name: string; agent_version: string }[]>([]);
   const healthTimer = useRef<ReturnType<typeof setInterval>>(undefined);
-  const qrRef = useRef<HTMLDivElement>(null);
 
   // Form state
   const [panelName, setPanelName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
   const [panelIps, setPanelIps] = useState("");
   const [smtpProvider, setSmtpProvider] = useState("custom");
   const [smtpHost, setSmtpHost] = useState("");
@@ -108,22 +208,6 @@ export default function Settings() {
 
   // Update count for tab badge
   const [updateCount, setUpdateCount] = useState(0);
-
-  // 2FA state
-  const [twoFaEnabled, setTwoFaEnabled] = useState(false);
-  const [twoFaSetup, setTwoFaSetup] = useState<{ secret: string; qr_svg: string } | null>(null);
-  const [twoFaCode, setTwoFaCode] = useState("");
-  const [twoFaDisableCode, setTwoFaDisableCode] = useState("");
-  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
-  const [twoFaLoading, setTwoFaLoading] = useState(false);
-
-  // Passkeys
-  const [passkeys, setPasskeys] = useState<Passkey[]>([]);
-  const [passkeyLoading, setPasskeyLoading] = useState(false);
-  const [passkeyName, setPasskeyName] = useState("My Passkey");
-  const [passkeySupported] = useState(() => !!window.PublicKeyCredential);
-  const [renamingPasskey, setRenamingPasskey] = useState<string | null>(null);
-  const [passkeyRenameValue, setPasskeyRenameValue] = useState("");
 
   // Auto-healing
   const [autoHealEnabled, setAutoHealEnabled] = useState(false);
@@ -146,6 +230,25 @@ export default function Settings() {
   const [testingWebhook, setTestingWebhook] = useState<string | null>(null);
   const [webhookResult, setWebhookResult] = useState<{ type: string; msg: string }>({ type: "", msg: "" });
   const [mutedTypes, setMutedTypes] = useState<string[]>([]);
+  // Defaults mirror the schema, which declares every one of these NOT NULL
+  // DEFAULT TRUE — so an unsaved page shows what the backend would do.
+  const [recordTypes, setRecordTypes] = useState<Record<string, boolean>>({
+    alert_cpu: true,
+    alert_memory: true,
+    alert_disk: true,
+    alert_offline: true,
+    alert_backup_failure: true,
+    alert_ssl_expiry: true,
+    alert_service_health: true,
+  });
+  // The Alerts page builds escalation policies and then tells the operator, in its own
+  // words, to "attach a policy to an alert rule from the alert-rules editor". This is
+  // that editor, and until now it had no such control: the attach endpoint had zero
+  // callers, so every rule kept escalation_policy_id NULL and every alert fell back to
+  // the hardcoded cadence no matter how many chains had been built.
+  const [alertRuleId, setAlertRuleId] = useState<string | null>(null);
+  const [escalationPolicyId, setEscalationPolicyId] = useState("");
+  const [escalationPolicies, setEscalationPolicies] = useState<{ id: string; name: string }[]>([]);
   // GPU alert thresholds
   const [gpuAlertEnabled, setGpuAlertEnabled] = useState(true);
   const [gpuUtilThreshold, setGpuUtilThreshold] = useState(95);
@@ -153,22 +256,13 @@ export default function Settings() {
   const [gpuTempThreshold, setGpuTempThreshold] = useState(85);
   const [gpuVramThreshold, setGpuVramThreshold] = useState(95);
 
-  // Password change
-  const [currentPass, setCurrentPass] = useState("");
-  const [newPass, setNewPass] = useState("");
-  const [confirmPass, setConfirmPass] = useState("");
-
-  // API Keys
-  const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
-  const [showNewKey, setShowNewKey] = useState(false);
-  const [newKeyName, setNewKeyName] = useState("");
-  const [newKeyResult, setNewKeyResult] = useState<string | null>(null);
-
   // Hostname
   const [hostname, setHostname] = useState("");
 
-  // Theme
-  const [currentTheme, setCurrentTheme] = useState(() => localStorage.getItem("dp-theme") || "midnight");
+  // Theme. Read through readStoredTheme so a legacy stored id ("nexus", "dark")
+  // resolves to the theme actually on screen — this used to be the one reader
+  // that skipped the migration, so such a user saw NO swatch marked active.
+  const [currentTheme, setCurrentTheme] = useState(readStoredTheme);
   const [showHeader, setShowHeader] = useState(() => localStorage.getItem("dp-show-header") === "true");
   const [flatNav, setFlatNav] = useState(() => localStorage.getItem("dp-flat-nav") === "true");
 
@@ -190,22 +284,16 @@ export default function Settings() {
     Object.fromEntries(NOTIF_CHANNELS.map(c => [c.id, ""]))
   );
 
-  // Stripe plan price IDs — routes/billing.rs looks each one up by
-  // `stripe_price_{plan}` and its comment already said "admin configures via
-  // Settings page", which was not true of any page.
-  const [stripePrices, setStripePrices] = useState<Record<string, string>>(
-    Object.fromEntries(STRIPE_PLANS.map(p => [p.id, ""]))
-  );
-  // Whether STRIPE_SECRET_KEY is present in api.env. The price IDs below are
-  // settings; the secret key is not, so the two halves of billing are configured
-  // in different places and only one of them is on this page.
-  const [billingEnabled, setBillingEnabled] = useState<boolean | null>(null);
+  const [canary, setCanary] = useState<{ enabled: boolean; watching: number; total: number; armable: number; paths: { path: string; state: string; plantable: boolean; detail: string | null }[] } | null>(null);
+  const [canaryErr, setCanaryErr] = useState<string | null>(null);
+  const [arming, setArming] = useState(false);
 
   const loadSettings = async () => {
     try {
       const data = await api.get<Record<string, string>>("/settings");
       setSettings(data);
       setPanelName(data.panel_name || "");
+      setBaseUrl(data.base_url || "");
       setPanelIps(data.allowed_panel_ips || "");
       setSmtpHost(data.smtp_host || "");
       setSmtpPort(data.smtp_port || "");
@@ -227,9 +315,6 @@ export default function Settings() {
       }])));
       setNotifTemplates(Object.fromEntries(
         NOTIF_CHANNELS.map(c => [c.id, data[`notif_template_${c.id}`] || ""])
-      ));
-      setStripePrices(Object.fromEntries(
-        STRIPE_PLANS.map(p => [p.id, data[`stripe_price_${p.id}`] || ""])
       ));
     } catch (e) {
       setMessage({
@@ -279,13 +364,6 @@ export default function Settings() {
           setTimeout(() => { window.location.href = "/login"; }, 2000);
           break;
         }
-        case "revoke_key": {
-          if (!data) break;
-          await api.delete(`/api-keys/${data.id}`);
-          setApiKeys(apiKeys.filter((a) => a.id !== data.id));
-          setMessage({ text: "API key revoked", type: "success" });
-          break;
-        }
       }
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Action failed", type: "error" });
@@ -293,32 +371,57 @@ export default function Settings() {
     }
   };
 
-  const load2faStatus = async () => {
+  // What the canary tripwire is ACTUALLY watching, as opposed to whether its
+  // setting is on. The row below rendered "on" from the setting alone, and the
+  // setting is seeded true, so a panel watching zero files looked identical to a
+  // panel watching all of them.
+  type CanaryPath = { path: string; state: string; plantable: boolean; detail: string | null };
+  type CanaryStatus = { enabled: boolean; watching: number; total: number; armable: number; paths: CanaryPath[] };
+  const loadCanary = async () => {
     try {
-      const data = await api.get<{ enabled: boolean }>("/auth/2fa/status");
-      setTwoFaEnabled(data.enabled);
-    } catch { /* ignore */ }
-  };
-
-  const loadPasskeys = async () => {
-    try {
-      const data = await api.get<{ passkeys: Passkey[] }>("/auth/passkeys");
-      setPasskeys(data.passkeys || []);
-    } catch { /* ignore */ }
+      setCanary(await api.get<CanaryStatus>("/security/canary-status"));
+      setCanaryErr(null);
+    } catch (e) {
+      // Deliberately NOT a silent catch: a status this screen cannot read is the
+      // one state the row must never paint as protected.
+      setCanary(null);
+      setCanaryErr(e instanceof Error ? e.message : "unavailable");
+    }
   };
 
   const loadNotifyChannels = async () => {
     try {
-      const rules = await api.get<{ notify_email?: boolean; notify_slack_url?: string; notify_discord_url?: string; notify_pagerduty_key?: string; muted_types?: string; alert_gpu?: boolean; gpu_util_threshold?: number; gpu_util_duration?: number; gpu_temp_threshold?: number; gpu_vram_threshold?: number }[]>("/alert-rules");
+      const rules = await api.get<{ id?: string; escalation_policy_id?: string | null; notify_email?: boolean; notify_slack_url?: string; notify_discord_url?: string; notify_pagerduty_key?: string; muted_types?: string; alert_cpu?: boolean; alert_memory?: boolean; alert_disk?: boolean; alert_offline?: boolean; alert_backup_failure?: boolean; alert_ssl_expiry?: boolean; alert_service_health?: boolean; alert_gpu?: boolean; gpu_util_threshold?: number; gpu_util_duration?: number; gpu_temp_threshold?: number; gpu_vram_threshold?: number }[]>("/alert-rules");
       if (rules.length > 0) {
         const r = rules[0];
+        setAlertRuleId(r.id ?? null);
+        setEscalationPolicyId(r.escalation_policy_id ?? "");
         setNotifyEmail(r.notify_email !== false);
         setNotifySlackUrl(r.notify_slack_url || "");
         setNotifyDiscordUrl(r.notify_discord_url || "");
         setNotifyPagerdutyKey(r.notify_pagerduty_key || "");
         if (r.muted_types) {
-          setMutedTypes(r.muted_types.split(',').filter((t: string) => t.trim()));
+          // Drop tokens this build cannot suppress before they reach the
+          // checkboxes. A stale one would otherwise survive every Save — it
+          // round-trips through the payload untouched — and the backend now
+          // refuses the write, so a settings page carrying one could never be
+          // saved again. Filtering here lets the next Save heal the row.
+          const known = new Set(SUPPRESSIBLE_ALERT_TYPES.map(t => t.key));
+          setMutedTypes(r.muted_types.split(',').map((t: string) => t.trim()).filter((t: string) => known.has(t)));
         }
+        // `!== false` so an absent column reads as the schema default (TRUE)
+        // rather than as "switched off" — the reassuring direction here is the
+        // WRONG one: showing a box ticked for a type the operator had silenced
+        // would invite them to save it back on without noticing.
+        setRecordTypes({
+          alert_cpu: r.alert_cpu !== false,
+          alert_memory: r.alert_memory !== false,
+          alert_disk: r.alert_disk !== false,
+          alert_offline: r.alert_offline !== false,
+          alert_backup_failure: r.alert_backup_failure !== false,
+          alert_ssl_expiry: r.alert_ssl_expiry !== false,
+          alert_service_health: r.alert_service_health !== false,
+        });
         if (r.alert_gpu !== undefined) setGpuAlertEnabled(r.alert_gpu);
         if (r.gpu_util_threshold) setGpuUtilThreshold(r.gpu_util_threshold);
         if (r.gpu_util_duration) setGpuUtilDuration(r.gpu_util_duration);
@@ -326,18 +429,22 @@ export default function Settings() {
         if (r.gpu_vram_threshold) setGpuVramThreshold(r.gpu_vram_threshold);
       }
     } catch { /* ignore */ }
+    // A missing policy list must not break the notification tab — the picker just has
+    // nothing to offer, which is also the honest state when no policies exist yet.
+    try {
+      const policies = await api.get<{ id: string; name: string }[]>("/escalation-policies");
+      setEscalationPolicies(policies.map(({ id, name }) => ({ id, name })));
+    } catch { setEscalationPolicies([]); }
   };
 
   useEffect(() => {
     loadSettings();
     loadHealth();
-    load2faStatus();
-    loadPasskeys();
     loadNotifyChannels();
+    loadCanary();
     api.get<{ count: number }>("/system/updates/count")
       .then((d) => setUpdateCount(d.count))
       .catch(() => {});
-    api.get<ApiKey[]>("/api-keys").then(setApiKeys).catch(() => {});
     api.get<{ lagging: { name: string; agent_version: string }[] }>("/settings/recording-coverage")
       .then((d) => setRecordingLagging(d.lagging || []))
       .catch(() => {});
@@ -347,32 +454,15 @@ export default function Settings() {
     api.get<OAuthRedirects>("/settings/oauth-redirects")
       .then(setOauthRedirects)
       .catch(() => {});
-    api.get<{ billing_enabled?: boolean }>("/billing/plan")
-      .then((d) => setBillingEnabled(!!d.billing_enabled))
-      .catch(() => {});
     healthTimer.current = setInterval(loadHealth, 30000);
     return () => clearInterval(healthTimer.current);
   }, []);
-
-  // Render QR SVG safely as a data URI image (sandboxes any embedded scripts)
-  useEffect(() => {
-    if (qrRef.current && twoFaSetup?.qr_svg) {
-      const encoded = btoa(unescape(encodeURIComponent(twoFaSetup.qr_svg)));
-      qrRef.current.innerHTML = "";
-      const img = document.createElement("img");
-      img.src = `data:image/svg+xml;base64,${encoded}`;
-      img.alt = "2FA QR Code";
-      img.width = 200;
-      img.height = 200;
-      qrRef.current.appendChild(img);
-    }
-  }, [twoFaSetup?.qr_svg]);
 
   const saveGeneral = async () => {
     setSaving("general");
     setMessage({ text: "", type: "" });
     try {
-      await api.put("/settings", { panel_name: panelName });
+      await api.put("/settings", { panel_name: panelName, base_url: baseUrl.trim() });
       setMessage({ text: "General settings saved", type: "success" });
     } catch (e) {
       setMessage({
@@ -388,7 +478,13 @@ export default function Settings() {
     setSaving("smtp");
     setMessage({ text: "", type: "" });
     try {
-      await api.put("/settings", {
+      // Saving SMTP pushes the config at EVERY member of the fleet, and the
+      // write to `settings` succeeding says nothing about whether it landed.
+      // `warning` is a complete sentence from the API naming the hosts that
+      // rejected it and the hosts that were never asked — the ones whose mail
+      // will keep using stale credentials until SMTP is saved again. Same
+      // response shape and same handling as BackupOrchestrator's deleteDest.
+      const res = await api.put<SmtpSaveResult>("/settings", {
         smtp_host: smtpHost,
         smtp_port: smtpPort,
         smtp_username: smtpUser,
@@ -397,7 +493,19 @@ export default function Settings() {
         smtp_from_name: smtpFromName,
         smtp_encryption: smtpEncryption,
       });
-      setMessage({ text: "SMTP settings saved", type: "success" });
+      const configured = res?.smtp?.configured ?? [];
+      setMessage(
+        res?.warning
+          ? { text: res.warning, type: "warning" }
+          : {
+              // Name the hosts on the way through: "saved" on its own is the
+              // claim that let one box's success stand for the fleet's.
+              text: configured.length > 1
+                ? `SMTP settings saved and pushed to all ${configured.length} servers (${configured.join(", ")})`
+                : "SMTP settings saved",
+              type: "success",
+            },
+      );
     } catch (e) {
       setMessage({
         text: e instanceof Error ? e.message : "Failed to save SMTP settings",
@@ -442,7 +550,22 @@ export default function Settings() {
     }
   };
 
-  const [tab, setTab] = useState("general");
+  // Deep-linkable tab, the same shape Monitoring.tsx and Security.tsx already
+  // use. Without it this page always opened on "general", so every control
+  // anywhere in the panel that said "configure X in Settings" landed the
+  // operator one tab short of X and left them to find it — and there was no way
+  // to write a correct link even if you wanted to, because nothing here read the
+  // URL. "Configure alert channels →" on the notifications page was the instance
+  // that surfaced it; there are several more.
+  const SETTINGS_TABS: readonly string[] = ["general", "email", "account", "channels", "services"];
+  const [searchParams] = useSearchParams();
+  const resolveSettingsTab = (raw: string | null): string =>
+    raw && SETTINGS_TABS.includes(raw) ? raw : "general";
+  const [tab, setTab] = useState(() => resolveSettingsTab(searchParams.get("tab")));
+  useEffect(() => {
+    setTab(resolveSettingsTab(searchParams.get("tab")));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   if (loading) {
     return (
@@ -492,30 +615,28 @@ export default function Settings() {
           className={`mb-4 px-4 py-3 rounded-lg text-sm border ${
             message.type === "success"
               ? "bg-rust-500/10 text-rust-400 border-rust-500/20"
-              : "bg-danger-500/10 text-danger-400 border-danger-500/20"
+              : message.type === "warning"
+                // A fleet operation that partly landed is neither. Red would say
+                // the save failed; green would say every host has the new config.
+                ? "bg-warn-500/10 text-warn-400 border-warn-500/20"
+                : "bg-danger-500/10 text-danger-400 border-danger-500/20"
           }`}
         >
           {message.text}
         </div>
       )}
 
-      {/* Inline confirmation bar */}
+      {/* Issue #120: this used to be an inline bar rendered here, at the top of
+          the page. The Reverse Proxy control that arms it sits near the bottom,
+          so switching back to nginx looked like it did nothing at all. It is a
+          portalled dialog now — see components/ConfirmDialog. */}
       {pendingConfirm && (
-        <div className={`mb-4 px-4 py-3 rounded-lg border flex items-center justify-between ${
-          ["revoke_sessions", "revoke_key"].includes(pendingConfirm.type) ? "border-danger-500/30 bg-danger-500/5" : "border-warn-500/30 bg-warn-500/5"
-        }`}>
-          <span className={`text-xs font-mono ${["revoke_sessions", "revoke_key"].includes(pendingConfirm.type) ? "text-danger-400" : "text-warn-400"}`}>
-            {pendingConfirm.label}
-          </span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeConfirm} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">
-              Confirm
-            </button>
-            <button onClick={() => setPendingConfirm(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">
-              Cancel
-            </button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={pendingConfirm.label}
+          tone={pendingConfirm.type === "revoke_sessions" ? "danger" : "warn"}
+          onConfirm={executeConfirm}
+          onCancel={() => setPendingConfirm(null)}
+        />
       )}
 
       <div className="space-y-6">
@@ -536,6 +657,22 @@ export default function Settings() {
                 className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
                 placeholder="DockPanel"
               />
+            </div>
+            <div>
+              <label htmlFor="base_url" className="block text-sm font-medium text-dark-100 mb-1">Panel URL</label>
+              <input
+                id="base_url"
+                type="url"
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+                className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                placeholder="https://panel.example.com"
+              />
+              <p className="text-xs text-dark-200 mt-1">
+                Where this panel is reachable. Alert notifications use it to link to the
+                matching runbook — leave it empty and alerts are still delivered, but
+                without the link.
+              </p>
             </div>
             <div className="flex justify-end">
               <button
@@ -715,14 +852,17 @@ export default function Settings() {
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
           <div className="px-5 py-3 border-b border-dark-600">
             <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Public Status Page</h3>
-            <p className="text-xs text-dark-200 mt-0.5">Share monitor status publicly at /api/status-page</p>
+            <p className="text-xs text-dark-200 mt-0.5">The master switch for everything served publicly at /status — off by default</p>
           </div>
           <div className="p-5">
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-dark-100">Enable public status page</p>
                 <p className="text-xs text-dark-300 mt-0.5">
-                  Exposes all enabled monitor statuses (name + status only, no URLs) at a public JSON endpoint
+                  Publishes, to anyone on the internet with no login: every enabled monitor's name and
+                  status, your status-page components, and any incident marked visible on the status page —
+                  including the ones the alert engine files for you, whose titles name your servers and
+                  services. Appearance and history are configured under Incidents.
                 </p>
               </div>
               <button
@@ -837,66 +977,6 @@ export default function Settings() {
           </div>
         </div>
 
-        {/* Stripe plan pricing.
-            routes/billing.rs builds the key from the plan being checked out, and
-            when the row is missing answers 503 "Price not configured for the pro
-            plan. Set '…' in settings." — an error naming a setting no page could
-            set, next to a comment reading "admin configures via Settings page".
-            This is that page.
-            The key names are deliberately not spelled out here: §9 of
-            tests/settings-controls-pin-e2e.sh greps this tree for them, and a
-            key named only in prose would credit a control that does not exist. */}
-        {user?.role === "admin" && (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
-          <div className="px-5 py-3 border-b border-dark-600">
-            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Stripe Plan Pricing</h3>
-            <p className="text-xs text-dark-200 mt-0.5">Stripe Price IDs used at checkout. A plan with no price ID cannot be subscribed to.</p>
-          </div>
-          {billingEnabled === false && (
-            <div className="px-5 py-3 border-b border-dark-600 bg-dark-900/40">
-              <p className="text-xs text-dark-300">
-                <span className="text-dark-100 font-medium">Billing is off.</span> The price IDs below are stored but unused until
-                <code className="font-mono mx-1">STRIPE_SECRET_KEY</code> is set in <code className="font-mono">/etc/dockpanel/api.env</code> —
-                that half of the configuration is not a panel setting.
-              </p>
-            </div>
-          )}
-          <div className="p-5 space-y-3">
-            {STRIPE_PLANS.map(p => (
-              <div key={p.id}>
-                <label htmlFor={`stripe-price-${p.id}`} className="block text-sm font-medium text-dark-100 mb-1">{p.label}</label>
-                <input
-                  id={`stripe-price-${p.id}`}
-                  type="text"
-                  value={stripePrices[p.id] || ""}
-                  onChange={e => setStripePrices(prev => ({ ...prev, [p.id]: e.target.value }))}
-                  placeholder="price_1AbCdEfGhIjKlMnO"
-                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
-                />
-              </div>
-            ))}
-            <button
-              onClick={async () => {
-                setSaving("stripe");
-                try {
-                  const body = Object.fromEntries(
-                    STRIPE_PLANS.map(p => [`stripe_price_${p.id}`, (stripePrices[p.id] || "").trim()])
-                  );
-                  await api.put("/settings", body);
-                  setSettings(prev => ({ ...prev, ...body }));
-                  setMessage({ text: "Plan pricing saved", type: "success" });
-                } catch (e) {
-                  setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
-                } finally {
-                  setSaving(null);
-                }
-              }}
-              disabled={saving === "stripe"}
-              className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
-            >{saving === "stripe" ? "Saving..." : "Save Pricing"}</button>
-          </div>
-        </div>
-        )}
 
         {/* Feature #5: Configuration Backup */}
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
@@ -1028,10 +1108,11 @@ export default function Settings() {
                 ] as const).map(l => {
                   const currentLayout = localStorage.getItem("dp-layout") || "command";
                   const isActive = currentLayout === l.id;
-                  const accent = currentTheme === "midnight" ? "#3b82f6" : currentTheme === "arctic" ? "#0d9488" : currentTheme === "ember" ? "#f97316" : "#22c55e";
-                  const bg = currentTheme === "arctic" ? "#f7f9fc" : currentTheme === "midnight" ? "#0a1628" : currentTheme === "ember" ? "#1a1614" : "#111113";
-                  const bar = currentTheme === "arctic" ? "#dce3ed" : currentTheme === "midnight" ? "#182d50" : currentTheme === "ember" ? "#332b26" : "#27272a";
-                  const text = currentTheme === "arctic" ? "#8d9bb0" : currentTheme === "midnight" ? "#6280a8" : currentTheme === "ember" ? "#8a7968" : "#71717a";
+                  // Same table as the theme picker below. The ternary chain this
+                  // replaces branched on midnight/arctic/ember only, so both Clean
+                  // themes fell through to terminal's dark values.
+                  const sw = THEME_SWATCHES.find(s => s.id === currentTheme) ?? DEFAULT_SWATCH;
+                  const { accent, bg, bar, text } = sw;
                   return (
                     <button key={l.id} onClick={() => {
                       localStorage.setItem("dp-layout", l.id);
@@ -1090,20 +1171,15 @@ export default function Settings() {
             <div>
               <p className="text-sm text-dark-100 mb-3">Theme</p>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {([
-                  { id: "terminal", name: "Terminal", desc: "Hacker aesthetic", bg: "#111113", sidebar: "#09090b", accent: "#22c55e", card: "#18181b", text: "#71717a", bar: "#27272a" },
-                  { id: "midnight", name: "Midnight", desc: "Deep navy, modern", bg: "#0a1628", sidebar: "#050a18", accent: "#3b82f6", card: "#0f1f3a", text: "#6280a8", bar: "#182d50" },
-                  { id: "ember", name: "Ember", desc: "Warm & premium", bg: "#1a1614", sidebar: "#0c0a09", accent: "#f97316", card: "#241f1c", text: "#8a7968", bar: "#332b26" },
-                  { id: "clean-dark", name: "Clean Dark", desc: "GitHub-dark, rounded", bg: "#161b22", sidebar: "#0d1117", accent: "#3b82f6", card: "#1c2333", text: "#636e7b", bar: "#2d333b" },
-                  { id: "arctic", name: "Arctic", desc: "Teal & light", bg: "#f7f9fc", sidebar: "#ffffff", accent: "#0d9488", card: "#edf1f7", text: "#8d9bb0", bar: "#dce3ed" },
-                  { id: "clean", name: "Clean Light", desc: "Modern SaaS, blue", bg: "#f8fafc", sidebar: "#ffffff", accent: "#2563eb", card: "#f1f5f9", text: "#94a3b8", bar: "#e2e8f0" },
-                ] as const).map(t => {
+                {THEME_SWATCHES.map(t => {
                   const active = currentTheme === t.id;
                   return (
                     <button key={t.id} onClick={() => {
-                      localStorage.setItem("dp-theme", t.id);
-                      document.documentElement.setAttribute("data-theme", t.id);
-                      document.documentElement.setAttribute("data-color-scheme", (t.id === "arctic" || t.id === "clean") ? "light" : "dark");
+                      // Goes through applyTheme so the layout's useLayoutState
+                      // re-seeds. Writing the DOM here directly left that hook on
+                      // its mount-time value, so the header cycle button computed
+                      // its next theme from a stale one and looked dead for a click.
+                      applyTheme(t.id);
                       setCurrentTheme(t.id);
                     }}
                       className="group text-left transition-all duration-150"
@@ -1297,141 +1373,18 @@ export default function Settings() {
 
         )}
 
-        {/* Two-Factor Authentication */}
+        {/* The self-service cards below are SHARED with `pages/Account.tsx`, the
+            non-adminOnly door every role can reach. One implementation, two
+            callers — a copy here would drift the moment either side changed. */}
         {tab === "account" && (<>
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
-          <div className="px-5 py-3 border-b border-dark-600">
-            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Two-Factor Authentication</h3>
-            <p className="text-xs text-dark-200 mt-0.5">Add an extra layer of security to your account</p>
-          </div>
-          <div className="p-5">
-            {twoFaEnabled ? (
-              <div className="space-y-4">
-                <div className="flex items-center gap-2">
-                  <div className="w-3 h-3 rounded-full bg-rust-500" />
-                  <span className="text-sm text-rust-400 font-medium">2FA is enabled</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    value={twoFaDisableCode}
-                    onChange={(e) => setTwoFaDisableCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                    placeholder="Enter TOTP code to disable"
-                    aria-label="TOTP code to disable 2FA"
-                    className="px-3 py-2 border border-dark-500 rounded-lg text-sm w-48 focus:ring-2 focus:ring-accent-500 outline-none font-mono"
-                  />
-                  <button
-                    disabled={twoFaLoading || twoFaDisableCode.length < 6}
-                    onClick={async () => {
-                      setTwoFaLoading(true);
-                      setMessage({ text: "", type: "" });
-                      try {
-                        await api.post("/auth/2fa/disable", { code: twoFaDisableCode });
-                        setTwoFaEnabled(false);
-                        setTwoFaDisableCode("");
-                        setMessage({ text: "2FA disabled", type: "success" });
-                      } catch (e) {
-                        setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
-                      } finally {
-                        setTwoFaLoading(false);
-                      }
-                    }}
-                    className="px-4 py-2 bg-danger-500/20 text-danger-400 rounded-lg text-sm font-medium hover:bg-danger-500/30 disabled:opacity-50"
-                  >
-                    Disable 2FA
-                  </button>
-                </div>
-              </div>
-            ) : twoFaSetup ? (
-              <div className="space-y-4">
-                <p className="text-sm text-dark-100">Scan this QR code with your authenticator app:</p>
-                <div ref={qrRef} className="flex justify-center bg-white rounded-lg p-4 w-fit mx-auto" />
-                <p className="text-xs text-dark-300 text-center font-mono break-all">
-                  Manual entry: {twoFaSetup.secret}
-                </p>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    value={twoFaCode}
-                    onChange={(e) => setTwoFaCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                    placeholder="Enter 6-digit code"
-                    aria-label="TOTP verification code"
-                    className="px-3 py-2 border border-dark-500 rounded-lg text-sm w-48 focus:ring-2 focus:ring-accent-500 outline-none font-mono"
-                    autoFocus
-                  />
-                  <button
-                    disabled={twoFaLoading || twoFaCode.length < 6}
-                    onClick={async () => {
-                      setTwoFaLoading(true);
-                      setMessage({ text: "", type: "" });
-                      try {
-                        const res = await api.post<{ recovery_codes: string[] }>("/auth/2fa/enable", { code: twoFaCode });
-                        setTwoFaEnabled(true);
-                        setTwoFaSetup(null);
-                        setTwoFaCode("");
-                        setRecoveryCodes(res.recovery_codes);
-                        setMessage({ text: "2FA enabled! Save your recovery codes.", type: "success" });
-                      } catch (e) {
-                        setMessage({ text: e instanceof Error ? e.message : "Invalid code", type: "error" });
-                      } finally {
-                        setTwoFaLoading(false);
-                      }
-                    }}
-                    className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
-                  >
-                    Verify & Enable
-                  </button>
-                  <button
-                    onClick={() => { setTwoFaSetup(null); setTwoFaCode(""); }}
-                    className="px-4 py-2 text-dark-300 border border-dark-600 rounded-lg text-sm font-medium hover:text-dark-100 hover:border-dark-400"
-                  >
-                    Cancel
-                  </button>
-                </div>
-                {recoveryCodes.length > 0 && (
-                  <div className="mt-4 p-4 bg-warn-500/10 rounded-lg border border-warn-500/20">
-                    <p className="text-sm font-medium text-warn-400 mb-2">Recovery Codes (save these!)</p>
-                    <div className="grid grid-cols-2 gap-1">
-                      {recoveryCodes.map((code, i) => (
-                        <code key={i} className="text-xs text-dark-100 font-mono bg-dark-900 px-2 py-1 rounded">{code}</code>
-                      ))}
-                    </div>
-                    <p className="text-xs text-dark-300 mt-2">Each code can only be used once. Store them securely.</p>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="space-y-3">
-                <p className="text-sm text-dark-200">
-                  Protect your account with time-based one-time passwords (TOTP).
-                  Works with Google Authenticator, Authy, 1Password, etc.
-                </p>
-                <button
-                  disabled={twoFaLoading}
-                  onClick={async () => {
-                    setTwoFaLoading(true);
-                    setMessage({ text: "", type: "" });
-                    try {
-                      const res = await api.post<{ secret: string; qr_svg: string }>("/auth/2fa/setup");
-                      setTwoFaSetup(res);
-                    } catch (e) {
-                      setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
-                    } finally {
-                      setTwoFaLoading(false);
-                    }
-                  }}
-                  className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
-                >
-                  {twoFaLoading ? "Setting up..." : "Enable 2FA"}
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
+        <TwoFactorCard />
 
-        {/* 2FA Enforcement (admin only) */}
+        {/* 2FA Enforcement. The "(admin only)" in this comment was the ONLY
+            thing asserting it — no role check existed, so the toggle rendered
+            for every account that reached /settings by URL. `PUT /api/settings`
+            is `AdminUser`, so it always refused; a control that refuses is a
+            broken promise rather than a leak, which is why it survived. */}
+        {user?.role === "admin" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
           <div className="px-5 py-3 border-b border-dark-600">
             <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">2FA Enforcement</h3>
@@ -1456,186 +1409,9 @@ export default function Settings() {
             </button>
           </div>
         </div>
+        )}
 
-        {/* Passkeys / WebAuthn */}
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
-          <div className="px-5 py-3 border-b border-dark-600">
-            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Passkeys</h3>
-            <p className="text-xs text-dark-200 mt-0.5">Passwordless sign-in with biometrics or security keys</p>
-          </div>
-          <div className="p-5">
-            {!passkeySupported ? (
-              <p className="text-sm text-dark-300">Your browser does not support WebAuthn/Passkeys.</p>
-            ) : (
-              <div className="space-y-4">
-                {/* Existing passkeys list */}
-                {passkeys.length > 0 && (
-                  <div className="space-y-2">
-                    {passkeys.map((pk) => (
-                      <div key={pk.id} className="flex items-center justify-between px-3 py-2 bg-dark-700 rounded-lg border border-dark-600">
-                        <div className="flex items-center gap-3">
-                          <svg className="w-4 h-4 text-rust-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
-                            <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
-                          </svg>
-                          <div>
-                            <p className="text-sm text-dark-100">{pk.name}</p>
-                            <p className="text-xs text-dark-400">Added {new Date(pk.created_at).toLocaleDateString()}</p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-3">
-                          {renamingPasskey === pk.id ? (
-                            <span className="inline-flex items-center gap-1">
-                              <input
-                                type="text"
-                                value={passkeyRenameValue}
-                                onChange={(e) => setPasskeyRenameValue(e.target.value)}
-                                onKeyDown={async (e) => {
-                                  if (e.key === "Enter" && passkeyRenameValue && passkeyRenameValue !== pk.name) {
-                                    try {
-                                      await api.put(`/auth/passkeys/${pk.id}`, { name: passkeyRenameValue });
-                                      setPasskeys(prev => prev.map(p => p.id === pk.id ? { ...p, name: passkeyRenameValue } : p));
-                                      setMessage({ text: "Passkey renamed", type: "success" });
-                                    } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed", type: "error" }); }
-                                    setRenamingPasskey(null);
-                                  }
-                                  if (e.key === "Escape") setRenamingPasskey(null);
-                                }}
-                                autoFocus
-                                className="w-28 px-2 py-0.5 bg-dark-900 border border-dark-500 rounded text-xs text-dark-100"
-                              />
-                              <button
-                                onClick={async () => {
-                                  if (!passkeyRenameValue || passkeyRenameValue === pk.name) { setRenamingPasskey(null); return; }
-                                  try {
-                                    await api.put(`/auth/passkeys/${pk.id}`, { name: passkeyRenameValue });
-                                    setPasskeys(prev => prev.map(p => p.id === pk.id ? { ...p, name: passkeyRenameValue } : p));
-                                    setMessage({ text: "Passkey renamed", type: "success" });
-                                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed", type: "error" }); }
-                                  setRenamingPasskey(null);
-                                }}
-                                className="px-1.5 py-0.5 bg-rust-500 text-white rounded text-[10px] font-medium"
-                              >Save</button>
-                              <button onClick={() => setRenamingPasskey(null)} className="px-1.5 py-0.5 bg-dark-600 text-dark-200 rounded text-[10px]">Cancel</button>
-                            </span>
-                          ) : (
-                            <button
-                              onClick={() => { setRenamingPasskey(pk.id); setPasskeyRenameValue(pk.name); }}
-                              className="text-xs text-accent-400 hover:text-accent-300"
-                            >
-                              Rename
-                          </button>
-                          )}
-                          <button
-                            onClick={async () => {
-                              try {
-                                await api.delete(`/auth/passkeys/${pk.id}`);
-                                setPasskeys(prev => prev.filter(p => p.id !== pk.id));
-                                setMessage({ text: "Passkey removed", type: "success" });
-                              } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-                            }}
-                            className="text-xs text-danger-400 hover:text-danger-300"
-                          >
-                            Remove
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Add new passkey */}
-                {passkeys.length < 10 && (
-                  <div className="flex items-end gap-3">
-                    <div className="flex-1">
-                      <label className="block text-xs text-dark-300 mb-1">Passkey name</label>
-                      <input
-                        type="text"
-                        value={passkeyName}
-                        onChange={e => setPasskeyName(e.target.value)}
-                        className="w-full px-3 py-2 text-sm border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
-                        placeholder="My Passkey"
-                      />
-                    </div>
-                    <button
-                      disabled={passkeyLoading}
-                      onClick={async () => {
-                        setPasskeyLoading(true);
-                        try {
-                          // 1. Begin registration
-                          const beginData = await api.post<{ publicKey: WebAuthnPublicKeyOptions }>("/auth/passkey/register/begin", {});
-                          const publicKey = beginData.publicKey;
-
-                          // 2. Convert base64url to ArrayBuffer
-                          const b64toBuf = (b64: string) => {
-                            const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
-                            const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
-                            const arr = new Uint8Array(raw.length);
-                            for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-                            return arr.buffer;
-                          };
-                          const bufTo64 = (buf: ArrayBuffer) => {
-                            const arr = new Uint8Array(buf);
-                            let bin = "";
-                            for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
-                            return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-                          };
-
-                          publicKey.challenge = b64toBuf(publicKey.challenge as string);
-                          publicKey.user.id = b64toBuf(publicKey.user.id as string);
-                          if (publicKey.excludeCredentials) {
-                            publicKey.excludeCredentials = (publicKey.excludeCredentials as { id: string; type: string }[]).map((c) => ({
-                              ...c, id: b64toBuf(c.id),
-                            }));
-                          }
-
-                          // 3. Create credential via browser
-                          const credential = await navigator.credentials.create({ publicKey: publicKey as unknown as PublicKeyCredentialCreationOptions }) as PublicKeyCredential;
-                          const attestation = credential.response as AuthenticatorAttestationResponse;
-
-                          // 4. Get transports
-                          const transports = "getTransports" in attestation && typeof (attestation as AuthenticatorAttestationResponse & { getTransports?: () => string[] }).getTransports === "function"
-                            ? (attestation as AuthenticatorAttestationResponse & { getTransports: () => string[] }).getTransports() : undefined;
-
-                          // 5. Complete registration
-                          await api.post("/auth/passkey/register/complete", {
-                            id: credential.id,
-                            rawId: bufTo64(credential.rawId),
-                            response: {
-                              attestationObject: bufTo64(attestation.attestationObject),
-                              clientDataJson: bufTo64(attestation.clientDataJSON),
-                            },
-                            name: passkeyName || "My Passkey",
-                            transports,
-                          });
-
-                          setMessage({ text: "Passkey registered!", type: "success" });
-                          setPasskeyName("My Passkey");
-                          loadPasskeys();
-                        } catch (e) {
-                          if (e instanceof DOMException && e.name === "NotAllowedError") {
-                            // User cancelled — ignore
-                          } else {
-                            setMessage({ text: e instanceof Error ? e.message : "Failed to register passkey", type: "error" });
-                          }
-                        } finally {
-                          setPasskeyLoading(false);
-                        }
-                      }}
-                      className="px-4 py-2 text-sm bg-rust-500 text-white rounded-lg hover:bg-rust-600 disabled:opacity-50 transition-colors whitespace-nowrap"
-                    >
-                      {passkeyLoading ? "Registering..." : "Add Passkey"}
-                    </button>
-                  </div>
-                )}
-
-                {passkeys.length === 0 && (
-                  <p className="text-xs text-dark-400">No passkeys registered. Add one to enable passwordless login.</p>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
+        <PasskeysCard />
 
         {/* SSH Keys — Security tab */}
         <SSHKeys />
@@ -1643,106 +1419,42 @@ export default function Settings() {
         {/* Auto-Updates — Security tab */}
         <AutoUpdates />
 
-        {/* IP Whitelist — Security tab */}
-        <IPWhitelist />
+        {/* The "Panel IP Whitelist" card that stood here was removed in v2.90.0: it
+            wrote a file on the agent host that nothing read, while telling the operator
+            "Whitelist saved (N IPs)". The control that actually restricts panel access
+            is Panel IP Allowlist, in Security Hardening further down this tab. */}
 
-        {/* Feature #6: Password Change */}
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
-          <div className="px-5 py-3 border-b border-dark-600">
-            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Change Password</h3>
-          </div>
-          <div className="p-5 space-y-3">
-            <input type="password" value={currentPass} onChange={e => setCurrentPass(e.target.value)} placeholder="Current password"
-              className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none" />
-            <input type="password" value={newPass} onChange={e => setNewPass(e.target.value)} placeholder="New password (min 8 chars)"
-              className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none" />
-            <input type="password" value={confirmPass} onChange={e => setConfirmPass(e.target.value)} placeholder="Confirm new password"
-              className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none" />
-            <button disabled={!currentPass || !newPass || newPass !== confirmPass || newPass.length < 8} onClick={async () => {
-              try {
-                await api.post("/auth/change-password", { current_password: currentPass, new_password: newPass });
-                setMessage({ text: "Password changed successfully", type: "success" });
-                setCurrentPass(""); setNewPass(""); setConfirmPass("");
-              } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-            }} className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50">
-              Change Password
-            </button>
-          </div>
-        </div>
+        <ChangePasswordCard />
 
-        {/* Feature #3: Session Management */}
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
+        <SessionsCard />
+
+        {/* Revoke every session PANEL-WIDE. Its own copy said "Admin only." and
+            nothing enforced it: the row rendered for anyone who reached
+            /settings, and only `POST /api/auth/revoke-all` (an `AdminUser`
+            route writing a global `sessions_revoked_at`) refused them. A client
+            revoking their OWN sessions is `SessionsCard` above; this is the
+            different, panel-wide capability, so it stays here and is gated. */}
+        {user?.role === "admin" && (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
           <div className="px-5 py-3 border-b border-dark-600">
-            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Sessions</h3>
+            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Panel-Wide Sessions</h3>
           </div>
-          <div className="p-5 flex items-center justify-between">
+          <div className="p-5 flex items-center justify-between gap-4">
             <div>
-              <p className="text-sm text-dark-100">Active Sessions</p>
-              <p className="text-xs text-dark-300 mt-0.5">Force all users to re-login</p>
+              <p className="text-sm text-dark-100">Revoke every session, panel-wide</p>
+              <p className="text-xs text-dark-300 mt-0.5">
+                Logs out <span className="text-warn-400">every user of this panel</span>, not just you.
+              </p>
             </div>
             <button onClick={() => setPendingConfirm({ type: "revoke_sessions", label: "Revoke all sessions? All users (including you) will be logged out." })}
-              className="px-3 py-1.5 bg-danger-500/10 text-danger-400 rounded text-xs font-medium hover:bg-danger-500/20">Revoke All Sessions</button>
+              className="shrink-0 px-3 py-1.5 bg-danger-500/10 text-danger-400 rounded text-xs font-medium hover:bg-danger-500/20">Revoke All Sessions</button>
           </div>
         </div>
+        )}
 
-        {/* Feature #4: API Key Management */}
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
-          <div className="px-5 py-3 border-b border-dark-600 flex justify-between items-center">
-            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">API Keys</h3>
-            <button onClick={() => setShowNewKey(!showNewKey)} className="text-xs text-rust-400 hover:text-rust-300">
-              {showNewKey ? "Cancel" : "+ Create Key"}
-            </button>
-          </div>
-          {showNewKey && (
-            <div className="px-5 py-3 border-b border-dark-600 flex gap-2">
-              <input value={newKeyName} onChange={e => setNewKeyName(e.target.value)} placeholder="Key name"
-                className="flex-1 px-3 py-1.5 border border-dark-500 rounded text-sm focus:ring-2 focus:ring-accent-500 outline-none" />
-              <button onClick={async () => {
-                try {
-                  const result = await api.post<{ key: string }>("/api-keys", { name: newKeyName || "API Key" });
-                  setNewKeyResult(result.key);
-                  setNewKeyName("");
-                  setShowNewKey(false);
-                  api.get<ApiKey[]>("/api-keys").then(setApiKeys).catch(() => {});
-                } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-              }} className="px-3 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600">Create</button>
-            </div>
-          )}
-          {newKeyResult && (
-            <div className="px-5 py-3 border-b border-dark-600 bg-rust-500/5">
-              <p className="text-xs text-rust-400 mb-1">Copy this key now — it won't be shown again:</p>
-              <div className="flex gap-2">
-                <code className="flex-1 px-2 py-1 bg-dark-900 rounded text-xs font-mono text-dark-100 break-all">{newKeyResult}</code>
-                <button onClick={() => { navigator.clipboard.writeText(newKeyResult); setNewKeyResult(null); }} className="px-2 py-1 bg-dark-700 rounded text-xs text-dark-200 shrink-0">Copy</button>
-              </div>
-            </div>
-          )}
-          <div className="divide-y divide-dark-600">
-            {apiKeys.map((k) => (
-              <div key={k.id} className="px-5 py-2.5 flex items-center justify-between text-xs">
-                <div>
-                  <span className="text-dark-100">{k.name}</span>
-                  <span className="text-dark-400 ml-2">Created {new Date(k.created_at).toLocaleDateString()}</span>
-                </div>
-                <div className="flex gap-2">
-                  <button onClick={async () => {
-                    try {
-                      const r = await api.post<{ key: string }>(`/api-keys/${k.id}/rotate`);
-                      setNewKeyResult(r.key);
-                      api.get<ApiKey[]>("/api-keys").then(setApiKeys).catch(() => {});
-                    } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-                  }} className="text-dark-300 hover:text-dark-100">Rotate</button>
-                  <button onClick={() => setPendingConfirm({
-                    type: "revoke_key",
-                    label: "Revoke this API key?",
-                    data: { id: k.id }
-                  })} className="text-danger-400 hover:text-danger-300">Revoke</button>
-                </div>
-              </div>
-            ))}
-            {apiKeys.length === 0 && <p className="px-5 py-3 text-xs text-dark-300">No API keys created</p>}
-          </div>
-        </div>
+        <ExportMyDataCard />
+
+        <ApiKeysCard />
 
         {/* Security Hardening Settings (admin only) */}
         {user?.role === "admin" && (
@@ -1845,7 +1557,7 @@ export default function Settings() {
                     and records regardless — so without this, switching recording off
                     reports a fleet-wide success that is false for those members. */}
                 {recordingLagging.length > 0 && (
-                  <p className="text-xs text-amber-400 mt-1">
+                  <p className="text-xs text-warn-400 mt-1">
                     {settings.security_session_recording === "false"
                       ? "Still recording on "
                       : "Not controlled by this toggle on "}
@@ -1885,22 +1597,86 @@ export default function Settings() {
               </button>
             </div>
             {/* Canary Files */}
-            <div className="px-5 py-3 flex items-center justify-between">
-              <div>
-                <p className="text-sm text-dark-100">Canary File Monitoring</p>
-                <p className="text-xs text-dark-400">Detect unauthorized filesystem exploration</p>
+            <div className="px-5 py-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm text-dark-100">Canary File Monitoring</p>
+                  <p className="text-xs text-dark-400">Detect unauthorized filesystem exploration</p>
+                </div>
+                <button onClick={async () => {
+                  const current = settings.security_canary_enabled !== "false";
+                  const newVal = !current;
+                  try {
+                    await api.put("/settings", { security_canary_enabled: newVal ? "true" : "false" });
+                    setSettings(prev => ({ ...prev, security_canary_enabled: newVal ? "true" : "false" }));
+                    setMessage({ text: `Canary monitoring ${newVal ? "enabled" : "disabled"}`, type: "success" });
+                  } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
+                }} className={`relative w-11 h-6 rounded-full transition-colors ${settings.security_canary_enabled !== "false" ? "bg-rust-500" : "bg-dark-600"}`}>
+                  <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${settings.security_canary_enabled !== "false" ? "translate-x-5.5 left-0.5" : "left-0.5"}`} />
+                </button>
               </div>
-              <button onClick={async () => {
-                const current = settings.security_canary_enabled !== "false";
-                const newVal = !current;
-                try {
-                  await api.put("/settings", { security_canary_enabled: newVal ? "true" : "false" });
-                  setSettings(prev => ({ ...prev, security_canary_enabled: newVal ? "true" : "false" }));
-                  setMessage({ text: `Canary monitoring ${newVal ? "enabled" : "disabled"}`, type: "success" });
-                } catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-              }} className={`relative w-11 h-6 rounded-full transition-colors ${settings.security_canary_enabled !== "false" ? "bg-rust-500" : "bg-dark-600"}`}>
-                <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-transform ${settings.security_canary_enabled !== "false" ? "translate-x-5.5 left-0.5" : "left-0.5"}`} />
-              </button>
+              {/* The switch above reports the SETTING. This reports the TRIPWIRE.
+                  They were the same control until v2.132.0, and because nothing in
+                  the product planted a canary, "on" meant "watching nothing" on
+                  every install — an intrusion detector whose only observable
+                  behaviour was silence, which is what a working one looks like. */}
+              {settings.security_canary_enabled !== "false" && (
+                <div className="mt-2.5">
+                  {canaryErr ? (
+                    <p className="text-xs text-warn-400">Armed state unavailable ({canaryErr}) — this screen cannot confirm anything is being watched.</p>
+                  ) : canary ? (
+                    <>
+                      <div className="flex items-center justify-between gap-3">
+                        <p className={`text-xs ${canary.watching === 0 ? "text-danger-400" : "text-dark-300"}`}>
+                          {canary.watching === 0
+                            ? "NOT ARMED — no canary file is being watched, so no alert can ever fire."
+                            : `Watching ${canary.watching} of ${canary.total} canary paths.`}
+                        </p>
+                        {canary.armable > 0 && (
+                          <button
+                            disabled={arming}
+                            onClick={async () => {
+                              setArming(true);
+                              try {
+                                const r = await api.post<{ armed: number; total: number; refused: { path: string; reason: string }[] }>("/security/canary/arm", {});
+                                await loadCanary();
+                                // Report the refusals too. The agent endpoint used to
+                                // drop them, which is how three of its four paths went
+                                // unplanted without anyone being told.
+                                setMessage(
+                                  r.refused && r.refused.length > 0
+                                    ? { text: `Armed ${r.armed} of ${r.total}. Refused: ${r.refused.map(f => `${f.path} (${f.reason})`).join("; ")}`, type: "error" }
+                                    : { text: `Armed ${r.armed} of ${r.total} canary files`, type: "success" }
+                                );
+                              } catch (e) {
+                                setMessage({ text: e instanceof Error ? e.message : "Failed to arm canary files", type: "error" });
+                              } finally { setArming(false); }
+                            }}
+                            className="shrink-0 px-2 py-1 rounded text-xs font-medium bg-rust-500/20 text-rust-400 hover:bg-rust-500/30 disabled:opacity-50"
+                          >
+                            {arming ? "Arming..." : `Arm ${canary.armable} canary file${canary.armable === 1 ? "" : "s"}`}
+                          </button>
+                        )}
+                      </div>
+                      <ul className="mt-1.5 space-y-0.5">
+                        {canary.paths.map(p => (
+                          <li key={p.path} className="text-xs font-mono flex items-baseline gap-2">
+                            <span className={
+                              p.state === "watching" ? "text-rust-400"
+                                : p.state === "masked" ? "text-dark-400"
+                                : "text-warn-400"
+                            }>{p.state === "watching" ? "watching" : p.state}</span>
+                            <span className="text-dark-300">{p.path}</span>
+                            {p.detail && <span className="text-dark-400 font-sans">— {p.detail}</span>}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : (
+                    <p className="text-xs text-dark-400">Checking what is armed...</p>
+                  )}
+                </div>
+              )}
             </div>
             {/* Lockdown Threshold */}
             <div className="px-5 py-3 flex items-center justify-between">
@@ -1999,6 +1775,135 @@ export default function Settings() {
           </div>
         </div>
         )}
+
+        {/* Data retention windows. The reader (auto_healer.rs's run_retention_cleanup,
+            GAP 67) has existed for a while but had no ALLOWED_KEYS entry and no
+            control here — every install was stuck at the hardcoded defaults with no
+            way to change them. Found by the first dockpanel loose-ends audit. */}
+        {user?.role === "admin" && (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
+          <div className="px-5 py-3 border-b border-dark-600">
+            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Data Retention</h3>
+            <p className="text-xs text-dark-200 mt-0.5">How long each log/history table keeps rows before the nightly cleanup deletes them.</p>
+          </div>
+          <div className="divide-y divide-dark-700">
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">Activity Log</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 365)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_activity_days || "365"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_activity_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_activity_days: e.target.value }));
+                    setMessage({ text: "Activity Log retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">System Logs</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 30)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_system_log_days || "30"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_system_log_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_system_log_days: e.target.value }));
+                    setMessage({ text: "System Logs retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">Alert History</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 90)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_alert_days || "90"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_alert_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_alert_days: e.target.value }));
+                    setMessage({ text: "Alert History retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">Security Scan History</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 90)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_scan_days || "90"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_scan_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_scan_days: e.target.value }));
+                    setMessage({ text: "Security Scan History retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">Webhook Delivery Log</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 7)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_webhook_days || "7"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_webhook_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_webhook_days: e.target.value }));
+                    setMessage({ text: "Webhook Delivery Log retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">Notification History</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 30)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_notification_days || "30"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_notification_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_notification_days: e.target.value }));
+                    setMessage({ text: "Notification History retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+            <div className="px-5 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-sm text-dark-100">Monitor Check History</p>
+                <p className="text-xs text-dark-400">Days to keep (default: 7)</p>
+              </div>
+              <input type="number" min="1" max="3650" value={settings.retention_monitor_days || "7"}
+                onChange={async (e) => {
+                  try {
+                    await api.put("/settings", { retention_monitor_days: e.target.value });
+                    setSettings(prev => ({ ...prev, retention_monitor_days: e.target.value }));
+                    setMessage({ text: "Monitor Check History retention updated", type: "success" });
+                  } catch (err) { setMessage({ text: err instanceof Error ? err.message : "Failed to save", type: "error" }); }
+                }}
+                className="w-20 px-2 py-1 border border-dark-500 rounded text-sm text-center focus:ring-2 focus:ring-accent-500 outline-none bg-dark-700"
+              />
+            </div>
+          </div>
+        </div>
+        )}
+
+        {user?.role === "admin" && <CredentialEncryptionCard setMessage={setMessage} />}
 
         {/* OAuth Sign-In Providers.
             The six oauth_*_client_id/_client_secret keys were in ALLOWED_KEYS,
@@ -2234,43 +2139,120 @@ export default function Settings() {
               />
               <p className="text-xs text-dark-300 mt-1">Events API v2 integration key. Get it from PagerDuty &gt; Services &gt; Integrations.</p>
             </div>
-            {/* Alert Type Muting */}
+            {/* Escalation policy — attached through its own admin-only endpoint, so it
+                applies the moment it is picked rather than waiting on Save below. */}
+            <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-2">
+              <label htmlFor="escalation-policy" className="block text-sm font-medium text-dark-100">Escalation Policy</label>
+              <select
+                id="escalation-policy"
+                value={escalationPolicyId}
+                disabled={!alertRuleId}
+                onChange={async (e) => {
+                  const next = e.target.value;
+                  const previous = escalationPolicyId;
+                  setEscalationPolicyId(next);
+                  try {
+                    await api.put(`/alert-rules/${alertRuleId}/escalation-policy`, { policy_id: next || null });
+                    setMessage({ text: next ? "Escalation policy attached" : "Escalation policy removed", type: "success" });
+                  } catch (err) {
+                    // Put the picker back where it was — leaving it showing a policy the
+                    // rule does not carry is the same lie this release is about.
+                    setEscalationPolicyId(previous);
+                    setMessage({ text: err instanceof Error ? err.message : "Failed to attach policy", type: "error" });
+                  }
+                }}
+                className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-sm text-dark-50 outline-none disabled:opacity-50"
+              >
+                <option value="">No escalation (default cadence)</option>
+                {escalationPolicies.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+              <p className="text-xs text-dark-300">
+                {!alertRuleId
+                  ? "Save your notification settings once to create an alert rule, then choose a policy."
+                  : escalationPolicies.length === 0
+                    ? "No policies yet — build one on the Alerts page under Escalation."
+                    : "Unacknowledged alerts follow this chain instead of the built-in reminder cadence, then keep re-paging its last step every 30 minutes until acknowledged."}
+              </p>
+            </div>
+            {/* Alert Behaviour — one row per type, Record and Notify side by side.
+                These are two different switches and were previously two different
+                shapes: a checkbox grid for muting, and nothing at all for the
+                record columns, which were reachable only through Export/Import
+                Config. A single row per type is what makes the difference
+                legible — the alternative on the table was a second grid beside
+                the first, one meaning "don't page me" and the other "don't
+                record it".
+                Both columns read positively: ticked = it happens. The mute grid
+                this replaces was inverted (ticked = suppressed), which could not
+                survive sitting next to a Record column without misreading. */}
             <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-3">
-              <h3 className="text-sm font-medium text-dark-100 font-mono">Suppress External Notifications</h3>
-              <p className="text-xs text-dark-400">Muted alert types still record in the panel but won't trigger Slack, Discord, PagerDuty, or webhook notifications.</p>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {[
-                  { key: "cpu", label: "CPU" },
-                  { key: "memory", label: "Memory" },
-                  { key: "disk", label: "Disk" },
-                  { key: "offline", label: "Offline" },
-                  { key: "backup_failure", label: "Backup" },
-                  { key: "ssl_expiry", label: "SSL" },
-                  { key: "service_down", label: "Service" },
-                  { key: "gpu_utilization", label: "GPU Util" },
-                  { key: "gpu_temperature", label: "GPU Temp" },
-                  { key: "gpu_vram", label: "GPU VRAM" },
-                ].map(({ key, label }) => (
-                  <label key={key} className="flex items-center gap-2 text-sm text-dark-200 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={mutedTypes.includes(key)}
-                      onChange={e => setMutedTypes(
-                        e.target.checked ? [...mutedTypes, key] : mutedTypes.filter(t => t !== key)
-                      )}
-                      className="rounded border-dark-500 bg-dark-900 text-rust-500 focus:ring-rust-500"
-                    />
-                    {label}
-                  </label>
-                ))}
+              <h3 className="text-sm font-medium text-dark-100 font-mono">Alert Behaviour</h3>
+              <p className="text-xs text-dark-400">
+                <span className="text-dark-200">Record</span> keeps the alert inside the panel — the alert row, the
+                bell, and any status-page incident. Switched off, the event is never created at all.{" "}
+                <span className="text-dark-200">Notify</span> governs only the external send — Slack, Discord,
+                PagerDuty, webhooks. Switched off, the alert is still recorded; you just are not paged for it.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs font-mono uppercase tracking-widest text-dark-400">
+                      <th className="text-left font-normal py-2">Type</th>
+                      <th className="text-center font-normal py-2 w-24">Record</th>
+                      <th className="text-center font-normal py-2 w-24">Notify</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {SUPPRESSIBLE_ALERT_TYPES.map(({ key, label }) => {
+                      const column = RECORD_COLUMN_BY_TYPE[key];
+                      const recorded = column === "alert_gpu" ? gpuAlertEnabled : column ? recordTypes[column] : true;
+                      return (
+                        <tr key={key} className="border-t border-dark-700">
+                          <td className="py-2 text-dark-200">{label}</td>
+                          <td className="py-2 text-center">
+                            {column ? (
+                              <input
+                                type="checkbox"
+                                aria-label={`Record ${label} alerts`}
+                                checked={recorded}
+                                onChange={e => {
+                                  if (column === "alert_gpu") setGpuAlertEnabled(e.target.checked);
+                                  else setRecordTypes({ ...recordTypes, [column]: e.target.checked });
+                                }}
+                                className="rounded border-dark-500 bg-dark-900 text-rust-500 focus:ring-rust-500"
+                              />
+                            ) : (
+                              <span className="text-dark-500" title="Always recorded — this type has no record switch">&mdash;</span>
+                            )}
+                          </td>
+                          <td className="py-2 text-center">
+                            <input
+                              type="checkbox"
+                              aria-label={`Notify externally for ${label} alerts`}
+                              checked={!mutedTypes.includes(key)}
+                              onChange={e => setMutedTypes(
+                                e.target.checked ? mutedTypes.filter(t => t !== key) : [...mutedTypes, key]
+                              )}
+                              className="rounded border-dark-500 bg-dark-900 text-rust-500 focus:ring-rust-500"
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
+              <p className="text-xs text-dark-500">
+                &mdash; means the type is always recorded and has no switch. The three GPU rows share a single
+                switch, the same one the GPU card below uses.
+              </p>
             </div>
             {/* GPU Alert Thresholds */}
             <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-4">
               <div className="flex items-center justify-between">
                 <div>
                   <h3 className="text-sm font-medium text-dark-100 font-mono">GPU Alert Thresholds</h3>
-                  <p className="text-xs text-dark-400 mt-0.5">Configure when GPU alerts fire. Only applies to servers with NVIDIA GPUs.</p>
+                  <p className="text-xs text-dark-400 mt-0.5">Configure when GPU alerts fire. Only applies to servers with NVIDIA GPUs. The Enabled box is the same switch as the three GPU rows in the grid above &mdash; one value, shown in both places.</p>
                 </div>
                 <label className="flex items-center gap-2 text-sm text-dark-200 cursor-pointer">
                   <input type="checkbox" checked={gpuAlertEnabled} onChange={e => setGpuAlertEnabled(e.target.checked)}
@@ -2321,12 +2303,30 @@ export default function Settings() {
                   setSaving("notify");
                   setMessage({ text: "", type: "" });
                   try {
+                    // Send the field exactly as the operator left it, empty included.
+                    // Substituting a null for an empty box made clearing a destination
+                    // impossible: the handler COALESCEs a null onto the stored value, so
+                    // the old webhook survived, alerts kept being posted to it, and the
+                    // save still answered "Notification channels saved". An empty string
+                    // is the safe sentinel at both ends — the SSRF validators skip a
+                    // blank field rather than rejecting it, and every sender guards on
+                    // the value being non-empty before it delivers.
                     await api.put("/alert-rules", {
                       notify_email: notifyEmail,
-                      notify_slack_url: notifySlackUrl || null,
-                      notify_discord_url: notifyDiscordUrl || null,
-                      notify_pagerduty_key: notifyPagerdutyKey || null,
+                      notify_slack_url: notifySlackUrl,
+                      notify_discord_url: notifyDiscordUrl,
+                      notify_pagerduty_key: notifyPagerdutyKey,
                       muted_types: mutedTypes.join(','),
+                      // Explicit booleans, never omitted: upsert_rules COALESCEs
+                      // a null onto the stored value, so a missing field would
+                      // make switching a type OFF silently impossible.
+                      alert_cpu: recordTypes.alert_cpu,
+                      alert_memory: recordTypes.alert_memory,
+                      alert_disk: recordTypes.alert_disk,
+                      alert_offline: recordTypes.alert_offline,
+                      alert_backup_failure: recordTypes.alert_backup_failure,
+                      alert_ssl_expiry: recordTypes.alert_ssl_expiry,
+                      alert_service_health: recordTypes.alert_service_health,
                       alert_gpu: gpuAlertEnabled,
                       gpu_util_threshold: gpuUtilThreshold,
                       gpu_util_duration: gpuUtilDuration,
@@ -2334,6 +2334,9 @@ export default function Settings() {
                       gpu_vram_threshold: gpuVramThreshold,
                     });
                     setMessage({ text: "Notification channels saved", type: "success" });
+                    // Re-read so the escalation picker learns the rule id on the first
+                    // save, when the row is created rather than updated.
+                    await loadNotifyChannels();
                   } catch (e) {
                     setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
                   } finally {
@@ -2434,6 +2437,9 @@ export default function Settings() {
         {/* Image Vulnerability Scanning */}
         <ImageScanSettings setMessage={setMessage} />
 
+        {/* WordPress Vulnerability Scanning (direct peer of the above) */}
+        <WpVulnScanSettings setMessage={setMessage} />
+
         {/* SBOM (composition; companion to image scanning) */}
         <SbomSettings setMessage={setMessage} />
 
@@ -2446,6 +2452,12 @@ export default function Settings() {
 
         {/* ACME profile selection — 2026-ready Let's Encrypt */}
         <AcmeSettings setMessage={setMessage} />
+
+        {/* AI-assisted build/deploy failure diagnosis (BYO API key) */}
+        <AiDiagnosisSettings setMessage={setMessage} />
+
+        {/* MCP server (dockpanel-mcp) — read-only introspection for AI agents */}
+        <McpServerSettings setMessage={setMessage} onManageKeys={() => setTab("account")} />
 
         {/* System Health */}
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
@@ -2594,6 +2606,7 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
     { id: "composer", label: "Composer", desc: "PHP dependency manager for Laravel, Symfony, Drupal", field: "composer", checkInstalled: (s: ServiceStatus) => s?.composer?.installed, checkRunning: () => null, extra: () => null },
     { id: "waf", label: "WAF (ModSecurity)", desc: "Web Application Firewall with OWASP CRS — blocks SQL injection, XSS, and OWASP Top 10", field: "waf", checkInstalled: (s: ServiceStatus) => s?.waf?.installed, checkRunning: () => null, extra: () => null },
     { id: "cloudflared", label: "Cloudflare Tunnel", desc: "Expose sites without port forwarding — zero-trust access via Cloudflare's network", field: "cloudflared", checkInstalled: (s: ServiceStatus) => s?.cloudflared?.installed, checkRunning: (s: ServiceStatus) => s?.cloudflared?.running, extra: () => null },
+    { id: "sshpass", label: "sshpass", desc: "Required for password-authenticated SFTP backup destinations — not needed for SSH-key or S3 destinations", field: "sshpass", checkInstalled: (s: ServiceStatus) => s?.sshpass?.installed, checkRunning: () => null, extra: () => null },
   ];
 
   return (
@@ -2620,21 +2633,16 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
           </div>
         )}
 
-        {/* Inline confirmation bar for service uninstall */}
+        {/* Issue #120: this detached uninstall bar rendered here, above the
+            service list, while the Uninstall buttons that arm it sit in the rows
+            below. It is a portalled dialog now — see components/ConfirmDialog. */}
         {svcPendingConfirm && (
-          <div className="px-4 py-3 rounded-lg border flex items-center justify-between border-danger-500/30 bg-danger-500/5">
-            <span className="text-xs font-mono text-danger-400">
-              Uninstall {svcPendingConfirm.label}?
-            </span>
-            <div className="flex items-center gap-2 shrink-0 ml-4">
-              <button onClick={executeUninstall} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">
-                Confirm
-              </button>
-              <button onClick={() => setSvcPendingConfirm(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">
-                Cancel
-              </button>
-            </div>
-          </div>
+          <ConfirmDialog
+            label={`Uninstall ${svcPendingConfirm.label}?`}
+            tone="danger"
+            onConfirm={executeUninstall}
+            onCancel={() => setSvcPendingConfirm(null)}
+          />
         )}
 
         <button
@@ -2829,6 +2837,248 @@ curl -s -H "X-API-Key: your-secret-key-here" \\
   );
 }
 
+// ── AI Build/Deploy Diagnosis (BYO API key, default off) ───────────────
+
+const AI_DIAGNOSIS_PROVIDERS = [
+  { id: "anthropic", label: "Anthropic", placeholder: "claude-sonnet-5" },
+  { id: "openai", label: "OpenAI", placeholder: "gpt-4o" },
+  { id: "gemini", label: "Gemini", placeholder: "gemini-2.0-flash" },
+  { id: "grok", label: "Grok (xAI)", placeholder: "grok-2-latest" },
+];
+
+function AiDiagnosisSettings({ setMessage }: { setMessage: (m: { text: string; type: string }) => void }) {
+  const [enabled, setEnabled] = useState(false);
+  const [provider, setProvider] = useState("anthropic");
+  const [model, setModel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const load = () => {
+    api.get<Record<string, string>>("/settings")
+      .then((data) => {
+        setEnabled(data.ai_diagnosis_enabled === "true");
+        setProvider(data.ai_diagnosis_provider || "anthropic");
+        setModel(data.ai_diagnosis_model || "");
+        setApiKey(data.ai_diagnosis_api_key || "");
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const body: Record<string, string> = {
+        ai_diagnosis_enabled: enabled ? "true" : "false",
+        ai_diagnosis_provider: provider,
+        ai_diagnosis_model: model.trim(),
+      };
+      // Don't overwrite a stored key with the mask placeholder — same guard as PowerDNS.
+      if (apiKey && apiKey !== "********") {
+        body.ai_diagnosis_api_key = apiKey;
+      }
+      await api.put("/settings", body);
+      setMessage({ text: "AI diagnosis settings saved", type: "success" });
+      load();
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Failed to save AI diagnosis settings", type: "error" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const activeProvider = AI_DIAGNOSIS_PROVIDERS.find((p) => p.id === provider) ?? AI_DIAGNOSIS_PROVIDERS[0];
+
+  return (
+    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+      <div className="px-5 py-3 border-b border-dark-600">
+        <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">AI Build/Deploy Diagnosis</h3>
+        <p className="text-xs text-dark-200 mt-0.5">
+          Bring your own API key to get an AI-generated root-cause explanation for a failed Git Deploy, on demand from its history entry.
+        </p>
+        <p className="text-[10px] text-dark-300 mt-1 italic">
+          Off by default. Nothing is ever sent automatically — this only fires when enabled here AND you click "Explain with AI" on a specific failed deploy.
+        </p>
+      </div>
+      <div className="p-5 space-y-4">
+        <div className="flex items-center justify-between border border-dark-600 bg-dark-900/50 rounded p-4">
+          <div>
+            <div className="text-sm font-medium text-dark-50">Enable AI diagnosis</div>
+            <p className="text-[10px] text-dark-300 mt-0.5">Requires a provider, model, and API key below.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setEnabled(!enabled)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-md ${enabled ? "bg-rust-500 text-white hover:bg-rust-600" : "bg-dark-600 text-dark-100 hover:bg-dark-500"}`}
+          >
+            {enabled ? "Enabled" : "Disabled"}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label htmlFor="ai-diag-provider" className="block text-xs font-medium text-dark-100 mb-1">Provider</label>
+            <select
+              id="ai-diag-provider"
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+              className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none bg-dark-900"
+            >
+              {AI_DIAGNOSIS_PROVIDERS.map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="ai-diag-model" className="block text-xs font-medium text-dark-100 mb-1">Model</label>
+            <input
+              id="ai-diag-model"
+              type="text"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none font-mono"
+              placeholder={activeProvider.placeholder}
+            />
+          </div>
+        </div>
+
+        <div>
+          <label htmlFor="ai-diag-key" className="block text-xs font-medium text-dark-100 mb-1">API Key</label>
+          <input
+            id="ai-diag-key"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none font-mono"
+            placeholder={`Your ${activeProvider.label} API key`}
+          />
+          <p className="text-xs text-dark-300 mt-1">Stored encrypted at rest. Failure output is redacted for obvious secrets (passwords, tokens, private keys) before it's sent, and truncated to the last ~8000 characters.</p>
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            onClick={save}
+            disabled={saving || !loaded}
+            className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
+          >
+            {saving ? "Saving..." : "Save AI Diagnosis Settings"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── MCP Server Component ─────────────────────────────────────────────────
+
+function McpServerSettings({ setMessage, onManageKeys }: { setMessage: (m: { text: string; type: string }) => void; onManageKeys: () => void }) {
+  const [enabled, setEnabled] = useState(false);
+  const [bindMode, setBindMode] = useState("loopback");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const load = () => {
+    api.get<Record<string, string>>("/settings")
+      .then((data) => {
+        setEnabled(data.mcp_server_enabled === "true");
+        setBindMode(data.mcp_bind_mode || "loopback");
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.put("/settings", {
+        mcp_server_enabled: enabled ? "true" : "false",
+        mcp_bind_mode: bindMode,
+      });
+      setMessage({ text: "MCP server record saved", type: "success" });
+      load();
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Failed to save MCP server settings", type: "error" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const endpoint = bindMode === "direct"
+    ? "Whatever address you set in /etc/dockpanel/mcp.env's LISTEN_ADDR — not proxied by nginx in this mode."
+    : `${window.location.origin}/mcp`;
+
+  return (
+    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+      <div className="px-5 py-3 border-b border-dark-600">
+        <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">MCP Server</h3>
+        <p className="text-xs text-dark-200 mt-0.5">
+          Read-only DockPanel introspection for AI agents (list sites, read logs/metrics, check security posture) over the Model Context Protocol.
+        </p>
+        <p className="text-[10px] text-dark-300 mt-1 italic">
+          The toggle and bind mode below are a record for this Settings page to display — they don't start, stop, or
+          reconfigure the <code>dockpanel-mcp</code> systemd service themselves. Set them to match what you've actually
+          done on the host.
+        </p>
+      </div>
+      <div className="p-5 space-y-4">
+        <div className="flex items-center justify-between border border-dark-600 bg-dark-900/50 rounded p-4">
+          <div>
+            <div className="text-sm font-medium text-dark-50">MCP server enabled</div>
+            <p className="text-[10px] text-dark-300 mt-0.5">Reflects whether you've run <code>systemctl enable --now dockpanel-mcp</code> on the host.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setEnabled(!enabled)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-md ${enabled ? "bg-rust-500 text-white hover:bg-rust-600" : "bg-dark-600 text-dark-100 hover:bg-dark-500"}`}
+          >
+            {enabled ? "Enabled" : "Disabled"}
+          </button>
+        </div>
+
+        <div>
+          <label htmlFor="mcp-bind-mode" className="block text-xs font-medium text-dark-100 mb-1">Bind mode</label>
+          <select
+            id="mcp-bind-mode"
+            value={bindMode}
+            onChange={(e) => setBindMode(e.target.value)}
+            className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none bg-dark-900"
+          >
+            <option value="loopback">Loopback, proxied by nginx (recommended)</option>
+            <option value="direct">Direct bind (advanced — bypasses nginx and TLS)</option>
+          </select>
+          <p className="text-xs text-dark-300 mt-1">
+            Endpoint once running: <code className="font-mono text-dark-100">{endpoint}</code>
+          </p>
+        </div>
+
+        <div className="border border-dark-600 bg-dark-900/50 rounded p-4 space-y-1.5">
+          <p className="text-xs font-medium text-dark-100">Setup, if you haven't already</p>
+          <ol className="text-[10px] text-dark-300 list-decimal list-inside space-y-0.5">
+            <li>Mint an API key named "MCP server" — <button type="button" onClick={onManageKeys} className="text-rust-400 hover:text-rust-300 underline">manage API keys</button>.</li>
+            <li>Save it to <code>/etc/dockpanel/mcp.token</code> on the host (root:root, mode 600).</li>
+            <li>Run <code>systemctl enable --now dockpanel-mcp</code>.</li>
+          </ol>
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            onClick={save}
+            disabled={saving || !loaded}
+            className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
+          >
+            {saving ? "Saving..." : "Save MCP Server Record"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── SSH Keys Component ──────────────────────────────────────────────────
 
 function SSHKeys() {
@@ -2887,6 +3137,10 @@ function SSHKeys() {
 function AutoUpdates() {
   const [status, setStatus] = useState<{ installed: boolean; enabled: boolean } | null>(null);
   const [toggling, setToggling] = useState(false);
+  // Local, and rendered under the toggle on purpose. A page-level banner on a
+  // page this long is a message the operator never sees next to the control
+  // they clicked — the #120 shape. Keep the answer where the question was.
+  const [error, setError] = useState("");
 
   useEffect(() => {
     api.get<{ installed: boolean; enabled: boolean }>("/auto-updates/status").then(setStatus).catch(() => {});
@@ -2895,10 +3149,16 @@ function AutoUpdates() {
   const toggle = async () => {
     if (!status) return;
     setToggling(true);
+    setError("");
     try {
       await api.post(status.enabled ? "/auto-updates/disable" : "/auto-updates/enable", {});
       setStatus({ ...status, installed: true, enabled: !status.enabled });
-    } catch { /* toggle failed — state not changed */ }
+    } catch (e) {
+      // The switch used to slide back with no explanation, which on a host
+      // family where unattended-upgrades is not the mechanism is the ONLY
+      // outcome it can have. Silence there reads as "done".
+      setError(e instanceof Error ? e.message : "Could not change automatic security updates");
+    }
     finally { setToggling(false); }
   };
 
@@ -2918,57 +3178,7 @@ function AutoUpdates() {
             <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${status?.enabled ? "translate-x-6" : "translate-x-1"}`} />
           </button>
         </div>
-      </div>
-    </div>
-  );
-}
-
-// ── IP Whitelist Component ──────────────────────────────────────────────
-
-function IPWhitelist() {
-  const [ips, setIps] = useState<string[]>([]);
-  const [newIp, setNewIp] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState({ text: "", type: "" });
-
-  useEffect(() => {
-    api.get<{ ips: string[] }>("/panel-whitelist").then(d => setIps(d.ips || [])).catch(() => {});
-  }, []);
-
-  const save = async (list: string[]) => {
-    setSaving(true); setMsg({ text: "", type: "" });
-    try {
-      await api.post("/panel-whitelist", { ips: list });
-      setIps(list);
-      setMsg({ text: list.length > 0 ? `Whitelist saved (${list.length} IPs)` : "Whitelist cleared", type: "success" });
-    } catch (e) { setMsg({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
-      <div className="px-5 py-3 border-b border-dark-600">
-        <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Panel IP Whitelist</h3>
-        <p className="text-xs text-dark-200 mt-0.5">Restrict panel access to specific IPs</p>
-      </div>
-      <div className="p-5 space-y-3">
-        {msg.text && <div className={`px-3 py-2 rounded text-xs ${msg.type === "success" ? "bg-rust-500/10 text-rust-400" : "bg-danger-500/10 text-danger-400"}`}>{msg.text}</div>}
-        {ips.length === 0 && (
-          <p className="text-xs text-dark-400 text-center py-2">No IP whitelist — all IPs can access the panel</p>
-        )}
-        {ips.map((ip, i) => (
-          <div key={i} className="flex items-center justify-between bg-dark-900 border border-dark-500 px-3 py-1.5">
-            <span className="text-xs text-dark-50 font-mono">{ip}</span>
-            <button onClick={() => save(ips.filter((_, j) => j !== i))} className="text-dark-300 hover:text-danger-400">
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-            </button>
-          </div>
-        ))}
-        <div className="flex gap-2">
-          <input type="text" value={newIp} onChange={(e) => setNewIp(e.target.value)} placeholder="e.g. 203.0.113.50" className="flex-1 px-3 py-2 border border-dark-500 rounded-lg text-xs font-mono focus:ring-2 focus:ring-accent-500 outline-none" />
-          <button disabled={!newIp || saving} onClick={() => { save([...ips, newIp.trim()]); setNewIp(""); }} className="px-3 py-2 bg-rust-500 text-white rounded-lg text-xs font-medium hover:bg-rust-600 disabled:opacity-50 shrink-0">Add IP</button>
-        </div>
-        {ips.length > 0 && <button onClick={() => save([])} className="text-xs text-dark-300 hover:text-dark-100">Clear whitelist (allow all)</button>}
+        {error && <p className="text-xs text-danger-400 mt-3">{error}</p>}
       </div>
     </div>
   );
@@ -3109,7 +3319,7 @@ function ImageScanSettings({ setMessage }: { setMessage: (m: { text: string; typ
           {s.installed ? (
             uninstallConfirm ? (
               <div className="flex gap-2">
-                <button type="button" onClick={uninstall} disabled={installing} className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-[10px] font-medium hover:bg-danger-400 disabled:opacity-50">
+                <button type="button" onClick={uninstall} disabled={installing} className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-[10px] font-medium hover:bg-danger-600 disabled:opacity-50">
                   {installing ? "Removing..." : "Confirm uninstall"}
                 </button>
                 <button type="button" onClick={() => setUninstallConfirm(false)} className="px-2.5 py-1 bg-dark-600 text-dark-200 rounded-lg text-[10px] font-medium hover:bg-dark-500">
@@ -3157,7 +3367,7 @@ function ImageScanSettings({ setMessage }: { setMessage: (m: { text: string; typ
             />
             <div>
               <div className="text-sm font-medium text-dark-50">Gate deploys on scan results</div>
-              <p className="text-[10px] text-dark-300 mt-0.5">Block new app deploys when the image's last scan exceeds the threshold below.</p>
+              <p className="text-[10px] text-dark-300 mt-0.5">Refuse an image whose last scan exceeds the threshold below &mdash; on deploys, image changes, compose and stacks. Updating an app is exempt: it re-pulls the same reference, so the scan on file describes the image being replaced.</p>
             </div>
           </label>
         </div>
@@ -3195,6 +3405,113 @@ function ImageScanSettings({ setMessage }: { setMessage: (m: { text: string; typ
             />
             <p className="text-[10px] text-dark-300 mt-2">Background sweep skips images scanned within this window.</p>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── WordPress vulnerability scanning ────────────────────────────────────
+// Direct peer of ImageScanSettings above — same shape, same "off by
+// default" posture. Before this, a critically-vulnerable plugin stayed
+// invisible until an operator manually reopened a site's toolkit and
+// clicked Scan; there was no schedule and no alert.
+
+interface WpScanSettingsState {
+  enabled: boolean;
+  interval_hours: number;
+}
+
+function WpVulnScanSettings({ setMessage }: { setMessage: (m: { text: string; type: string }) => void }) {
+  const [s, setS] = useState<WpScanSettingsState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const load = () => {
+    setLoadError(null);
+    api.get<WpScanSettingsState>("/wordpress/vuln-scan-settings")
+      .then(setS)
+      .catch((e: unknown) => {
+        setS(null);
+        setLoadError(e instanceof Error ? e.message : "Failed to load settings");
+      });
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const update = async (patch: Partial<WpScanSettingsState>) => {
+    if (!s) return;
+    const next = { ...s, ...patch };
+    setS(next);
+    setSaving(true);
+    try {
+      await api.put("/wordpress/vuln-scan-settings", {
+        enabled: next.enabled,
+        interval_hours: next.interval_hours,
+      });
+      setMessage({ text: "WordPress vulnerability scan settings saved", type: "success" });
+    } catch (e) {
+      setMessage({ text: `Save failed: ${(e as Error).message || "unknown"}`, type: "error" });
+      load();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!s) {
+    return (
+      <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+        <div className="px-5 py-3 border-b border-dark-600">
+          <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">WordPress Vulnerability Scanning</h3>
+        </div>
+        {loadError ? (
+          <div className="p-5 flex items-center justify-between gap-3">
+            <p className="text-sm text-danger-400">Could not load scanner settings: {loadError}</p>
+            <button type="button" onClick={load} className="px-3 py-1.5 bg-dark-600 text-dark-50 rounded-lg text-xs font-medium hover:bg-dark-500 shrink-0">Retry</button>
+          </div>
+        ) : (
+          <div className="p-5 text-sm text-dark-300">Loading...</div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+      <div className="px-5 py-3 border-b border-dark-600">
+        <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">WordPress Vulnerability Scanning</h3>
+        <p className="text-xs text-dark-200 mt-0.5">Scan every WordPress site's plugins for known CVEs on a schedule. Manual scans (site toolkit &rarr; Vuln Scan) are unaffected either way.</p>
+      </div>
+      <div className="p-5 space-y-4">
+        <label className="flex items-start gap-3 border border-dark-600 bg-dark-900/50 rounded p-4 cursor-pointer hover:bg-dark-900">
+          <input
+            type="checkbox"
+            checked={s.enabled}
+            disabled={saving}
+            onChange={e => update({ enabled: e.target.checked })}
+            className="mt-1"
+          />
+          <div>
+            <div className="text-sm font-medium text-dark-50">Enable scheduled scans</div>
+            <p className="text-[10px] text-dark-300 mt-0.5">Background sweep rescans every WordPress site at the interval below and alerts on critical or high severity findings.</p>
+          </div>
+        </label>
+
+        <div className="border border-dark-600 bg-dark-900/50 rounded p-4 max-w-xs">
+          <label className="block text-xs font-mono text-dark-300 uppercase tracking-widest mb-2">Rescan interval (hours)</label>
+          <input
+            type="number"
+            min={1}
+            max={720}
+            value={s.interval_hours}
+            disabled={saving}
+            onChange={e => {
+              const v = parseInt(e.target.value, 10);
+              if (!Number.isNaN(v)) update({ interval_hours: v });
+            }}
+            className="w-full px-3 py-2 bg-dark-800 border border-dark-500 rounded text-sm text-dark-50 font-mono"
+          />
+          <p className="text-[10px] text-dark-300 mt-2">Background sweep skips sites scanned within this window.</p>
         </div>
       </div>
     </div>
@@ -3294,7 +3611,7 @@ function SbomSettings({ setMessage }: { setMessage: (m: { text: string; type: st
           {s.installed ? (
             uninstallConfirm ? (
               <div className="flex gap-2">
-                <button type="button" onClick={uninstall} disabled={installing} className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-[10px] font-medium hover:bg-danger-400 disabled:opacity-50">
+                <button type="button" onClick={uninstall} disabled={installing} className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-[10px] font-medium hover:bg-danger-600 disabled:opacity-50">
                   {installing ? "Removing..." : "Confirm uninstall"}
                 </button>
                 <button type="button" onClick={() => setUninstallConfirm(false)} className="px-2.5 py-1 bg-dark-600 text-dark-200 rounded-lg text-[10px] font-medium hover:bg-dark-500">
@@ -3432,7 +3749,7 @@ function PrometheusSettings({ setMessage }: { setMessage: (m: { text: string; ty
                 </div>
                 {rotateConfirm ? (
                   <div className="flex gap-2">
-                    <button onClick={() => save(s.enabled, true)} disabled={saving} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 disabled:opacity-50">
+                    <button onClick={() => save(s.enabled, true)} disabled={saving} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-600 disabled:opacity-50">
                       {saving ? "..." : "Confirm Rotate"}
                     </button>
                     <button onClick={() => setRotateConfirm(false)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500">
@@ -3447,8 +3764,8 @@ function PrometheusSettings({ setMessage }: { setMessage: (m: { text: string; ty
               </div>
 
               {newToken && (
-                <div className="border border-warning-500/30 bg-warning-500/5 rounded p-3">
-                  <div className="text-[10px] font-medium text-warning-400 uppercase tracking-wider mb-1">Save this token — it won't be shown again</div>
+                <div className="border border-warn-500/30 bg-warn-500/5 rounded p-3">
+                  <div className="text-[10px] font-medium text-warn-400 uppercase tracking-wider mb-1">Save this token — it won't be shown again</div>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 text-xs font-mono text-dark-50 break-all">{newToken}</code>
                     <button
@@ -3743,6 +4060,148 @@ function AcmeSettings({ setMessage }: { setMessage: (m: { text: string; type: st
             ))}
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+interface ReencryptSubject {
+  subject: string;
+  examined: number;
+  rewritten: number;
+  already_current: number;
+  unreadable: number;
+  raced: number;
+}
+
+interface ReencryptResult {
+  examined: number;
+  rewritten: number;
+  unreadable: number;
+  raced: number;
+  subjects: ReencryptSubject[];
+  covered_modules: string[];
+}
+
+/// The operator half of SECRETS_ENCRYPTION_KEY.
+///
+/// Shipping the endpoint without this card would have reproduced the exact
+/// shape this session spent its verification budget criticising elsewhere in
+/// the panel: a complete, authz-scoped backend reachable only by hand-crafted
+/// HTTP, with nothing in the UI able to run it.
+function CredentialEncryptionCard({ setMessage }: { setMessage: (m: { text: string; type: string }) => void }) {
+  const [running, setRunning] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [result, setResult] = useState<ReencryptResult | null>(null);
+
+  const run = async () => {
+    setConfirming(false);
+    setRunning(true);
+    try {
+      const r = await api.post<ReencryptResult>("/settings/credentials/reencrypt", {});
+      setResult(r);
+      if (r.unreadable > 0) {
+        setMessage({
+          text: `${r.rewritten} re-encrypted, but ${r.unreadable} value(s) could not be read and were left untouched`,
+          type: "error",
+        });
+      } else if (r.raced > 0) {
+        setMessage({
+          text: `${r.rewritten} re-encrypted, but ${r.raced} value(s) changed while this ran and were safely skipped — run it again to pick them up`,
+          type: "error",
+        });
+      } else if (r.rewritten === 0) {
+        setMessage({ text: "Everything is already under the current key — nothing to do", type: "success" });
+      } else {
+        setMessage({ text: `${r.rewritten} credential(s) re-encrypted under the current key`, type: "success" });
+      }
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Re-encryption failed", type: "error" });
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-4">
+      <div className="px-5 py-3 border-b border-dark-600">
+        <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Credential Encryption</h3>
+        <p className="text-xs text-dark-200 mt-0.5">Rewrite stored credentials under the current encryption key</p>
+      </div>
+      <div className="px-5 py-4 space-y-3">
+        <p className="text-xs text-dark-300">
+          Stored credentials and Secrets Manager values are encrypted with a key derived from{" "}
+          <code className="text-dark-100">JWT_SECRET</code>, or from{" "}
+          <code className="text-dark-100">SECRETS_ENCRYPTION_KEY</code> when you set one. After changing
+          either, run this once so every value is rewritten under the new key — until you do, the panel
+          is reading old values through a fallback and the previous key still has to be derivable.
+        </p>
+        <p className="text-xs text-dark-400">
+          Safe to re-run. A value the panel cannot read is reported and left untouched rather than
+          overwritten.
+        </p>
+
+        {!confirming ? (
+          <button
+            type="button"
+            onClick={() => setConfirming(true)}
+            disabled={running}
+            className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
+          >
+            {running ? "Re-encrypting…" : "Re-encrypt credentials"}
+          </button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-dark-200">Rewrite every stored credential now?</span>
+            <button
+              type="button"
+              onClick={run}
+              className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-xs font-medium hover:bg-rust-600"
+            >
+              Yes, re-encrypt
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirming(false)}
+              className="px-3 py-1.5 bg-dark-700 text-dark-200 rounded-lg text-xs font-medium hover:bg-dark-600"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {result && (
+          <div className="mt-2 border border-dark-600 rounded-lg overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-dark-900 text-dark-400">
+                <tr>
+                  <th className="text-left px-3 py-2 font-medium">Store</th>
+                  <th className="text-right px-3 py-2 font-medium">Examined</th>
+                  <th className="text-right px-3 py-2 font-medium">Rewritten</th>
+                  <th className="text-right px-3 py-2 font-medium">Already current</th>
+                  <th className="text-right px-3 py-2 font-medium">Unreadable</th>
+                  <th className="text-right px-3 py-2 font-medium">Raced</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-dark-700">
+                {result.subjects.map((s) => (
+                  <tr key={s.subject}>
+                    <td className="px-3 py-2 font-mono text-dark-200">{s.subject}</td>
+                    <td className="px-3 py-2 text-right text-dark-300">{s.examined}</td>
+                    <td className="px-3 py-2 text-right text-dark-100">{s.rewritten}</td>
+                    <td className="px-3 py-2 text-right text-dark-400">{s.already_current}</td>
+                    <td className={`px-3 py-2 text-right ${s.unreadable > 0 ? "text-danger-400" : "text-dark-400"}`}>
+                      {s.unreadable}
+                    </td>
+                    <td className={`px-3 py-2 text-right ${s.raced > 0 ? "text-warn-400" : "text-dark-400"}`}>
+                      {s.raced}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   );

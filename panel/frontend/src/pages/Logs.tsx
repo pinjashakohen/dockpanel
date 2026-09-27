@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api, ApiError } from "../api";
 import SystemLogsContent from "./SystemLogs";
 import AuditLogContent from "./Activity";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 interface Site {
   id: string;
@@ -761,15 +762,14 @@ function SiteLogsContent() {
         </div>
       )}
 
-      {/* Confirm truncate bar */}
+      {/* Issue #120: the truncate prompt portals to document.body — its trigger is a per-file row far below this point. */}
       {pendingTruncate && (
-        <div className="mx-4 sm:mx-6 mt-4 border border-danger-500/30 bg-danger-500/5 rounded-lg px-4 py-3 flex items-center justify-between">
-          <span className="text-xs text-danger-400 font-mono">Clear log file? This cannot be undone: {pendingTruncate}</span>
-          <div className="flex items-center gap-2 shrink-0 ml-4">
-            <button onClick={executeTruncate} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 transition-colors">Confirm</button>
-            <button onClick={() => setPendingTruncate(null)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors">Cancel</button>
-          </div>
-        </div>
+        <ConfirmDialog
+          label={`Clear log file? This cannot be undone: ${pendingTruncate}`}
+          tone="danger"
+          onConfirm={executeTruncate}
+          onCancel={() => setPendingTruncate(null)}
+        />
       )}
 
       {/* Feature #2: Stats Panel */}
@@ -944,7 +944,20 @@ type LogTab = "site" | "system" | "audit";
 
 export default function Logs() {
   const { user } = useAuth();
-  const [tab, setTab] = useState<LogTab>("site");
+  // Deep-linkable tab (see Monitoring.tsx). Two legacy URLs redirect here —
+  // `/activity` and `/system-logs` — and both landed on Site Logs, which is a
+  // file tailer, not the audit trail or the system events they are named for.
+  // The Dashboard's "Recent Activity → View all" had the same problem: it lists
+  // `activity_logs` rows and sent you to a tab that reads nginx files.
+  const LOG_TABS: readonly string[] = ["site", "system", "audit"];
+  const [searchParams] = useSearchParams();
+  const resolveLogTab = (raw: string | null): LogTab =>
+    raw && LOG_TABS.includes(raw) ? (raw as LogTab) : "site";
+  const [tab, setTab] = useState<LogTab>(() => resolveLogTab(searchParams.get("tab")));
+  useEffect(() => {
+    setTab(resolveLogTab(searchParams.get("tab")));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   if (!user) return <Navigate to="/login" replace />;
   if (user.role !== "admin") return <Navigate to="/" replace />;

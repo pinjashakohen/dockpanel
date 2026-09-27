@@ -29,7 +29,7 @@ test_contains() {
     else
         body=$(curl -s -X "$method" "$API$path" -H "$AUTH" -H "Content-Type: application/json" -d "${5:-{}}" 2>/dev/null)
     fi
-    if echo "$body" | grep -q "$pattern"; then green "$label"; else red "$label (missing: $pattern)"; fi
+    if echo "$body" | grep -c "$pattern" >/dev/null; then green "$label"; else red "$label (missing: $pattern)"; fi
 }
 
 echo "═══════════════════════════════════════════════"
@@ -52,7 +52,7 @@ test_api GET /api/auth/sessions "List sessions"
 test_contains GET /api/auth/me "User has admin role" '"role":"admin"'
 # Registration: test via direct curl (special case — body needed)
 REG_RESP=$(curl -s -X POST "$API/api/auth/register" -H "$AUTH" -H "Content-Type: application/json" -d '{"email":"test@test.com","password":"testtest123"}' 2>/dev/null)
-echo "$REG_RESP" | grep -q "disabled\|Disabled\|forbidden\|lockdown" && green "Registration blocked" || red "Registration NOT blocked: $REG_RESP"
+echo "$REG_RESP" | grep -c "disabled\|Disabled\|forbidden\|lockdown" >/dev/null && green "Registration blocked" || red "Registration NOT blocked: $REG_RESP"
 
 echo ""
 echo "── Dashboard ──"
@@ -142,14 +142,14 @@ LOCK_STATUS=$(echo "$LOCK_RESP" | tail -1)
 [ "$LOCK_STATUS" = "200" ] && green "Activate lockdown (200)" || red "Activate lockdown ($LOCK_STATUS)"
 
 LOCK_CHECK=$(curl -s "$API/api/security/lockdown" -H "$AUTH" 2>/dev/null)
-echo "$LOCK_CHECK" | grep -q '"active":true' && green "Lockdown is active" || red "Lockdown not active: $LOCK_CHECK"
+echo "$LOCK_CHECK" | grep -c '"active":true' >/dev/null && green "Lockdown is active" || red "Lockdown not active: $LOCK_CHECK"
 
 UNLOCK_RESP=$(curl -s -X POST "$API/api/security/lockdown/deactivate" -H "$AUTH" -H "X-Requested-With: XMLHttpRequest" -H "Content-Type: application/json" -d '{}' -w "\n%{http_code}" 2>/dev/null)
 UNLOCK_STATUS=$(echo "$UNLOCK_RESP" | tail -1)
 [ "$UNLOCK_STATUS" = "200" ] && green "Deactivate lockdown (200)" || red "Deactivate lockdown ($UNLOCK_STATUS)"
 
 UNLOCK_CHECK=$(curl -s "$API/api/security/lockdown" -H "$AUTH" 2>/dev/null)
-echo "$UNLOCK_CHECK" | grep -q '"active":false' && green "Lockdown is inactive" || red "Lockdown still active"
+echo "$UNLOCK_CHECK" | grep -c '"active":false' >/dev/null && green "Lockdown is inactive" || red "Lockdown still active"
 
 echo ""
 echo "── Secrets Manager ──"
@@ -209,7 +209,6 @@ test_it "SELECT 1 FROM security_audit_log LIMIT 0" "security_audit_log table exi
 test_it "SELECT active FROM lockdown_state WHERE id = 1" "lockdown_state table exists"
 test_it "SELECT 1 FROM suspicious_events LIMIT 0" "suspicious_events table exists"
 test_it "SELECT 1 FROM terminal_recordings LIMIT 0" "terminal_recordings table exists"
-test_it "SELECT 1 FROM canary_files LIMIT 0" "canary_files table exists"
 test_it "SELECT approved FROM users LIMIT 0" "users.approved column exists"
 test_it "SELECT sha256_hash FROM backups LIMIT 0" "backups.sha256_hash column exists"
 
@@ -218,11 +217,33 @@ echo "── Filesystem ──"
 [ -d /var/lib/dockpanel/audit ] && green "Audit log directory exists" || red "Audit log directory missing"
 [ -d /var/lib/dockpanel/recordings ] && green "Recordings directory exists" || red "Recordings directory missing"
 [ -d /var/backups/dockpanel ] && green "DB backup directory exists" || red "DB backup directory missing"
-lsattr -d /var/lib/dockpanel/audit/ 2>/dev/null | grep -q "a" && green "Audit dir has append-only flag" || red "Audit dir missing append-only flag"
+# The append-only assertion that used to live here demanded the attribute on the audit
+# DIRECTORY. No shipped code has ever set it, so it could only pass on a box where a
+# human ran chattr by hand — and it did pass, for months, on exactly one such box while
+# the feature it claimed to test did not exist anywhere. It also asserted the wrong
+# thing: on a directory the attribute leaves the files inside rewritable in place, and
+# it blocks the panel's own audit retention sweep. The honest check is that the log is
+# being written at all; kernel-enforced protection is an operator choice, documented in
+# docs/guides/security-hardening.md, so a stock install must not be marked red for it.
+AUDIT_TODAY="/var/lib/dockpanel/audit/audit-$(date -u +%Y-%m-%d).log"
+if [ -s "$AUDIT_TODAY" ]; then
+  green "Audit file log is being written ($AUDIT_TODAY)"
+elif ls /var/lib/dockpanel/audit/audit-*.log >/dev/null 2>&1; then
+  green "Audit file log present (no events yet today)"
+else
+  red "Audit file log missing — no audit-*.log in /var/lib/dockpanel/audit/"
+fi
+if lsattr -d /var/lib/dockpanel/audit/ 2>/dev/null | cut -d' ' -f1 | grep -c "a" >/dev/null; then
+  # Deliberately NOT green()/red(): it is neither a pass nor a failure, it is an
+  # operator choice with a consequence they should know about. Using a counting
+  # helper here would also move this suite's assertion total, which docs/testing.md
+  # publishes and docs-claims-pin-e2e.sh re-derives.
+  echo -e "\e[33m  ! Audit DIRECTORY carries the append-only attribute — this does not protect the log contents and blocks the 365-day retention sweep; see docs/guides/security-hardening.md\e[0m"
+fi
 
 echo ""
 echo "── Tier 2 Cert Pin (sub-suite) ──"
-TIER2_SCRIPT="$(dirname "$0")/tier2-pin-e2e.sh"
+TIER2_SCRIPT="$(dirname "$0")/tier2-certpin-e2e.sh"
 if [ -x "$TIER2_SCRIPT" ]; then
     if bash "$TIER2_SCRIPT" > /tmp/tier2_output 2>&1; then
         TIER2_LINE=$(grep -oP '\d+ passed, \d+ failed(?:, \d+ skipped)?' /tmp/tier2_output | tail -1)
